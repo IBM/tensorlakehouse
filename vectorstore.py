@@ -26,6 +26,7 @@ class Vectorstore(object):
     
     # Default values for variables
     VECTORSTORE_DIRECTORY     = '/data/vector/vectorstore/'
+    OVERVIEWSTORE_DIRECTORY   = '/data/vector/overviews/'
 
     TEMPORAL_KEYS             = ['year']
     TEMPORAL_PARTITIONS       = []
@@ -71,6 +72,7 @@ class Vectorstore(object):
     def __init__(self,
                  dataset,
                  vectorstore_directory = None,
+                 overviewstore_directory = None,
                  temporal_keys = None,
                  temporal_partitions = None,
                  overview_level = None,
@@ -97,10 +99,14 @@ class Vectorstore(object):
         
         # Vectorstore base directory
         self.vectorstore_directory        = self.VECTORSTORE_DIRECTORY if vectorstore_directory is None else vectorstore_directory
+        # Overview base directory
+        self.overviewstore_directory      = self.OVERVIEWSTORE_DIRECTORY if overviewstore_directory is None else overviewstore_directory
         
-        # Dataset directory is subfolder in vectorstore_directory
+        # Dataset directory is subfolder in vectorstore_directory and/or overviewstore_directory
         self.dataset_directory            = os.path.join(self.vectorstore_directory, self.dataset)
         if not os.path.exists(self.dataset_directory): os.makedirs(self.dataset_directory)
+        self.overview_directory            = os.path.join(self.overviewstore_directory, self.dataset)
+        if not os.path.exists(self.overview_directory): os.makedirs(self.overview_directory)
 
         # Temporal keys and partitions
         self.temporal_keys                = self.TEMPORAL_KEYS if temporal_keys is None else temporal_keys
@@ -347,7 +353,7 @@ class Vectorstore(object):
         self._create_filter_key_columns(self.gdf_intersection)
         
         
-    def to_parquet(self, verbose=False):
+    def to_parquet(self, append=False, verbose=False):
         """
         Write GeoDataFrame to parquet
         """
@@ -360,8 +366,17 @@ class Vectorstore(object):
             if verbose:
                 print(filepath)
             if len(df_part)==0:
-                print('WARNING: no data found')
+                print('WARNING: no data to write')
             else:
+                if append:
+                    try:
+                        # See if there is something already present under this overview key
+                        df_existing = geopandas.read_parquet(filepath)
+                    except:
+                        pass
+                    else:
+                        # Merge the two by concatenating and dropping duplicates
+                        df_part = pandas.concat([df_existing, df_part]).drop_duplicates().reset_index(drop=True)
                 df_part.to_parquet(
                     path=filepath,
                     engine='pyarrow',
@@ -388,12 +403,15 @@ class Vectorstore(object):
         vs_settings['temporal_keys'] = self.temporal_keys
         vs_settings['temporal_partitions'] = self.temporal_partitions
         vs_settings['spatial_partition_identifier'] = self.spatial_partition_identifier
+        vs_settings['spatial_partition_levels'] = self.spatial_partition_levels
         vs_settings['spatial_partitions'] = self.spatial_partitions
         vs_settings['partitions'] = self.partitions
         vs_settings['intersection_policy'] = self.intersection_policy
         vs_settings['dataset'] = self.dataset
         vs_settings['vectorstore_directory'] = self.vectorstore_directory
         vs_settings['dataset_directory'] = self.dataset_directory
+        vs_settings['overviewstore_directory'] = self.overviewstore_directory
+        vs_settings['overview_directory'] = self.overview_directory
         vs_settings['partition_order'] = self.partition_order
         vs_settings['numeric_layers'] = self.numeric_layers
         vs_settings['timestamp_layers'] = self.timestamp_layers
@@ -423,7 +441,7 @@ class Vectorstore(object):
         df_cell_statistics = pandas.concat(df_cell_statistics, axis=1)
 
         for numeric_layer in self.numeric_layers:
-            filepath = os.path.join(self.dataset_directory, 'overview_statistics_' + numeric_layer + '.parquet')
+            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + numeric_layer + '.parquet')
             df_cell_statistics_layer = df_cell_statistics[numeric_layer].T.rename_axis(self.overview_key_col).reset_index()
             df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
             
@@ -447,7 +465,7 @@ class Vectorstore(object):
             df_cell_statistics_layer['count'] = df_cell_statistics_layer['count'].astype(int)
             df_cell_statistics_layer = df_cell_statistics_layer.reset_index()
 
-            filepath = os.path.join(self.dataset_directory, 'overview_statistics_' + timestamp_layer + '.parquet')
+            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + timestamp_layer + '.parquet')
             df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
 
     def _calc_write_overview_statistics_categorical(self):
@@ -465,7 +483,7 @@ class Vectorstore(object):
         df_cell_statistics = pandas.concat(df_cell_statistics, axis=1)
 
         for categorical_layer in self.categorical_layers:
-            filepath = os.path.join(self.dataset_directory, 'overview_statistics_' + categorical_layer + '.parquet')
+            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + categorical_layer + '.parquet')
             df_cell_statistics_layer = df_cell_statistics[categorical_layer].T.rename_axis(self.overview_key_col).reset_index()
             df_cell_statistics_layer['count'] = df_cell_statistics_layer['count'].astype(int)
             df_cell_statistics_layer['unique'] = df_cell_statistics_layer['unique'].astype(int)
@@ -482,7 +500,7 @@ class Vectorstore(object):
                 df2[self.overview_key_col] = row[self.overview_key_col]
                 df_cell_statistics_layer.append(df2)
 
-            filepath = os.path.join(self.dataset_directory, 'overview_histogram_' + categorical_layer + '.parquet')
+            filepath = os.path.join(self.overview_directory, 'overview_histogram_' + categorical_layer + '.parquet')
             df_cell_statistics_layer = pandas.concat(df_cell_statistics_layer, axis=1)
             try:
                 df_cell_statistics_layer = df_cell_statistics_layer.sort_index().T.set_index(self.overview_key_col).fillna(0).astype(int).reset_index()
@@ -529,7 +547,7 @@ class Vectorstore(object):
                 self._calc_write_overview_histogram_categorical()
             
     def read_overview_statistics(self, layer):
-        filepath = os.path.join(self.dataset_directory, 'overview_statistics_' + layer + '.parquet')
+        filepath = os.path.join(self.overview_directory, 'overview_statistics_' + layer + '.parquet')
         try:
             df = pandas.read_parquet(filepath)
         except Exception as e:
@@ -538,7 +556,7 @@ class Vectorstore(object):
         return df
 
     def read_overview_histogram(self, layer):
-        filepath = os.path.join(self.dataset_directory, 'overview_histogram_' + layer + '.parquet')
+        filepath = os.path.join(self.overview_directory, 'overview_histogram_' + layer + '.parquet')
         try:
             df = pandas.read_parquet(filepath)
         except Exception as e:
@@ -703,47 +721,56 @@ class Vectorstore(object):
         self._create_spatial_partition_columns(self.query_df_meta)
 
         lst_gdf = []
-        overview_keys = list(self.query_df_meta[self.overview_key_col])
+        overview_keys_requested = set(self.query_df_meta[self.overview_key_col])
+        try:
+            overview_keys_present = set(self.gdf_meta[self.overview_key_col])
+        except:
+            # gdf_meta likely not present yet, so generate it
+            self.metadata_from_parquet()
+            overview_keys_present = set(self.gdf_meta[self.overview_key_col])
+        overview_keys = sorted(overview_keys_requested & overview_keys_present)
         for overview_key in overview_keys:
             _, filepath = self._select_partition(self.query_df_meta, overview_key)
             gdf = self._read_parquet(filepath, self.query_dt_start, self.query_dt_end, verbose=False)
             if len(gdf)>0:
-                # Spatial filtering
-                if self.query_intersection_policy=='cut':
-                    # return intersection (cut polygons)
-                    gdf = geopandas.overlay(
-                        gdf,
-                        self.query_gdf_polygon, 
-                        how='intersection'
-                    ).reset_index(drop=True)
-                elif self.query_intersection_policy=='original':
-                    # Return intersecting polygons intact
-                    if self.intersection_policy=='cut':
-                        # To do: use geometry_id to find all locations of this polygon and stitch together.
-                        print('NOT IMPLEMENTED WARNING: Query asks for original polygons but we are returning the cut ones.')
-                        gdf = geopandas.sjoin(
-                            gdf, 
+                if not self.query_polygon.contains(shapely.geometry.box(*gdf.total_bounds)):
+                    # Spatial filtering may be necessary
+                    if self.query_intersection_policy=='cut':
+                        # return intersection (cut polygons)
+                        gdf = geopandas.overlay(
+                            gdf,
                             self.query_gdf_polygon, 
-                            how='left', 
-                            predicate='intersects'
-                        ).dropna(subset=['index_right']).drop(columns=['index_right'])
-                    elif self.intersection_policy=='original':
-                        # Data has been saved as complete polygons
-                        gdf = geopandas.sjoin(
-                            gdf, 
-                            self.query_gdf_polygon, 
-                            how='left', 
-                            predicate='intersects'
-                        ).dropna(subset=['index_right']).drop(columns=['index_right'])
-                    elif self.intersection_policy=='both':
-                        # Pick the original geometry column with complete polygons
-                        gdf = geopandas.sjoin(
-                            gdf.set_geometry(self.geom_col + '_original', crs=4326), 
-                            self.query_gdf_polygon, 
-                            how='left', 
-                            predicate='intersects'
-                        ).dropna(subset=['index_right']).drop(columns=['index_right'])
-                lst_gdf.append(gdf)
+                            how='intersection'
+                        ).reset_index(drop=True)
+                    elif self.query_intersection_policy=='original':
+                        # Return intersecting polygons intact
+                        if self.intersection_policy=='cut':
+                            # To do: use geometry_id to find all locations of this polygon and stitch together.
+                            print('NOT IMPLEMENTED WARNING: Query asks for original polygons but we are returning the cut ones.')
+                            gdf = geopandas.sjoin(
+                                gdf, 
+                                self.query_gdf_polygon, 
+                                how='left', 
+                                predicate='intersects'
+                            ).dropna(subset=['index_right']).drop(columns=['index_right'])
+                        elif self.intersection_policy=='original':
+                            # Data has been saved as complete polygons
+                            gdf = geopandas.sjoin(
+                                gdf, 
+                                self.query_gdf_polygon, 
+                                how='left', 
+                                predicate='intersects'
+                            ).dropna(subset=['index_right']).drop(columns=['index_right'])
+                        elif self.intersection_policy=='both':
+                            # Pick the original geometry column with complete polygons
+                            gdf = geopandas.sjoin(
+                                gdf.set_geometry(self.geom_col + '_original', crs=4326), 
+                                self.query_gdf_polygon, 
+                                how='left', 
+                                predicate='intersects'
+                            ).dropna(subset=['index_right']).drop(columns=['index_right'])
+                if len(gdf)>0:
+                    lst_gdf.append(gdf)
             else:
                 if verbose:
                     print(f"WARNING: no data found in {overview_key}")
@@ -761,21 +788,22 @@ class Vectorstore(object):
             # If we saved intersections of polygons, we need to stitch those together
             duplicated = self.gdf_query.groupby(self.id_col).count()
             duplicated = list(duplicated[duplicated[self.geom_col]>1].index)
-            gdf_duplicated = self.gdf_query[self.gdf_query[self.id_col].isin(duplicated)]
-            # Removing the annoying buffer warning
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                # Drop the duplicated rows and dissolve the geometris
-                gdf_duplicated = pandas.merge(
-                    gdf_duplicated.drop_duplicates(subset=self.id_col).drop(columns=self.geom_col), 
-                    gdf_duplicated.dissolve(by=self.id_col).buffer(1e-10).buffer(-1e-10).reset_index().rename(columns={0: self.geom_col}), 
-                    on=self.id_col,
-                    how='left'
-                )
-            self.gdf_query = pandas.concat([
-                self.gdf_query[~self.gdf_query[self.id_col].isin(duplicated)], 
-                gdf_duplicated,
-            ]).sort_values(by=[self.dt_col, self.overview_key_col]).reset_index(drop=True)
+            if len(duplicated)>0:
+                gdf_duplicated = self.gdf_query[self.gdf_query[self.id_col].isin(duplicated)]
+                # Removing the annoying buffer warning
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    # Drop the duplicated rows and dissolve the geometris
+                    gdf_duplicated = pandas.merge(
+                        gdf_duplicated.drop_duplicates(subset=self.id_col).drop(columns=self.geom_col), 
+                        gdf_duplicated.dissolve(by=self.id_col).buffer(1e-10).buffer(-1e-10).reset_index().rename(columns={0: self.geom_col}), 
+                        on=self.id_col,
+                        how='left'
+                    )
+                self.gdf_query = pandas.concat([
+                    self.gdf_query[~self.gdf_query[self.id_col].isin(duplicated)], 
+                    gdf_duplicated,
+                ]).sort_values(by=[self.dt_col, self.overview_key_col]).reset_index(drop=True)
 
             if verbose:
                 print('gdf_query after merging duplicated ', len(self.gdf_query))
