@@ -58,7 +58,8 @@ class Vectorstore(object):
     NUMERIC_LAYERS            = []
     TIMESTAMP_LAYERS          = []
     CATEGORICAL_LAYERS        = []
-    HISTOGRAM_FOR_CATEGORICAL_LAYERS = True
+    HISTOGRAM_FOR_TIMESTAMP_LAYERS = True    # Must be True since table will be used for indexing.
+    HISTOGRAM_FOR_CATEGORICAL_LAYERS = True  # Optional
     PERCENTILES               = [0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1]
     
     # Min and max datetime conventions (used when querying data)
@@ -150,9 +151,17 @@ class Vectorstore(object):
         self.numeric_layers = self.NUMERIC_LAYERS if numeric_layers is None else numeric_layers
         self.timestamp_layers = self.TIMESTAMP_LAYERS if timestamp_layers is None else timestamp_layers
         self.categorical_layers = self.CATEGORICAL_LAYERS if categorical_layers is None else categorical_layers
+        self.histogram_for_timestamp_layers = self.HISTOGRAM_FOR_TIMESTAMP_LAYERS # Currently required to be True
         self.histogram_for_categorical_layers = self.HISTOGRAM_FOR_CATEGORICAL_LAYERS if histogram_for_categorical_layers is None \
             else histogram_for_categorical_layers
         self.percentiles = self.PERCENTILES if percentiles is None else percentiles
+        
+        # If the vectorstore already exists, read the settings and metadata
+        try:
+            self.read_vectorstore_settings()
+            self.metadata_from_parquet()
+        except:
+            pass
 
     @staticmethod
     def polygons2geodataframe(lst_polygons, geom_col, crs=4326):
@@ -443,11 +452,14 @@ class Vectorstore(object):
         for numeric_layer in self.numeric_layers:
             filepath = os.path.join(self.overview_directory, 'overview_statistics_' + numeric_layer + '.parquet')
             df_cell_statistics_layer = df_cell_statistics[numeric_layer].T.rename_axis(self.overview_key_col).reset_index()
+            df_cell_statistics_layer = df_cell_statistics_layer.set_index(self.overview_key_col)
             df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
             
     def _calc_write_overview_statistics_temporal(self):
+        """
+        Timestamp treated as numeric separately from the other numeric layers. (pandas .describe does not work for the combined layers)
+        """
         df_cell_statistics = []
-        # Timestamp layer (treating as numeric separately from the other numeric layers because, pandas describe does not work for the combined layers)
         for i, row in self.gdf_meta[[self.overview_key_col, 'filepath']].iterrows():
             df = pandas.read_parquet(row['filepath'], columns=self.timestamp_layers)
             df = df.describe(percentiles=self.percentiles, datetime_is_numeric=True)
@@ -466,6 +478,7 @@ class Vectorstore(object):
             df_cell_statistics_layer = df_cell_statistics_layer.reset_index()
 
             filepath = os.path.join(self.overview_directory, 'overview_statistics_' + timestamp_layer + '.parquet')
+            df_cell_statistics_layer = df_cell_statistics_layer.set_index(self.overview_key_col)
             df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
 
     def _calc_write_overview_statistics_categorical(self):
@@ -483,39 +496,34 @@ class Vectorstore(object):
         df_cell_statistics = pandas.concat(df_cell_statistics, axis=1)
 
         for categorical_layer in self.categorical_layers:
-            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + categorical_layer + '.parquet')
             df_cell_statistics_layer = df_cell_statistics[categorical_layer].T.rename_axis(self.overview_key_col).reset_index()
             df_cell_statistics_layer['count'] = df_cell_statistics_layer['count'].astype(int)
             df_cell_statistics_layer['unique'] = df_cell_statistics_layer['unique'].astype(int)
             df_cell_statistics_layer['freq'] = df_cell_statistics_layer['freq'].astype(int)
-            df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
-
-    def _calc_write_overview_histogram_categorical(self):
-        # Categorical layers (full histogram)
-        for categorical_layer in self.categorical_layers:
-            df_cell_statistics_layer = []
-            for i, row in self.gdf_meta[[self.overview_key_col, 'filepath']].iterrows():
-                df1 = pandas.read_parquet(row['filepath'], columns=self.categorical_layers)
-                df2 = df1[categorical_layer].value_counts()
-                df2[self.overview_key_col] = row[self.overview_key_col]
-                df_cell_statistics_layer.append(df2)
-
-            filepath = os.path.join(self.overview_directory, 'overview_histogram_' + categorical_layer + '.parquet')
-            df_cell_statistics_layer = pandas.concat(df_cell_statistics_layer, axis=1)
-            try:
-                df_cell_statistics_layer = df_cell_statistics_layer.sort_index().T.set_index(self.overview_key_col).fillna(0).astype(int).reset_index()
-            except:
-                # Likely mixed string and numeric-type data column, so try without the sort_index()
-                df_cell_statistics_layer = df_cell_statistics_layer.T.set_index(self.overview_key_col).fillna(0).astype(int).reset_index()
-                sorted_hist_values = sorted([c for c in df_cell_statistics_layer.columns if c!=self.overview_key_col])
-                df_cell_statistics_layer = df_cell_statistics_layer[[self.overview_key_col] + sorted_hist_values]
-                translate_to_string = {u: str(u) for u in sorted_hist_values}
-                df_cell_statistics_layer = df_cell_statistics_layer.rename(columns=translate_to_string)
-
+            
+            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + categorical_layer + '.parquet')
+            df_cell_statistics_layer = df_cell_statistics_layer.set_index(self.overview_key_col)
             df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
             
-    def calc_overview_statistics(self, numeric_layers=None, timestamp_layers=None, categorical_layers=None,
-                             histogram_for_categorical_layers=True, percentiles=None):
+    def _calc_write_overview_histogram(self, histogram_layer):
+        # Categorical and timestamp layers only (full histogram)
+        assert(histogram_layer in (self.categorical_layers + self.timestamp_layers))
+
+        df_cell_hist = []
+        for i, row in self.gdf_meta[[self.overview_key_col, 'filepath']].iterrows():
+            df1 = pandas.read_parquet(row['filepath'], columns=[histogram_layer])
+            df2 = df1[histogram_layer].value_counts()
+            df2.name = row[self.overview_key_col]
+            df_cell_hist.append(df2)
+        df_cell_hist = pandas.concat(df_cell_hist, axis=1)
+        df_cell_hist = df_cell_hist.sort_index().fillna(0).astype(int)
+
+        filepath = os.path.join(self.overview_directory, 'overview_histogram_' + histogram_layer + '.parquet')
+        df_cell_hist.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
+
+    def calc_overview_statistics(
+        self, numeric_layers=None, timestamp_layers=None, categorical_layers=None, histogram_for_categorical_layers=True, percentiles=None
+    ):
         """
         Caluculate the overview layer statistics and write them out to parquet
         """
@@ -525,6 +533,7 @@ class Vectorstore(object):
             self.timestamp_layers = timestamp_layers 
         if categorical_layers is not None:
             self.categorical_layers = categorical_layers 
+        self.histogram_for_timestamp_layers = self.HISTOGRAM_FOR_TIMESTAMP_LAYERS
         if histogram_for_categorical_layers is not None:
             self.histogram_for_categorical_layers = histogram_for_categorical_layers 
         if percentiles is not None:
@@ -541,14 +550,20 @@ class Vectorstore(object):
             self._calc_write_overview_statistics_numeric()
         if len(self.timestamp_layers)>0:
             self._calc_write_overview_statistics_temporal()
+            if self.histogram_for_timestamp_layers:
+                for timestamp_layer in self.timestamp_layers:
+                    self._calc_write_overview_histogram(timestamp_layer)
         if len(self.categorical_layers)>0:
             self._calc_write_overview_statistics_categorical()
             if self.histogram_for_categorical_layers:
-                self._calc_write_overview_histogram_categorical()
+                for categorical_layer in self.categorical_layers:
+                    self._calc_write_overview_histogram(categorical_layer)
             
     def read_overview_statistics(self, layer):
         filepath = os.path.join(self.overview_directory, 'overview_statistics_' + layer + '.parquet')
         try:
+            # If needed, transpose after reading the parquet instead of in the parquet file itself, 
+            # because parquet has limitations in storing mixed datatypes in columns.
             df = pandas.read_parquet(filepath)
         except Exception as e:
             print(e)
