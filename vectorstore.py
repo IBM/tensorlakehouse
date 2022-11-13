@@ -45,6 +45,7 @@ class Vectorstore(object):
     
     # Policy how to deal with polygons that intersect overview cells ("cut", "original", "both")
     INTERSECTION_POLICY       = 'cut' # 'original', 'both'
+    INTERSECTION_FLAG_COL     = 'intersection_flag'
     
     # GeoDataFrame colum conventions (used when loading data from gdf or vectorstore)
     DT_COL                    = 'timestamp'
@@ -82,6 +83,7 @@ class Vectorstore(object):
                  partition_order = None,
                  filter_key_levels = None,
                  intersection_policy = None,
+                 intersection_flag_col = None,
                  dt_col = None,
                  geom_col = None, 
                  id_col = None,
@@ -135,6 +137,7 @@ class Vectorstore(object):
         # Policy how to deal with polygons that intersect overview cells ("cut", "original", "both")
         self.intersection_policy = self.INTERSECTION_POLICY if intersection_policy is None else intersection_policy
         assert(self.intersection_policy in ['cut', 'original', 'both'])
+        self.intersection_flag_col = self.INTERSECTION_FLAG_COL if intersection_flag_col is None else intersection_flag_col
         
         # Table specific column information
         self.dt_col = self.DT_COL if dt_col is None else dt_col
@@ -334,7 +337,7 @@ class Vectorstore(object):
         # Geodataframe of geolab cells (all on the same overview_level resolution)
         self.gdf_total_bounds_cells = self._polyCells2geodataframe(self.total_bounds_cells)
         
-        # (B1) JOIN ORIGINAL GEODATAFRAME TO GET THE SPATIAL KEY FROM THE OVERVIEW CELLS 
+        # (B2) JOIN ORIGINAL GEODATAFRAME TO GET THE SPATIAL KEY FROM THE OVERVIEW CELLS 
         # Joining original GeoDataFram with overview cells may result in duplication of rows. 
         # intersection_policy specifies how to deal with the geometry in such cases
         if self.intersection_policy=='cut':
@@ -352,13 +355,17 @@ class Vectorstore(object):
                 on=self.id_col
             )
             
-        # (C) COMBINE THE TEMPORAL AND SPATIAL KEYS INTO ONE "overview_key".
+        # (C) KEEP TRACK OF THE POLYGONS THAT INTERSECT THE OVERVIEW CELLS
+        self.gdf_intersection[self.intersection_flag_col] = False
+        self.gdf_intersection.loc[self.gdf_intersection[self.id_col].duplicated(keep=False), self.intersection_flag_col] = True
+        
+        # (D) COMBINE THE TEMPORAL AND SPATIAL KEYS INTO ONE "overview_key".
         self.gdf_intersection[self.overview_key_col] = self._generate_overview_keys(self.gdf_intersection)
         
-        # (D) CREATE COLUMNS FOR SPATIAL PARTITIONING
+        # (E) CREATE COLUMNS FOR SPATIAL PARTITIONING
         self._create_spatial_partition_columns(self.gdf_intersection)
         
-        # (E) CREATE FILTER-KEY COLUMNS WITH KEYS FULLY CONTAINING THE GEOMETRY BOUNDING BOX AT VARIOUS RESOLUTION LEVELS
+        # (F) CREATE FILTER-KEY COLUMNS WITH KEYS FULLY CONTAINING THE GEOMETRY BOUNDING BOX AT VARIOUS RESOLUTION LEVELS
         self._create_filter_key_columns(self.gdf_intersection)
         
         
@@ -521,6 +528,20 @@ class Vectorstore(object):
         filepath = os.path.join(self.overview_directory, 'overview_histogram_' + histogram_layer + '.parquet')
         df_cell_hist.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
 
+    def _calc_write_intersected_geometry(self):
+        # Determine the geometries that intersect overview cells
+        df_intersected = []
+        for i, row in self.gdf_meta[[self.overview_key_col, 'filepath']].iterrows():
+            df1 = pandas.read_parquet(row['filepath'], columns=[self.overview_key_col, self.id_col, self.intersection_flag_col])
+            df_intersected.append(df1[df1[self.intersection_flag_col]])
+        df_intersected = pandas.concat(df_intersected).reset_index(drop=True)
+        
+        # Generate a two column table (id_col and lists of overview_key_col) 
+        df_intersected = df_intersected.groupby(self.id_col)[self.overview_key_col].apply(list).reset_index()
+
+        filepath = os.path.join(self.overview_directory, 'intersected_geometry.parquet')
+        df_intersected = df_intersected.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
+
     def calc_overview_statistics(
         self, numeric_layers=None, timestamp_layers=None, categorical_layers=None, histogram_for_categorical_layers=True, percentiles=None
     ):
@@ -558,6 +579,9 @@ class Vectorstore(object):
             if self.histogram_for_categorical_layers:
                 for categorical_layer in self.categorical_layers:
                     self._calc_write_overview_histogram(categorical_layer)
+                    
+        # Summary of intersected geometries (at overview cell boundaries)
+        self._calc_write_intersected_geometry()
             
     def read_overview_statistics(self, layer):
         filepath = os.path.join(self.overview_directory, 'overview_statistics_' + layer + '.parquet')
@@ -579,6 +603,15 @@ class Vectorstore(object):
             df = pandas.DataFrame()
         return df
 
+    def read_intersected_geometry(self):
+        filepath = os.path.join(self.overview_directory, 'intersected_geometry.parquet')
+        try:
+            df = pandas.read_parquet(filepath)
+        except Exception as e:
+            print(e)
+            df = pandas.DataFrame()
+        return df
+    
     def metadata_from_parquet(self, verbose=False):
         glob_wildcard_path = self.dataset_directory
         for partition_name in self.partitions:
