@@ -8,14 +8,11 @@ from pairs_python.core import pairs_quadtree as pqt
 
 import numpy
 import pandas
-from pandas.api.types import is_numeric_dtype
 from datetime import datetime, timedelta
 import pytz
 import geopandas
 import shapely
 import pyproj
-import contextily
-import sqlite3
 from functools import partial
 import json
 
@@ -59,9 +56,10 @@ class Vectorstore(object):
     NUMERIC_LAYERS            = []
     TIMESTAMP_LAYERS          = []
     CATEGORICAL_LAYERS        = []
-    HISTOGRAM_FOR_TIMESTAMP_LAYERS = True    # Must be True since table will be used for indexing.
-    HISTOGRAM_FOR_CATEGORICAL_LAYERS = True  # Optional
     PERCENTILES               = [0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1]
+    
+    # Pyramids
+    PYRAMID_LEVELS            = []  # Initialize as empty list. Will be populated when pyramids are generated
     
     # Min and max datetime conventions (used when querying data)
     MIN_DT = datetime(1, 1, 1).replace(tzinfo=pytz.utc)
@@ -93,7 +91,6 @@ class Vectorstore(object):
                  numeric_layers = None,
                  timestamp_layers = None,
                  categorical_layers = None,
-                 histogram_for_categorical_layers = None,
                  percentiles = None,
                 ):
         
@@ -154,11 +151,11 @@ class Vectorstore(object):
         self.numeric_layers = self.NUMERIC_LAYERS if numeric_layers is None else numeric_layers
         self.timestamp_layers = self.TIMESTAMP_LAYERS if timestamp_layers is None else timestamp_layers
         self.categorical_layers = self.CATEGORICAL_LAYERS if categorical_layers is None else categorical_layers
-        self.histogram_for_timestamp_layers = self.HISTOGRAM_FOR_TIMESTAMP_LAYERS # Currently required to be True
-        self.histogram_for_categorical_layers = self.HISTOGRAM_FOR_CATEGORICAL_LAYERS if histogram_for_categorical_layers is None \
-            else histogram_for_categorical_layers
         self.percentiles = self.PERCENTILES if percentiles is None else percentiles
-        
+
+        # Pyramid variables
+        self.pyramid_levels = self.PYRAMID_LEVELS  # Will be set when pyramids are generated
+
         # If the vectorstore already exists, read the settings and metadata
         try:
             self.read_vectorstore_settings()
@@ -432,8 +429,8 @@ class Vectorstore(object):
         vs_settings['numeric_layers'] = self.numeric_layers
         vs_settings['timestamp_layers'] = self.timestamp_layers
         vs_settings['categorical_layers'] = self.categorical_layers
-        vs_settings['histogram_for_categorical_layers'] = self.histogram_for_categorical_layers
         vs_settings['percentiles'] = self.percentiles
+        vs_settings['pyramid_levels'] = self.pyramid_levels
 
         json_path = os.path.join(self.dataset_directory, self.dataset+'.json')
         with open(json_path, 'w') as f:
@@ -445,6 +442,29 @@ class Vectorstore(object):
             vs_settings = json.load(f)
         for k in vs_settings:
             setattr(self, k, vs_settings[k])
+            
+    def _calc_write_intersected_geometry(self):
+        # Determine the geometries that intersect overview cells
+        df_intersected = []
+        for i, row in self.gdf_meta[[self.overview_key_col, 'filepath']].iterrows():
+            df1 = pandas.read_parquet(row['filepath'], columns=[self.overview_key_col, self.id_col, self.intersection_flag_col])
+            df_intersected.append(df1[df1[self.intersection_flag_col]])
+        df_intersected = pandas.concat(df_intersected).reset_index(drop=True)
+        
+        # Generate a two column table (id_col and lists of overview_key_col) 
+        df_intersected = df_intersected.groupby(self.id_col)[self.overview_key_col].apply(list).reset_index()
+
+        filepath = os.path.join(self.overview_directory, 'intersected_geometry.parquet')
+        df_intersected = df_intersected.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
+
+    def read_intersected_geometry(self):
+        filepath = os.path.join(self.overview_directory, 'intersected_geometry.parquet')
+        try:
+            df = pandas.read_parquet(filepath)
+        except Exception as e:
+            print(e)
+            df = pandas.DataFrame()
+        return df
             
     def _calc_write_overview_statistics_numeric(self):
         df_cell_statistics = []
@@ -527,24 +547,8 @@ class Vectorstore(object):
 
         filepath = os.path.join(self.overview_directory, 'overview_histogram_' + histogram_layer + '.parquet')
         df_cell_hist.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
-
-    def _calc_write_intersected_geometry(self):
-        # Determine the geometries that intersect overview cells
-        df_intersected = []
-        for i, row in self.gdf_meta[[self.overview_key_col, 'filepath']].iterrows():
-            df1 = pandas.read_parquet(row['filepath'], columns=[self.overview_key_col, self.id_col, self.intersection_flag_col])
-            df_intersected.append(df1[df1[self.intersection_flag_col]])
-        df_intersected = pandas.concat(df_intersected).reset_index(drop=True)
         
-        # Generate a two column table (id_col and lists of overview_key_col) 
-        df_intersected = df_intersected.groupby(self.id_col)[self.overview_key_col].apply(list).reset_index()
-
-        filepath = os.path.join(self.overview_directory, 'intersected_geometry.parquet')
-        df_intersected = df_intersected.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
-
-    def calc_overview_statistics(
-        self, numeric_layers=None, timestamp_layers=None, categorical_layers=None, histogram_for_categorical_layers=True, percentiles=None
-    ):
+    def calc_overview_statistics(self, numeric_layers=None, timestamp_layers=None, categorical_layers=None, percentiles=None):
         """
         Caluculate the overview layer statistics and write them out to parquet
         """
@@ -554,9 +558,6 @@ class Vectorstore(object):
             self.timestamp_layers = timestamp_layers 
         if categorical_layers is not None:
             self.categorical_layers = categorical_layers 
-        self.histogram_for_timestamp_layers = self.HISTOGRAM_FOR_TIMESTAMP_LAYERS
-        if histogram_for_categorical_layers is not None:
-            self.histogram_for_categorical_layers = histogram_for_categorical_layers 
         if percentiles is not None:
             self.percentiles = percentiles 
         
@@ -571,14 +572,12 @@ class Vectorstore(object):
             self._calc_write_overview_statistics_numeric()
         if len(self.timestamp_layers)>0:
             self._calc_write_overview_statistics_temporal()
-            if self.histogram_for_timestamp_layers:
-                for timestamp_layer in self.timestamp_layers:
-                    self._calc_write_overview_histogram(timestamp_layer)
+            for timestamp_layer in self.timestamp_layers:
+                self._calc_write_overview_histogram(timestamp_layer)
         if len(self.categorical_layers)>0:
             self._calc_write_overview_statistics_categorical()
-            if self.histogram_for_categorical_layers:
-                for categorical_layer in self.categorical_layers:
-                    self._calc_write_overview_histogram(categorical_layer)
+            for categorical_layer in self.categorical_layers:
+                self._calc_write_overview_histogram(categorical_layer)
                     
         # Summary of intersected geometries (at overview cell boundaries)
         self._calc_write_intersected_geometry()
@@ -602,10 +601,226 @@ class Vectorstore(object):
             print(e)
             df = pandas.DataFrame()
         return df
+    
+    def _numeric_pyramids(self, numeric_layer, verbose=False):
+        if verbose:
+            print('numeric_layer', numeric_layer)
+        # Get the cell statistics at the overview level
+        df_cell_statistics = self.read_overview_statistics(numeric_layer)
 
-    def read_intersected_geometry(self):
-        filepath = os.path.join(self.overview_directory, 'intersected_geometry.parquet')
+        # Keep a limited number of statistics and add the pyramid keys
+        df = df_cell_statistics[['count', 'mean', 'min', 'max']]
+        df = df.join(self.df_pyramid_keys)
+
+        # Calculate the sum
+        df['sum'] = df['count'] * df['mean']
+
+        for pyramid_level in self.pyramid_levels:
+            if verbose:
+                print('pyramid_level', pyramid_level)
+            # Naively aggregate count, sum, min, max
+            df1 = []
+            df1.append(df[['pyramid_level' + str(pyramid_level), 'count']].groupby('pyramid_level' + str(pyramid_level)).sum())
+            df1.append(df[['pyramid_level' + str(pyramid_level), 'sum']].groupby('pyramid_level' + str(pyramid_level)).sum())
+            df1.append(df[['pyramid_level' + str(pyramid_level), 'min']].groupby('pyramid_level' + str(pyramid_level)).min())
+            df1.append(df[['pyramid_level' + str(pyramid_level), 'max']].groupby('pyramid_level' + str(pyramid_level)).max())
+            df1 = pandas.concat(df1, axis=1)
+
+            # Correct the count and sum statistics for polygons intersecting multiple overview cells 
+            # (otherwise they would be counted multiple times)
+            df3 = []
+            for i, row in self.df_intersected_T.iterrows():
+                overview_key = row[self.overview_key_col]
+                filepath = row['filepath']
+                lst_filter_id = row[self.id_col]
+                df2 = pandas.read_parquet(filepath, columns=[self.overview_key_col, self.id_col, numeric_layer])
+                df2 = df2[df2[self.id_col].isin(lst_filter_id)]
+                df3.append(df2)
+
+            df3 = pandas.concat(df3).reset_index(drop=True)
+            df3 = df3.set_index(self.overview_key_col)
+            df3 = df3.join(self.df_pyramid_keys)
+
+            # Groupby id and pyramid level together to find relevant overcounts
+            df4 = []
+            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), numeric_layer]].groupby(
+                [self.id_col, 'pyramid_level' + str(pyramid_level)]
+            ).count().rename(columns={numeric_layer: 'count'}))
+            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), numeric_layer]].groupby(
+                [self.id_col, 'pyramid_level' + str(pyramid_level)]
+            ).first().rename(columns={numeric_layer: 'first'}))
+            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), numeric_layer]].groupby(
+                [self.id_col, 'pyramid_level' + str(pyramid_level)]
+            ).sum().rename(columns={numeric_layer: 'sum'}))
+            df4 = pandas.concat(df4, axis=1)
+
+            # Prepare for summing up by pyramid key
+            df4 = df4[df4['count']>1]
+            df4 = df4.reset_index()
+            df4['overcount'] = df4['count']-1
+            df4['oversum'] = df4['overcount'] * df4['first'] 
+
+            # Sum up the overcount and oversum by pyramid level key
+            df5 = df4[['pyramid_level' + str(pyramid_level), 'overcount', 'oversum']].groupby('pyramid_level' + str(pyramid_level)).sum()
+
+            # Join with the original statistics and correct them
+            df6 = df1.join(df5)
+            df6['count'] = df6['count'] - df6['overcount'].fillna(0)
+            df6['sum'] = df6['sum'] - df6['oversum'].fillna(0)
+            #del df6['overcount']
+            #del df6['oversum']
+            df6['mean'] = df6['sum'] / df6['count']
+            #del df6['sum']
+            df6['count'] = df6['count'].astype(int)
+            df6 = df6[['count', 'mean', 'min', 'max']]
+
+            # Save to parquet file
+            filepath = os.path.join(self.overview_directory, 'pyramid_level' + str(pyramid_level) + '_layer_' + numeric_layer + '.parquet')
+            df6.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
+            
+    def _histogram_pyramids(self, categorical_layer, verbose=False):
+        if verbose:
+            print('histogram_layer', categorical_layer)
+            
+        # Get the histogram at the overview level
+        df = self.read_overview_histogram(categorical_layer)
+        df = df.T
+        histogram_categories = df.columns
+        df = df.join(self.df_pyramid_keys)
+
+        for pyramid_level in self.pyramid_levels:
+            if verbose:
+                print('pyramid_level', pyramid_level)
+            # Naively aggregate the counts for each historgram category
+            df1 = []
+            for category in histogram_categories:
+                df1.append(df[['pyramid_level' + str(pyramid_level), category]].groupby('pyramid_level' + str(pyramid_level)).sum())
+            df1 = pandas.concat(df1, axis=1)
+
+            # Correct the statistics for polygons intersecting multiple overview cells 
+            # (otherwise they would be counted multiple times)
+            df3 = []
+            for i, row in self.df_intersected_T.iterrows():
+                overview_key = row[self.overview_key_col]
+                filepath = row['filepath']
+                lst_filter_id = row[self.id_col]
+                df2 = pandas.read_parquet(filepath, columns=[self.overview_key_col, self.id_col, categorical_layer])
+                df2 = df2[df2[self.id_col].isin(lst_filter_id)]
+                df3.append(df2)
+
+            df3 = pandas.concat(df3).reset_index(drop=True)
+            df3 = df3.set_index(self.overview_key_col)
+            df3 = df3.join(self.df_pyramid_keys)
+
+            # Groupby id and pyramid level together to find relevant overcounts
+            df4 = []
+            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), categorical_layer]].groupby(
+                [self.id_col, 'pyramid_level' + str(pyramid_level)]
+            ).count().rename(columns={categorical_layer: 'count'}))
+            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), categorical_layer]].groupby(
+                [self.id_col, 'pyramid_level' + str(pyramid_level)]
+            ).first().rename(columns={categorical_layer: 'category'}))
+
+            df4 = pandas.concat(df4, axis=1)
+
+            # Prepare for summing up by pyramid key
+            df4 = df4[df4['count']>1]
+            df4 = df4.reset_index()
+            df4['overcount'] = df4['count']-1
+
+            # Sum up the overcount and oversum by pyramid level key
+            df5 = df4[['pyramid_level' + str(pyramid_level), 'category', 'overcount']].groupby(
+                ['pyramid_level' + str(pyramid_level), 'category']
+            ).sum()
+
+            # Join with the original statistics and correct them
+            df1.columns.name = 'category'
+            df1_stacked = pandas.DataFrame(df1.stack().rename('count'))
+            df6 = df1_stacked.join(df5)
+            df6['count'] = df6['count'] - df6['overcount'].fillna(0)
+            df6 = df6[['count']]
+            df6 = df6.unstack()['count'].astype(int)
+            df6.columns.name = None
+
+            # Save to parquet file
+            filepath = os.path.join(self.overview_directory, 'pyramid_level' + str(pyramid_level) + '_histogram_' + categorical_layer + '.parquet')
+            df6.to_parquet(path=filepath, engine='pyarrow', compression='snappy')            
+            
+    def _categorical_pyramids(self, categorical_layer, verbose=False):
+        if verbose:
+            print('categorical_layer', categorical_layer)
+            for pyramid_level in self.pyramid_levels:
+                print('pyramid_level', pyramid_level)
+                filepath_histogram = os.path.join(
+                    self.overview_directory, 
+                    'pyramid_level' + str(pyramid_level) + '_histogram_' + categorical_layer + '.parquet'
+                )
+                try:
+                    df = pandas.read_parquet(filepath_histogram)
+                except:
+                    # Generate histogram pyramid first
+                    print('WARNING: (Re-)generating histogram needed for categorical pyramid')
+                    self._histogram_pyramids(categorical_layer, verbose=verbose)
+                    df = pandas.read_parquet(filepath_histogram)
+                    
+                df1 = df[[]].copy()
+                df1['count'] = df.sum(axis=1)
+                df_stacked = df[df!=0].stack().reset_index()
+                df1['unique'] = df_stacked.groupby('pyramid_level' + str(pyramid_level)).count()['level_1']
+                df1['top'] = df.idxmax(axis=1)
+                df1['freq'] = df_stacked.groupby('pyramid_level' + str(pyramid_level)).max()[0].astype(int)
+
+                # Save to parquet file
+                filepath = os.path.join(self.overview_directory, 'pyramid_level' + str(pyramid_level) + '_layer_' + categorical_layer + '.parquet')
+                df1.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
+                
+    def _create_pyramid_columns(self, gdf):
+        self.pyramid_levels = list(range(self.overview_level + 1))
+        for pyramid_level in self.pyramid_levels:
+            levelsUp = self.overview_level - pyramid_level
+            getParentKey_part = partial(pqt.getParentKey, levelsUp=levelsUp)
+            gdf['pyramid_level' + str(pyramid_level)] = gdf[self.spatial_key_col].apply(getParentKey_part)
+            
+    def pyramid_keys(self):
+        self.df_pyramid_keys = self.gdf_meta.copy()
+        self._create_pyramid_columns(self.df_pyramid_keys)
+        self.df_pyramid_keys = self.df_pyramid_keys[
+            [self.overview_key_col] + ['pyramid_level' + str(l) for l in self.pyramid_levels]
+        ].set_index(self.overview_key_col)
+                
+    def calc_pyramids(self, verbose=False):
+        if verbose:
+            print('Calculating pyramids')
+            
+        # Generate the pyramid keys
+        self.pyramid_keys()
+        
+        # Find the geometries intersecting overview cells
+        self.df_intersected = self.read_intersected_geometry()
+
+        # Transpose df_intersected so we can make quick filter queries using the id_col
+        self.df_intersected_T = self.df_intersected.set_index(self.id_col)[self.overview_key_col].explode().reset_index()
+        self.df_intersected_T = self.df_intersected_T.groupby(self.overview_key_col)[self.id_col].apply(list).reset_index()
+        self.df_intersected_T = pandas.merge(self.df_intersected_T, self.gdf_meta[[self.overview_key_col, 'filepath']], on=self.overview_key_col)
+        
+        for numeric_layer in self.numeric_layers:
+            self._numeric_pyramids(numeric_layer, verbose=verbose)
+            
+        for categorical_layer in self.categorical_layers:
+            self._histogram_pyramids(categorical_layer, verbose=verbose)
+            self._categorical_pyramids(categorical_layer, verbose=verbose)
+            
+        # Update the vectorstore settings
+        self.write_vectorstore_settings()
+        
+    def read_pyramid(self, pyramid_level, layer, histogram=False):
+        if histogram:
+            filepath = os.path.join(self.overview_directory, 'pyramid_level' + str(pyramid_level) + '_histogram_' + layer + '.parquet')
+        else:
+            filepath = os.path.join(self.overview_directory, 'pyramid_level' + str(pyramid_level) + '_layer_' + layer + '.parquet')
         try:
+            # If needed, transpose after reading the parquet instead of in the parquet file itself, 
+            # because parquet has limitations in storing mixed datatypes in columns.
             df = pandas.read_parquet(filepath)
         except Exception as e:
             print(e)
