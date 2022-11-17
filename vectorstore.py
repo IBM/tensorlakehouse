@@ -261,13 +261,30 @@ class Vectorstore(object):
 
     def _generate_overview_keys(self, df):
         """
-        Combine the temporal and spatial keys into one "overview_key"
+        Combine the temporal, spatial and dimension keys into one "overview_key"
         """
         df[self.overview_key_col] = 'level' + df[self.overview_level_col].astype(str) + '_' + df[self.spatial_key_col].astype(str) 
-        for k in self.temporal_keys:
+        for k in self.temporal_keys: # + self.dimension_keys:
             df[self.overview_key_col] = df[self.overview_key_col] + '_' + k + '_' + df[k].astype(str)
         return df[self.overview_key_col]
-    
+
+    def _decompose_overview_keys(self, df):
+        """
+        Decompose the overview_key into temporal, spatial, and dimension keys
+        """
+        cols = [self.overview_level_col, self.spatial_key_col]
+        df[[self.overview_level_col, self.spatial_key_col]] = df[self.overview_key_col].apply(
+            lambda x: x.split('level', 1)[1].split('_', 2)[:2]).to_list()
+        df[self.overview_level_col] = df[self.overview_level_col].astype(int)
+        df[self.spatial_key_col] = df[self.spatial_key_col].astype(int)
+        for k in self.temporal_keys: 
+            cols = cols + [k]
+            df[k] = df[self.overview_key_col].apply(lambda x: int(x.split(k+'_')[1].split('_')[0]))
+        #for k in self.dimension_keys: 
+        #    cols = cols=[k]
+        #    df[k] = df[self.overview_key_col].apply(lambda x: x.split(k+'_')[1].split('_')[0]) # Dimension keys are of type str
+        return df[cols]
+
     def _select_parquet_file(self, gdf, overview_key):
         df_part = gdf[gdf[self.overview_key_col]==overview_key].reset_index(drop=True)
         filepath = self.dataset_directory
@@ -292,9 +309,8 @@ class Vectorstore(object):
         assert(self._all_the_same(gdf[self.overview_key_col]))
         
         # Get the center lat/lon of the overview tile
-        level, key = gdf.loc[0, self.overview_key_col].split('level')[1].split('_')
-        level = int(level)
-        key = int(key)
+        key = gdf.loc[0, self.spatial_key_col]
+        level = gdf.loc[0, self.overview_level_col]
         lat, lon = pqt.getCenterLatLon(key, level)
 
         # local_azimuthal_projection preserves angle (e.g. circles stay circles)
@@ -527,11 +543,19 @@ class Vectorstore(object):
         df_cell_statistics = pandas.concat(df_cell_statistics, axis=1)
 
         for numeric_layer in self.numeric_layers:
-            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + numeric_layer + '.parquet')
             df_cell_statistics_layer = df_cell_statistics[numeric_layer].T.rename_axis(self.overview_key_col).reset_index()
+            self._decompose_overview_keys(df_cell_statistics_layer)
             df_cell_statistics_layer = df_cell_statistics_layer.set_index(self.overview_key_col)
+            
+            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + numeric_layer + '.parquet')
             df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
             
+    def _sanitize_dt_column(self, dt64):
+        dt64 = dt64.apply(lambda x: x.tz_localize(None))
+        ts = numpy.round((dt64 - numpy.datetime64('1970-01-01T00:00:00')) / numpy.timedelta64(1, 'us')) /1e6
+        ts = ts.apply(lambda x: datetime.utcfromtimestamp(x).replace(tzinfo=pytz.utc))
+        return ts
+
     def _calc_write_overview_statistics_temporal(self):
         """
         Timestamp treated as numeric separately from the other numeric layers. (pandas .describe does not work for the combined layers)
@@ -548,14 +572,13 @@ class Vectorstore(object):
             df_cell_statistics_layer = df_cell_statistics[timestamp_layer].T.rename_axis(self.overview_key_col)
             for col in [c for c in df_cell_statistics_layer.columns if c!='count']:
                 # From object to datetime requires some serious data wrangling
-                df_cell_statistics_layer[col] = df_cell_statistics_layer[col].apply(
-                    lambda x: x.tz_localize(None)
-                ).astype('datetime64[us]').apply(lambda x: x.tz_localize(pytz.utc))
+                df_cell_statistics_layer[col] = self._sanitize_dt_column(df_cell_statistics_layer[col])
             df_cell_statistics_layer['count'] = df_cell_statistics_layer['count'].astype(int)
             df_cell_statistics_layer = df_cell_statistics_layer.reset_index()
+            self._decompose_overview_keys(df_cell_statistics_layer)
+            df_cell_statistics_layer = df_cell_statistics_layer.set_index(self.overview_key_col)
 
             filepath = os.path.join(self.overview_directory, 'overview_statistics_' + timestamp_layer + '.parquet')
-            df_cell_statistics_layer = df_cell_statistics_layer.set_index(self.overview_key_col)
             df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
 
     def _calc_write_overview_statistics_categorical(self):
@@ -578,8 +601,10 @@ class Vectorstore(object):
             df_cell_statistics_layer['unique'] = df_cell_statistics_layer['unique'].astype(int)
             df_cell_statistics_layer['freq'] = df_cell_statistics_layer['freq'].astype(int)
             
-            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + categorical_layer + '.parquet')
+            self._decompose_overview_keys(df_cell_statistics_layer)
             df_cell_statistics_layer = df_cell_statistics_layer.set_index(self.overview_key_col)
+            
+            filepath = os.path.join(self.overview_directory, 'overview_statistics_' + categorical_layer + '.parquet')
             df_cell_statistics_layer.to_parquet(path=filepath, engine='pyarrow', compression='snappy')
             
     def _calc_write_overview_histogram(self, histogram_layer):
@@ -652,6 +677,10 @@ class Vectorstore(object):
             df = pandas.DataFrame()
         return df
     
+    def _pyramid_groupby_cols(self, pyramid_level):
+        cols = ['pyramid_level' + str(pyramid_level)] + self.temporal_keys # + self.dimension_keys
+        return cols
+    
     def _numeric_pyramids(self, numeric_layer, verbose=False):
         if verbose:
             print('numeric_layer', numeric_layer)
@@ -659,21 +688,22 @@ class Vectorstore(object):
         df_cell_statistics = self.read_overview_statistics(numeric_layer)
 
         # Keep a limited number of statistics and add the pyramid keys
-        df = df_cell_statistics[['count', 'mean', 'min', 'max']]
+        df = df_cell_statistics[['count', 'mean', 'min', 'max'] + self.temporal_keys] # + self.dimension_keys
         df = df.join(self.df_pyramid_keys)
 
         # Calculate the sum
         df['sum'] = df['count'] * df['mean']
 
         for pyramid_level in self.pyramid_levels:
-            if verbose:
-                print('pyramid_level', pyramid_level)
             # Naively aggregate count, sum, min, max
             df1 = []
-            df1.append(df[['pyramid_level' + str(pyramid_level), 'count']].groupby('pyramid_level' + str(pyramid_level)).sum())
-            df1.append(df[['pyramid_level' + str(pyramid_level), 'sum']].groupby('pyramid_level' + str(pyramid_level)).sum())
-            df1.append(df[['pyramid_level' + str(pyramid_level), 'min']].groupby('pyramid_level' + str(pyramid_level)).min())
-            df1.append(df[['pyramid_level' + str(pyramid_level), 'max']].groupby('pyramid_level' + str(pyramid_level)).max())
+            cols = self._pyramid_groupby_cols(pyramid_level)
+            if verbose:
+                print('pyramid grouping columns', cols)
+            df1.append(df[cols + ['count']].groupby(cols).sum())
+            df1.append(df[cols + ['sum']].groupby(cols).sum())
+            df1.append(df[cols + ['min']].groupby(cols).min())
+            df1.append(df[cols + ['max']].groupby(cols).max())
             df1 = pandas.concat(df1, axis=1)
 
             # Correct the count and sum statistics for polygons intersecting multiple overview cells 
@@ -683,7 +713,10 @@ class Vectorstore(object):
                 overview_key = row[self.overview_key_col]
                 filepath = row['filepath']
                 lst_filter_id = row[self.id_col]
-                df2 = pandas.read_parquet(filepath, columns=[self.overview_key_col, self.id_col, numeric_layer])
+                df2 = pandas.read_parquet(
+                    filepath, 
+                    columns=[self.overview_key_col, self.id_col, numeric_layer] + self.temporal_keys # + self.dimension_keys
+                )  
                 df2 = df2[df2[self.id_col].isin(lst_filter_id)]
                 df3.append(df2)
 
@@ -691,17 +724,11 @@ class Vectorstore(object):
             df3 = df3.set_index(self.overview_key_col)
             df3 = df3.join(self.df_pyramid_keys)
 
-            # Groupby id and pyramid level together to find relevant overcounts
+            # Groupby id and other keys together to find relevant overcounts
             df4 = []
-            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), numeric_layer]].groupby(
-                [self.id_col, 'pyramid_level' + str(pyramid_level)]
-            ).count().rename(columns={numeric_layer: 'count'}))
-            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), numeric_layer]].groupby(
-                [self.id_col, 'pyramid_level' + str(pyramid_level)]
-            ).first().rename(columns={numeric_layer: 'first'}))
-            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), numeric_layer]].groupby(
-                [self.id_col, 'pyramid_level' + str(pyramid_level)]
-            ).sum().rename(columns={numeric_layer: 'sum'}))
+            df4.append(df3[cols + [self.id_col, numeric_layer]].groupby([self.id_col] + cols).count().rename(columns={numeric_layer: 'count'}))
+            df4.append(df3[cols + [self.id_col, numeric_layer]].groupby([self.id_col] + cols).first().rename(columns={numeric_layer: 'first'}))
+            df4.append(df3[cols + [self.id_col, numeric_layer]].groupby([self.id_col] + cols).sum().rename(columns={numeric_layer: 'sum'}))
             df4 = pandas.concat(df4, axis=1)
 
             # Prepare for summing up by pyramid key
@@ -710,8 +737,8 @@ class Vectorstore(object):
             df4['overcount'] = df4['count']-1
             df4['oversum'] = df4['overcount'] * df4['first'] 
 
-            # Sum up the overcount and oversum by pyramid level key
-            df5 = df4[['pyramid_level' + str(pyramid_level), 'overcount', 'oversum']].groupby('pyramid_level' + str(pyramid_level)).sum()
+            # Sum up the overcount and oversum
+            df5 = df4[cols + ['overcount', 'oversum']].groupby(cols).sum()
 
             # Join with the original statistics and correct them
             df6 = df1.join(df5)
@@ -736,15 +763,25 @@ class Vectorstore(object):
         df = self.read_overview_histogram(categorical_layer)
         df = df.T
         histogram_categories = df.columns
+
+        # Get the temporal (and dimension) keys from the overview key
+        df.index.name = self.overview_key_col
+        df = df.reset_index()
+        self._decompose_overview_keys(df)
+        #del df[self.overview_level_col]
+        #del df[self.spatial_key_col]
+        df = df.set_index(self.overview_key_col)
+
         df = df.join(self.df_pyramid_keys)
 
         for pyramid_level in self.pyramid_levels:
-            if verbose:
-                print('pyramid_level', pyramid_level)
             # Naively aggregate the counts for each historgram category
             df1 = []
+            cols = self._pyramid_groupby_cols(pyramid_level)
+            if verbose:
+                print('pyramid grouping columns', cols)
             for category in histogram_categories:
-                df1.append(df[['pyramid_level' + str(pyramid_level), category]].groupby('pyramid_level' + str(pyramid_level)).sum())
+                df1.append(df[cols + [category]].groupby(cols).sum())
             df1 = pandas.concat(df1, axis=1)
 
             # Correct the statistics for polygons intersecting multiple overview cells 
@@ -754,7 +791,10 @@ class Vectorstore(object):
                 overview_key = row[self.overview_key_col]
                 filepath = row['filepath']
                 lst_filter_id = row[self.id_col]
-                df2 = pandas.read_parquet(filepath, columns=[self.overview_key_col, self.id_col, categorical_layer])
+                df2 = pandas.read_parquet(
+                    filepath, 
+                    columns=[self.overview_key_col, self.id_col, categorical_layer] + self.temporal_keys # + self.dimension_keys
+                )
                 df2 = df2[df2[self.id_col].isin(lst_filter_id)]
                 df3.append(df2)
 
@@ -764,12 +804,12 @@ class Vectorstore(object):
 
             # Groupby id and pyramid level together to find relevant overcounts
             df4 = []
-            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), categorical_layer]].groupby(
-                [self.id_col, 'pyramid_level' + str(pyramid_level)]
-            ).count().rename(columns={categorical_layer: 'count'}))
-            df4.append(df3[[self.id_col, 'pyramid_level' + str(pyramid_level), categorical_layer]].groupby(
-                [self.id_col, 'pyramid_level' + str(pyramid_level)]
-            ).first().rename(columns={categorical_layer: 'category'}))
+            df4.append(df3[cols + [self.id_col, categorical_layer]].groupby([self.id_col] + cols).count().rename(
+                columns={categorical_layer: 'count'}
+            ))
+            df4.append(df3[cols + [self.id_col, categorical_layer]].groupby([self.id_col] + cols).first().rename(
+                columns={categorical_layer: 'category'}
+            ))
 
             df4 = pandas.concat(df4, axis=1)
 
@@ -779,9 +819,7 @@ class Vectorstore(object):
             df4['overcount'] = df4['count']-1
 
             # Sum up the overcount and oversum by pyramid level key
-            df5 = df4[['pyramid_level' + str(pyramid_level), 'category', 'overcount']].groupby(
-                ['pyramid_level' + str(pyramid_level), 'category']
-            ).sum()
+            df5 = df4[cols + ['category', 'overcount']].groupby(cols + ['category']).sum()
 
             # Join with the original statistics and correct them
             df1.columns.name = 'category'
@@ -791,6 +829,7 @@ class Vectorstore(object):
             df6 = df6[['count']]
             df6 = df6.unstack()['count'].astype(int)
             df6.columns.name = None
+            #df6 = df6.reset_index()
 
             # Save to parquet file
             filepath = os.path.join(self.overview_directory, 'pyramid_level' + str(pyramid_level) + '_histogram_' + categorical_layer + '.parquet')
@@ -800,8 +839,9 @@ class Vectorstore(object):
         if verbose:
             print('categorical_layer', categorical_layer)
         for pyramid_level in self.pyramid_levels:
+            cols = self._pyramid_groupby_cols(pyramid_level)
             if verbose:
-                print('pyramid_level', pyramid_level)
+                print('pyramid grouping columns', cols)
             filepath_histogram = os.path.join(
                 self.overview_directory, 
                 'pyramid_level' + str(pyramid_level) + '_histogram_' + categorical_layer + '.parquet'
@@ -814,12 +854,14 @@ class Vectorstore(object):
                 self._histogram_pyramids(categorical_layer, verbose=verbose)
                 df = pandas.read_parquet(filepath_histogram)
 
+            df.columns.name = 'categories'
             df1 = df[[]].copy()
             df1['count'] = df.sum(axis=1)
             df_stacked = df[df!=0].stack().reset_index()
-            df1['unique'] = df_stacked.groupby('pyramid_level' + str(pyramid_level)).count()['level_1']
+            df1['unique'] = df_stacked.groupby(cols).count()['categories']
             df1['top'] = df.idxmax(axis=1)
-            df1['freq'] = df_stacked.groupby('pyramid_level' + str(pyramid_level)).max()[0].astype(int)
+            df1['freq'] = df_stacked.groupby(cols).max()[0].astype(int)
+            df1.columns.name = None
 
             # Save to parquet file
             filepath = os.path.join(self.overview_directory, 'pyramid_level' + str(pyramid_level) + '_layer_' + categorical_layer + '.parquet')
@@ -902,12 +944,7 @@ class Vectorstore(object):
         df_meta[self.overview_key_col] = df_meta[self.overview_key_col].apply(lambda x: x.split(self.dataset+'_')[-1])
         
         # Split the overview key column
-        df_meta[[self.overview_level_col, self.spatial_key_col]] = df_meta[self.overview_key_col].apply(
-            lambda x: x.split('level', 1)[1].split('_', 2)[:2]).to_list()
-        df_meta[self.overview_level_col] = df_meta[self.overview_level_col].astype(int)
-        df_meta[self.spatial_key_col] = df_meta[self.spatial_key_col].astype(int)
-        for k in self.temporal_keys:
-            df_meta[k] = df_meta[self.overview_key_col].apply(lambda x: int(x.split(k+'_')[1].split('_')[0]))
+        self._decompose_overview_keys(df_meta)
             
         # Cast to geopandas by infering the geometry column (cell boxes) from the overview level and spatial key
         self.gdf_meta = self._polyCells2geodataframe(df_meta[self.spatial_key_col].drop_duplicates().to_numpy())
@@ -965,10 +1002,7 @@ class Vectorstore(object):
         gdf = self._read_parquet(
             filepath, self.query_dt_start, self.query_dt_end, geometry_area=self.geometry_area, geometry_length=self.geometry_length, verbose=False
         )
-        if len(gdf)==0:
-            if verbose:
-                print(f"WARNING: no data found in {overview_key}")
-        else:
+        if len(gdf)!=0:
             if not self.query_polygon.contains(shapely.geometry.box(*gdf.total_bounds)):
                 # Spatial filtering may be necessary
                 if self.query_intersection_policy=='cut':
@@ -1157,7 +1191,8 @@ class Vectorstore(object):
                 self.gdf_query = pandas.concat([
                     self.gdf_query[~self.gdf_query[self.id_col].isin(duplicated)], 
                     gdf_duplicated,
-                ]).sort_values(by=[self.dt_col, self.overview_key_col]).reset_index(drop=True)
+                ])
+            self.gdf_query = self.gdf_query.sort_values(by=[self.dt_col, self.spatial_key_col]).reset_index(drop=True)
 
             if verbose:
                 print('gdf_query after merging duplicated ', len(self.gdf_query))
