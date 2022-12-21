@@ -3,6 +3,7 @@ os.environ['USE_PYGEOS'] = '0'
 import sys
 from glob import glob
 import warnings
+import time
 
 sys.path.insert(1, os.path.abspath(".."))
 from pairs_python.core import pairs_quadtree as pqt
@@ -36,6 +37,8 @@ class overviews(object):
     ISO_8601           = '%Y-%m-%dT%H:%M:%SZ'
     AOISTORE_DIRECTORY = '/data/vector/aoipolygons/'
     MIN_OVERVIEW_LEVEL = 7
+    MAX_OVERVIEW_LEVEL = 18
+    COMPLETE_WORLD     = shapely.geometry.box(-180, -90, 180, 90)
         
     def __init__(self,
                  pairs_server,
@@ -305,7 +308,8 @@ class overviews(object):
         """
         return geoseries.to_wkb().apply(lambda x: hashlib.sha256(x).hexdigest())
 
-    def vectorquery_to_geodataframe(self, verbose=False):
+    def vectorquery_to_geodataframe(self, temporal_keys=[], verbose=False):
+        self.temporal_keys = temporal_keys
         self.df['Name'] = self.df['Name'].str.lower()
         # Build a geometry column
         try:
@@ -332,8 +336,12 @@ class overviews(object):
         else:
             self.gdf = geopandas.GeoDataFrame(self.df, geometry='geometry').set_crs(epsg=4326)
 
+        before = len(self.gdf)
         # Looks like sometimes we get (partially) empty rows
         self.gdf = self.gdf[~self.gdf['Time'].isnull()].reset_index(drop=True)
+        after = len(self.gdf)
+        if (before!=after) and verbose:
+            print(f'Warning: droppd {after-before} rows')
 
         # Time string to datetime object
         self.time_to_timestamp()
@@ -345,12 +353,17 @@ class overviews(object):
         df_meta['dimensions'] = df_meta['data_layer_id'].apply(self.get_dimensions)
         df_meta['dimensions_shortName'] = df_meta['dimensions'].apply(lambda x: [d['shortName'] for d in x])
         # Make sure the dimsensions are the same for all columns
-        assert(len(df_meta['dimensions_shortName'].drop_duplicates())==1)
-        self.dimensions = df_meta['dimensions_shortName'].drop_duplicates().reset_index(drop=True)[0]
+        df_dim_unique = df_meta['dimensions_shortName'].drop_duplicates()
+        if len(df_dim_unique)==0:
+            self.dimension_keys=[]
+        elif len(df_dim_unique)==1:
+            self.dimension_keys = df_dim_unique.reset_index(drop=True)[0]
+        else:
+            raise
         if verbose:
-            print('dimensions:       ', self.dimensions)
+            print('dimension_keys:   ', self.dimension_keys)
 
-        if len(self.dimensions)>0:
+        if len(self.dimension_keys)>0:
             # Expand the property string columns (there might be a dimension among them)
             self.expand_property_string_columns()
 
@@ -371,13 +384,18 @@ class overviews(object):
             print('vector_table_name:', self.vector_table_name)
 
         # Limit to the columns we need
-        index_cols = self.dimensions + ['timestamp', 'geometry']
+        index_cols = self.dimension_keys + ['timestamp', 'geometry']
+        print('index_cols', index_cols)
         if 'aoi_id' in self.gdf.columns:
-            index_cols = ['aoi_id'] + index_cols
+            # Don't use the geometry column itself as an index
+            index_cols = ['aoi_id'] + [i for i in index_cols if i!='geometry']
+            # Remember the aoi_id - geometry relation
+            gdf_unique = self.gdf[['aoi_id', 'geometry']].drop_duplicates(subset='aoi_id').reset_index(drop=True)
         self.gdf = self.gdf[index_cols + ['vector_column_name', 'Value']]
 
         # Unstack the values for the different layers
         self.gdf = self.gdf.set_index(index_cols + ['vector_column_name']).unstack()['Value']
+
         # Recover the numeric column types
         self.layer_columns = list(self.gdf.columns)
         if verbose:
@@ -397,16 +415,37 @@ class overviews(object):
             (self.pairs_metadata_vector['vector_table_name']==self.vector_table_name)
         ]
         self.vector_level = df1['data_layer_level'].max()
+        if numpy.isnan(self.vector_level):
+            self.vector_level = self.MAX_OVERVIEW_LEVEL
         if verbose:
             print('vector_level:     ', self.vector_level)
-            
-        # Using sha256 hash on wkb representation of geometry to get a nearly unique geometry id       
-        self.gdf['geom_id'] = self.geom_id_hash(self.gdf['geometry'])
 
+        if not 'aoi_id' in self.gdf.columns:
+            gdf_unique = self.gdf[['geometry']].drop_duplicates().reset_index(drop=True)
+            
+        # Make sure the geometries are valid
+        gdf_unique['geometry'] = gdf_unique['geometry'].apply(shapely.validation.make_valid)
+
+        # Using sha256 hash on wkb representation of geometry to get a nearly unique geometry id       
+        gdf_unique['geom_id'] = self.geom_id_hash(gdf_unique['geometry'])
+        self.gdf = pandas.merge(gdf_unique, self.gdf, on='aoi_id')
 
     def quadtree(self, poly, level):
         polyQuadTree, _ = pqt.QuadTreePAIRS(poly, max_level=level)
         cells = pqt.QuadTreeCellsPAIRS(polyQuadTree, level)
+        return cells
+    
+    def quadtree2(self, poly, level):
+        """
+        version of quadtree that works better for complicated polygons
+        """
+        # Get all the cells within the total bounds
+        bounds_cells = self.quadtree(shapely.box(*poly.bounds), level)
+        gdf_bounds_cells = self.polyCells2geodataframe(bounds_cells, level)
+        # Filter the cells that overlap the polygon
+        mask = gdf_bounds_cells.intersects(poly)
+        df_masked = gdf_bounds_cells[mask].reset_index(drop=True)
+        cells = df_masked['spatial_key'].to_list()
         return cells
 
     def polyCells2geodataframe(self, cells, level):
@@ -426,8 +465,8 @@ class overviews(object):
     def process_chunk(self, i, chunk, verbose=False):
         loop_start = time.time()
         gdf = prepare_data(chunk)
-        partial_upload(gdf, verbose)
-        print('Upload time for chunk', i, round(time.time()-loop_start, 3), 'seconds')
+        partial_ingest(gdf, verbose)
+        print('Ingest time for chunk', i, round(time.time()-loop_start, 3), 'seconds')
 
     def prepare_data(self, chunk):
         if verbose:
@@ -451,12 +490,13 @@ class overviews(object):
 
         return gdf
 
-    def partial_upload(self, gdf, verbose=False):
+    def partial_ingest(self, gdf, verbose=False):
         # Create or initialize an existing Geolab vectorstore
         vs = vectorstore.Vectorstore(
             dataset=self.dataset, 
             temporal_keys=self.temporal_keys, 
             temporal_partitions=self.temporal_partitions, 
+            dimension_keys=self.dimension_keys,
             overview_level=self.overview_level, 
             spatial_partition_levels=self.spatial_partition_levels, 
             filter_key_levels=self.filter_key_levels,
@@ -466,13 +506,13 @@ class overviews(object):
             intersection_policy=self.intersection_policy,
         )
 
-        # Upload data
-        vs.load_geodataframe(gdf, verbose=verbose)
+        # Ingest data
+        vs.ingest_geodataframe(gdf, verbose=verbose)
 
         # Write the vectorstore to parquet
         vs.to_parquet(append=True, verbose=verbose)
 
-    # Upload to vectorstore by chunk
+    # Ingest into vectorstore by chunk
     """
     chunksize = 10**7
     verbose=True
@@ -483,7 +523,7 @@ class overviews(object):
             #    break
     """
 
-    def guess_vectorstore_parameters(self, simplify_tolerance=0.001, verbose=True):
+    def guess_vectorstore_parameters(self, simplify_tolerance=0.0005, verbose=True):
         # Vectorstore parameters
         self.dataset = 'P' + str(self.table_id) + '-' + self.vector_table_name
         self.dt_col = 'timestamp'
@@ -506,26 +546,44 @@ class overviews(object):
         # Temporal Keys (year, month, day, hour) are used to distribute data into separate parquet files.
         # Temporal Partitions (year, month, day, hour) organize parquet files in subfolders. 
         # A temporal key must exist for every temporal partition chosen
-        self.temporal_keys = [] 
         self.temporal_partitions = [] 
         if verbose:
             print('temporal_keys:           ', self.temporal_keys)
             print('temporal_partitions:     ', self.temporal_partitions)
+            stopwatch_start = time.time()
             
         # Dissolve all the geometries to estimate what overview_level will fit best
-        self.dissolved = self.gdf[['geometry']].drop_duplicates().dissolve()
+        gdf_unique = self.gdf[[self.id_col, self.geom_col]].drop_duplicates(
+            subset=self.id_col).reset_index(drop=True)[[self.geom_col]]
         if simplify_tolerance is not None:
-            self.dissolved = self.dissolved.apply(lambda x: x.simplify(tolerance=simplify_tolerance))
+            print('debug buffering')
+            gdf_unique[self.geom_col] = gdf_unique[self.geom_col].apply(lambda x: x.buffer(simplify_tolerance))
+        try:
+            self.gdf_dissolved = gdf_unique.dissolve()
+        except:
+            gdf_unique[self.geom_col] = gdf_unique[self.geom_col].apply(shapely.validation.make_valid)
+            self.gdf_dissolved = gdf_unique.dissolve()
+        if simplify_tolerance is not None:
+            print('debug simplifying')
+            self.gdf_dissolved[self.geom_col] = self.gdf_dissolved[self.geom_col].apply(lambda x: x.simplify(tolerance=simplify_tolerance))
+            self.gdf_dissolved[self.geom_col] = self.gdf_dissolved[self.geom_col].intersection(self.COMPLETE_WORLD)
+        if verbose:
+            print('Time for "dissolve" in seconds', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
 
         # Level at which the parquet files are stored. 
-        # Choose so that each parquet file will have on order of 10**5 to 10**6 rows (taking into account possible temporal or dimension keys)
+        # Choose so that each parquet file will have on order of 10**5 to 10**6 rows 
+        # (taking into account possible temporal or dimension keys)
         for self.overview_level in range(min(self.MIN_OVERVIEW_LEVEL, self.vector_level), self.vector_level+1):
-            self.cells = self.quadtree(self.dissolved['geometry'][0], self.overview_level)
+            self.cells = self.quadtree2(self.gdf_dissolved.loc[0, 'geometry'], self.overview_level)
+            #self.cells = self.quadtree(self.gdf_dissolved.loc[0, 'geometry'], self.overview_level)
             if len(self.cells)>500:
                 break
         if verbose:
             print('overview_level:          ', self.overview_level)
             print('len(cells):              ', len(self.cells))
+            print('Time for "cells" in seconds', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
 
         # List of spatial partition levels (with levels < overview_level) organize parquet files in subfolders
         self.spatial_partition_levels = [self.overview_level-4, self.overview_level-2] 
@@ -552,17 +610,33 @@ class overviews(object):
         self.categorical_layers = [l for l in self.layer_columns if l not in self.numeric_layers]
 
         self.quantiles = [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+        self.first = True
+        
+        # Count the timestamps. Individual overviews for each timestamp if there are fewer than 100 timestamps.
+        timestamp_count = len(self.gdf[self.timestamp_layers].drop_duplicates())
+        if timestamp_count<100:
+            self.timestamp_aggregation = False
+        else:
+            self.timestamp_aggregation = True
+
         if verbose:
             print('timestamp_layers:        ', self.timestamp_layers)
             print('numeric_layers:          ', self.numeric_layers)
             print('categorical_layers:      ', self.categorical_layers)
             print('quantiles:               ', self.quantiles)
+            print('first:                   ', self.first)
+            print('timestamp_aggregation:   ', self.timestamp_aggregation)
 
+    def ingest_geodataframe(self, verbose=True):
+        """
+        Call the ingest_geodataframe method of the vectorstore module
+        """
         # Create or initialize an existing Geolab vectorstore
         self.vs = vectorstore.Vectorstore(
             dataset=self.dataset, 
             temporal_keys=self.temporal_keys, 
             temporal_partitions=self.temporal_partitions, 
+            dimension_keys=self.dimension_keys,
             overview_level=self.overview_level, 
             spatial_partition_levels=self.spatial_partition_levels, 
             filter_key_levels=self.filter_key_levels,
@@ -571,18 +645,16 @@ class overviews(object):
             id_col=self.id_col, 
             intersection_policy=self.intersection_policy,
         )
+        if hasattr(self, 'dissolved'):
+            self.vs.ingest_geodataframe(self.gdf, dissolved=self.gdf_dissolved, verbose=verbose)
+        else:
+            self.vs.ingest_geodataframe(self.gdf, verbose=verbose)
 
-    def load_geodataframe(self, verbose=True):
-        """
-        Simply call the load_geodataframe method of the vectorstore module
-        """
-        self.vs.load_geodataframe(self.gdf, verbose=verbose)
-
-    def to_parquet(self, append=True, verbose=True):
+    def to_parquet(self, append=True, geometry_area=False, geometry_length=False, verbose=True):
         """
         Write the vectorstore to parquet
         """
-        self.vs.to_parquet(append=append, verbose=verbose)
+        self.vs.to_parquet(append=append, geometry_area=geometry_area, geometry_length=geometry_length, verbose=verbose)
 
     def calc_overview_statistics(self) :
         """
@@ -593,6 +665,8 @@ class overviews(object):
             timestamp_layers=self.timestamp_layers,
             categorical_layers=self.categorical_layers,
             quantiles=self.quantiles,
+            first=self.first,
+            timestamp_aggregation=self.timestamp_aggregation,
         )
 
     def calc_pyramids(self, verbose=False) :
@@ -602,3 +676,83 @@ class overviews(object):
         self.vs.calc_pyramids(
             verbose=verbose
         )
+
+def overview_worker(
+    table_id,
+    PAIRS_SERVER,
+    BASE_URI,
+    PAIRS_CREDENTIALS,
+    pairs_metadata_vector,
+    temporal_keys = [], #['year']
+    simplify_tolerance = None, #0 #0.0005 #None
+    geometry_area = True,
+    geometry_length = True,
+    pairs_box = [-89.9999, -179.9999, 89.9999, 179.9999],
+    starttime = "1970-01-01T00:00:00Z",
+    endtime = "2100-12-31T23:59:59Z",
+    verbose = True,
+):
+    # Initialize
+    ovw = overviews(
+        pairs_server=PAIRS_SERVER, 
+        base_uri=BASE_URI,
+        pairs_credentials=PAIRS_CREDENTIALS,
+        table_id=table_id, 
+        pairs_metadata_vector=pairs_metadata_vector,
+    )
+
+    if verbose:
+        stopwatch_start = time.time()
+
+    # Query PAIRS
+    ovw.query_pairs_vector_table(pairs_box)
+
+    if verbose:
+        print('Time for "query_pairs_vector_table" in seconds', round(time.time()-stopwatch_start, 3))
+        stopwatch_start = time.time()
+
+    #ovw.df = ovw.df.loc[::100, :].reset_index(drop=True)
+
+    # Vectorquery to GeoDataframe
+    ovw.vectorquery_to_geodataframe(verbose=verbose, temporal_keys=temporal_keys)
+
+    if verbose:
+        print('Time for "vectorquery_to_geodataframe" in seconds', round(time.time()-stopwatch_start, 3))
+        stopwatch_start = time.time()
+
+    # Use DataFrame statistics to guess good vectorstore parameters
+    ovw.guess_vectorstore_parameters(simplify_tolerance=simplify_tolerance, verbose=verbose)
+
+    if verbose:
+        print('Time for "guess_vectorstore_parameters" in seconds', round(time.time()-stopwatch_start, 3))
+        stopwatch_start = time.time()
+
+    # Complete ingest of gdf into vectorstore in one go
+    ovw.ingest_geodataframe(verbose=verbose)
+
+    if verbose:
+        print('Time for "ingest_geodataframe" in seconds', round(time.time()-stopwatch_start, 3))
+        stopwatch_start = time.time()
+
+    # Write the vectorstore to parquet
+    ovw.to_parquet(append=False, geometry_area=geometry_area, geometry_length=geometry_length, verbose=verbose)
+
+    if verbose:
+        print('Time for "to_parquet" in seconds', round(time.time()-stopwatch_start, 3))
+        stopwatch_start = time.time()
+
+    # Calculate and write the overview statistics
+    ovw.calc_overview_statistics()
+
+    if verbose:
+        print('Time for "calc_overview_statistics" in seconds', round(time.time()-stopwatch_start, 3))
+        stopwatch_start = time.time()
+
+    # Calculate and write the pyramids
+    #ovw.calc_pyramids()
+
+    if verbose:
+        print('Time for "calc_pyramids" in seconds', round(time.time()-stopwatch_start, 3))
+        stopwatch_start = time.time()
+        
+    return ovw
