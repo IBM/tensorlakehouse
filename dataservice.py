@@ -9,10 +9,8 @@ import pairs_quadtree
 
 logger = logging.getLogger(__name__)
 
-DATASERVICEENDPOINT = 'http://pairs-interactive01.pok.ibm.com:9082/pairsdataservice'
-DELTA_PIXEL_QUERY = 11
-DELTA_PIXEL_CELL = 5
-DELTA_CELL_QUERY = 6
+DATASERVICEENDPOINT = 'http://pairs-interactive01.pok.ibm.com:9084/pairsdataservice'
+#DATASERVICEENDPOINT = 'http://wattsun5.pok.ibm.com:9082/pairsdataservice'
 PERCENTILES = [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
 
 def getMortonInv(z):
@@ -148,22 +146,57 @@ def query_data_service(layer_id: str, level: int, latmin: float, lonmin: float, 
     
     return pairs_headers, data
 
-def query_key_to_frame(layer_id: str, level: int, key: int, timestamp: int, dimensions: Dict={}, overview=False, xy=False) -> pandas.DataFrame:
-    y_query, x_query = getMortonInv(key)
-    y_pixel = y_query*2**DELTA_PIXEL_QUERY+numpy.arange(2**DELTA_PIXEL_QUERY)
-    x_pixel = x_query*2**DELTA_PIXEL_QUERY+numpy.arange(2**DELTA_PIXEL_QUERY)
+def query_key_to_frame(
+    layer_id: str, 
+    level: int, 
+    query_key: int, 
+    query_level:int, 
+    timestamp: int, 
+    dimensions: Dict={}, 
+    overview=False, 
+    delta_pixel_overview=5,
+    delta_pixel_cell=5,
+    xy=False
+) -> pandas.DataFrame:
+    delta_pixel_query = level-query_level
+    y_query, x_query = getMortonInv(query_key)
+    y_pixel = y_query*2**delta_pixel_query+numpy.arange(2**delta_pixel_query)
+    x_pixel = x_query*2**delta_pixel_query+numpy.arange(2**delta_pixel_query)
     
     latmin = pairs_y_to_center_lat(y_pixel.min(), level)
     latmax = pairs_y_to_center_lat(y_pixel.max(), level)
     lonmin = pairs_x_to_center_lon(x_pixel.min(), level)
     lonmax = pairs_x_to_center_lon(x_pixel.max(), level)
     
+    """
+    print('Old:', latmin, latmax, lonmin, lonmax)
+    res = pairs_quadtree.getResolution(level-delta_pixel_cell) # Resolution on the pairs cell level
+    query_res = pairs_quadtree.getResolution(query_level) # Resolution on the query key level
+    
+    # Corner coordinates
+    latmin, lonmin = pairs_quadtree.getLatLon(query_key, query_level)
+    latmax = latmin + query_res
+    lonmax = lonmin + query_res
+    
+    # Center cell coordinates
+    latmin += res/2-1e-13
+    latmax -= res/2+1e-13
+    lonmin += res/2-1e-13
+    lonmax -= res/2+1e-13
+    print('New:', latmin, latmax, lonmin, lonmax)
+    """
+    
     pairs_headers, data = query_data_service(layer_id, level, latmin, lonmin, latmax, lonmax, timestamp)
     data_height = pairs_headers['height']
     data_width = pairs_headers['width']
     
-    clip_height = min(data_height, 2**DELTA_PIXEL_QUERY) 
-    clip_width = min(data_width, 2**DELTA_PIXEL_QUERY)
+    clip_height = min(data_height, 2**delta_pixel_query) 
+    clip_width = min(data_width, 2**delta_pixel_query)
+    if (clip_height!=data_height) or (clip_width!=data_width):
+        print('WARNING: QUERY ENDPOINT RETURNED TOO MUCH DATA. CLIPPING HERE')
+        print('data.shape', data.shape)
+        print('data_height, data_width', data_height, data_width)
+        print('clip_height, clip_width', clip_height, clip_width)
     data = data[-clip_height:, :clip_width]
     x_pixel = x_pixel[:clip_width]
     y_pixel = y_pixel[:clip_height]
@@ -185,10 +218,10 @@ def query_key_to_frame(layer_id: str, level: int, key: int, timestamp: int, dime
     data_frame = data_frame.sort_index()
     
     if overview:
-        overview_keys = getParentKey(data_frame.index.values, 5)
+        overview_keys = getParentKey(data_frame.index.values, delta_pixel_overview)
         grouped = data_frame.groupby(overview_keys, as_index=True)
         overview_timestamps = grouped['timestamp'].first()
-        overview_base_stats = grouped['value'].aggregate(['first', 'sum'])
+        overview_base_stats = grouped['value'].aggregate(['first'])
         overview_advanced_stats = grouped['value'].describe(percentiles=PERCENTILES)
         overview_frame = overview_timestamps.to_frame().join(overview_base_stats).join(overview_advanced_stats)
         overview_frame.index.name = 'key'
