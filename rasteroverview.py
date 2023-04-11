@@ -6,6 +6,7 @@
 """
 import os
 import sys
+from glob import glob
 import json
 from datetime import datetime, timedelta
 from functools import partial
@@ -60,6 +61,9 @@ class Rasteroverview():
                                 of an xarray.
         overview_statistics     Calculate overviews and append or write to file.
         to_parquet              Write GeoDataFrame partition to parquet.
+        to_dataframe            Compose DataFrame from the layer's parquet files.
+        to_zarr                 Write entire GeoDataFrame to zarr.
+        to_csv                  Write entire GeoDataFrame to csv.
         to_json                 Dump attributes to a json file.
         from_json               Load attributes from a json file.
 
@@ -185,7 +189,9 @@ class Rasteroverview():
         # Get the gridded geometries (boxes) at the overview level
         qt = qtree.QTree(self.valid_range, self.overview_level) # initialize
         qt.quadtree_dfs() # build the quadtree (depth first search)
-        gdf_grid = qt.gridded_to_geodataframe(key_col=key_col, level_col=level_col, hash_col='q_key', geom_col=geom_col) # grid
+        gdf_grid = qt.gridded_to_geodataframe(
+            key_col=key_col, level_col=level_col, hash_col='q_key', geom_col=geom_col
+        ) # grid
 
         # Set of overview keys
         self.overview_keys = gdf_grid[self.key_col].to_list()
@@ -320,46 +326,47 @@ class Rasteroverview():
         df = df.dropna(subset='value').reset_index(drop=True)
         if len(df)==0:
             return pandas.DataFrame()
-        else:
 
-            # For categorical data we cast to int and then string
-            df['value'] = df['value'].astype(int).astype(str)
+        # For categorical data we cast to int and then string
+        df['value'] = df['value'].astype(int).astype(str)
 
-            # Sort (needed for first statistic)
-            df = df.sort_values(by=['time', 'ovw_x', 'ovw_y', 'lon', 'lat'])
-            grp = df[['ovw_x', 'ovw_y', 'time', 'value']].groupby(['ovw_x', 'ovw_y', 'time'])
+        # Sort (needed for first statistic)
+        df = df.sort_values(by=['time', 'ovw_x', 'ovw_y', 'lon', 'lat'])
+        grp = df[['ovw_x', 'ovw_y', 'time', 'value']].groupby(['ovw_x', 'ovw_y', 'time'])
 
-            # Get count, unique, top, freq statistics in one shot
-            stats = grp.describe()['value']
+        # Get count, unique, top, freq statistics in one shot
+        stats = grp.describe()['value']
 
-            # Get "first" statistic (bottom left corner value)
-            first = grp.first()
-            first = first.rename(columns={'value': 'first'})
+        # Get "first" statistic (bottom left corner value)
+        first = grp.first()
+        first = first.rename(columns={'value': 'first'})
 
-            stats = pandas.concat([stats, first], axis=1)
+        stats = pandas.concat([stats, first], axis=1)
 
-            if histogram:
-                # Get the full histogram of value counts
-                hist = df.set_index(['lon', 'lat']).value_counts()
-                hist.name='value_counts'
-                hist = hist.reset_index()
+        if histogram:
+            # Get the full histogram of value counts
+            hist = df.set_index(['lon', 'lat']).value_counts()
+            hist.name='value_counts'
+            hist = hist.reset_index()
 
-                # The values will be column identifiers, so cast to integer then to string
-                hist['value'] = hist['value'].astype(int).astype(str)
+            # The values will be column identifiers, so cast to integer then to string
+            hist['value'] = hist['value'].astype(int).astype(str)
 
-                # Unstack and fill the counts of missing values with zero.
-                hist = hist.sort_values(by=['time', 'value']).set_index(['ovw_x', 'ovw_y', 'time', 'value']).unstack()
-                hist = hist.fillna(0).astype(int)
+            # Unstack and fill the counts of missing values with zero.
+            hist = hist.sort_values(by=['time', 'value']).set_index(
+                ['ovw_x', 'ovw_y', 'time', 'value']
+            ).unstack()
+            hist = hist.fillna(0).astype(int)
 
-                # Histogram columns may be identified by a prefix: 'count_'.
-                hist = hist['value_counts']
-                hist.columns.name = None
-                hist.columns = ['count_' + h for h in hist.columns]
+            # Histogram columns may be identified by a prefix: 'count_'.
+            hist = hist['value_counts']
+            hist.columns.name = None
+            hist.columns = ['count_' + h for h in hist.columns]
 
-                # Histogram columns will be merged with the other statistics.
-                stats = pandas.concat([stats, hist], axis=1)
+            # Histogram columns will be merged with the other statistics.
+            stats = pandas.concat([stats, hist], axis=1)
 
-            return stats.reset_index().set_index('time')
+        return stats.reset_index().set_index('time')
 
     def overview_statistics(
         self, temporal_partition=None, spatial_partition=None, n_workers=8, chunk_n=None,
@@ -469,7 +476,6 @@ class Rasteroverview():
 
         :param temporal_partition: temporal partition
         """
-        inv_encodings = {v: k for k, v in self.temporal_level_encodings.items()}
         tmp = temporal_partition
         values = []
         for temporal_level in reversed(self.temporal_levels):
@@ -533,9 +539,9 @@ class Rasteroverview():
         if chunk_n==0:
             if self.stats['number_global_timestamps']>0:
                 s = 'Too many query pixels per timestamp. Define smaller spatial partitions'
-                raise Exception(s)
+                raise ValueError(s)
             else:
-                raise Exception('Nothing found.')
+                raise RuntimeError('Nothing found.')
 
         df_stats = []
         for i, chunk in enumerate(self._chunks(query_epochtimes, chunk_n)):
@@ -568,7 +574,7 @@ class Rasteroverview():
                 coords={'time':arr.time, 'y': midx_y, 'x': midx_x}
             )
 
-            # To do: crop array to valid range 
+            # To do: crop array to valid range
             # (may only be necessary in special cases where we experiment with limited ranges)
 
             # Cut up the array into overview-cell sized cubes (many timestamps but one overview key)
@@ -585,7 +591,9 @@ class Rasteroverview():
                     if self.numeric_or_categorical == 'numeric':
                         df_stats.append(self.xarray_stats_numeric(arr_small))
                     elif self.numeric_or_categorical == 'categorical':
-                        df_stats.append(self.xarray_stats_categorical(arr_small, histogram=HISTOGRAM))
+                        df_stats.append(
+                            self.xarray_stats_categorical(arr_small, histogram=HISTOGRAM)
+                        )
             else:
                 # from multiprocessing import Pool
                 if self.numeric_or_categorical == 'numeric':
@@ -605,7 +613,7 @@ class Rasteroverview():
         if len(df_stats)==0:
             print('Nothing Found')
             return pandas.DataFrame()
-            
+
         if self.numeric_or_categorical == 'categorical' and HISTOGRAM:
             # Histogram columns may not be present in all parts
             hist_cols = [c for c in df_stats.columns if c.startswith('count_')]
@@ -613,19 +621,21 @@ class Rasteroverview():
 
         # Get the quaternary key from the ovw_x and ovw_y positions within the xarray
         #x_min, y_min = morton.base4_to_xy_indices(min(aggregation_keys))
-        x_min, y_min = morton.base4_to_xy_indices(query_key + '0' * (self.overview_level-self.spatial_level))
+        x_min, y_min = morton.base4_to_xy_indices(
+            query_key + '0' * (self.overview_level-self.spatial_level)
+        )
         gdf_unique = df_stats[['ovw_y', 'ovw_x']].drop_duplicates().reset_index(drop=True)
         xs = morton.x_idx_to_center_coord(gdf_unique['ovw_x'] + x_min, self.overview_level)
         ys = morton.y_idx_to_center_coord(gdf_unique['ovw_y'] + y_min, self.overview_level)
         keys = morton.get_key(numpy.array(ys), numpy.array(xs), [self.overview_level]*len(xs))
         q_keys = morton.encode(keys, [self.overview_level]*len(xs))
         gdf_unique[self.key_col] = q_keys
-        
+
         # Convert to geopandas GeoDataFrame
         gdf_unique[self.geom_col] = gdf_unique[self.key_col].apply(morton.base4_to_box)
         gdf_unique = geopandas.GeoDataFrame(gdf_unique, geometry=self.geom_col)
         gdf_unique[self.geom_col] = gdf_unique.intersection(self.valid_range)
-        
+
         # Catch the case when the valid range intersects with the query partition
         gdf_unique = gdf_unique[~gdf_unique[self.geom_col].is_empty].reset_index(drop=True)
         assert set(gdf_unique[self.key_col]).issubset(set(aggregation_keys))
@@ -720,7 +730,7 @@ class Rasteroverview():
             except IOError:
                 pass
             else:
-                # Merge the two by concatenating and dropping duplicates (keeping the newer version)
+                # Merge by concatenating and dropping duplicates (keeping the newer version)
                 gdf = pandas.concat([gdf_existing, gdf]).drop_duplicates(
                     subset=[self.dt_col, self.key_col], keep='last'
                 )
@@ -765,25 +775,31 @@ class Rasteroverview():
             df = pandas.concat(df).reset_index(drop=True)
             if self.geom_col in df.columns:
                 del df[self.geom_col]
-    
+
             # Histogram columns may not be present in all parts
             hist_cols = [c for c in df.columns if c.startswith('count_')]
             df[hist_cols] = df[hist_cols].fillna(0).astype(int)
 
         return df
-        
-    def to_zarr(self, chunks={'lat': 256, 'lon': 256, 'time': 256}, use_dask=True, columns=None, append=False):
+
+    def to_zarr(
+        self,
+        chunks={'lat': 256, 'lon': 256, 'time': 256},
+        use_dask=True,
+        columns=None,
+        append=False
+    ):
         """Write entire GeoDataFrame to zarr."""
         # Compose DataFrame from the layer's parquet files
         df = self.to_dataframe(use_dask=use_dask, columns=columns)
-        
+
         # Get latitude and longitude from base4 key
         df_unique = df[[self.key_col]].drop_duplicates().reset_index(drop=True)
         df_unique['lon'], df_unique['lat'] = morton.base4_to_center_coords(df_unique[self.key_col])
         df = pandas.merge(df_unique, df, on=self.key_col)
         del df[self.key_col]
         df = df.rename(columns={self.dt_col: 'time'})
-        
+
         # Convert to xarray dataset
         ds = df.set_index(['time', 'lat', 'lon']).to_xarray()
         ds.attrs = dict(
@@ -803,9 +819,9 @@ class Rasteroverview():
 
         # Write to zarr
         ds.to_zarr(filepath)
-        
+
     def to_csv(self, use_dask=True, columns=None, append=False, epoch=False):
-        """Write entire GeoDataFrame to zarr."""
+        """Write entire GeoDataFrame to csv."""
         # Compose DataFrame from the layer's parquet files
         df = self.to_dataframe(use_dask=use_dask, columns=columns)
 
@@ -814,7 +830,9 @@ class Rasteroverview():
             columns = df.columns
             # Translate to epoch time
             df_unique = df[[self.dt_col]].drop_duplicates().reset_index(drop=True)
-            df_unique[self.dt_col+'_tmp'] = df_unique[self.dt_col].apply(lambda x: int(x.timestamp()))
+            df_unique[self.dt_col+'_tmp'] = df_unique[self.dt_col].apply(
+                lambda x: int(x.timestamp())
+            )
             df = pandas.merge(df, df_unique, on=self.dt_col)
             del df[self.dt_col]
             df = df.rename(columns={self.dt_col+'_tmp' : self.dt_col})
