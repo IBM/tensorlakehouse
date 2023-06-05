@@ -11,7 +11,7 @@ import numpy
 import pandas
 import geopandas
 
-import morton
+import mortoncurve
 import qtree
 
 
@@ -32,11 +32,13 @@ class TemporalPartition():
         get_temporal_partition_levels  Collect temporal statistics and infer appropriate
                                        partition levels.
         get_temporal_partitions        Based on timestamps and temporal levels calculate
-                                       a list of temporal partitions.
+                                       a dictionary of temporal partitions (keys) and the
+                                       timestamps belonging to them (values are lists).
 
     """
     # Default values for class attributes
     DT_COL                     = 'timestamp'
+    VALID_TEMPORAL_LEVELS      = ['year', 'month', 'day', 'hour']
 
     def __init__(
         self,
@@ -59,13 +61,13 @@ class TemporalPartition():
         # Timestamp column name in DataFrames
         self.dt_col = self.DT_COL if dt_col is None else dt_col
 
-        self.verbose = verbose
-
+        self.valid_temporal_levels = self.VALID_TEMPORAL_LEVELS
+        
         # For later use
         self.temporal_levels = None
-        self.temporal_partitions = None
+        self.temporal_partitions = {}
 
-        self.temporal_level_encodings = {'year': 'y', 'month': 'm', 'day': 'd', 'hour': 'h'}
+        self.verbose = verbose
 
     def get_temporal_partition_levels(self, temporal_levels=None):
         """Collect temporal statistics and infer appropriate partition levels."""
@@ -74,6 +76,11 @@ class TemporalPartition():
         df_timestamps = pandas.DataFrame(self.timestamps).rename(columns={0: self.dt_col})
         df_timestamps['year'] = df_timestamps[self.dt_col].dt.year
         df_timestamps['month'] = df_timestamps[self.dt_col].dt.month
+        if temporal_levels is not None:
+            if ('day' in temporal_levels):
+                df_timestamps['day'] = df_timestamps[self.dt_col].dt.day
+            if ('hour' in temporal_levels):
+                df_timestamps['hour'] = df_timestamps[self.dt_col].dt.hour
 
         # Maximum timestamps per year
         self.stats['max_y_count'] = df_timestamps.groupby(
@@ -97,7 +104,7 @@ class TemporalPartition():
             else:
                 self.temporal_levels = []
         else:
-            assert set(temporal_levels) <= set(self.temporal_level_encodings.keys())
+            assert set(temporal_levels) <= set(self.valid_temporal_levels)
             self.temporal_levels = temporal_levels
         if self.verbose:
             print('temporal_levels                 ', self.temporal_levels)
@@ -121,28 +128,17 @@ class TemporalPartition():
         :param temporal_levels: List of temporal levels, such as ['year', 'month', 'day']
         """
         if len(self.temporal_levels)==0:
-            self.temporal_partitions = [] # No temporal partitions
+            self.temporal_partitions = {} # No temporal partitions
             return
 
-        # Get the unique combinations of the different temporal levels
+        # Get the the unique values of the temporal levels
         df_timestamps = pandas.DataFrame(self.timestamps).rename(columns={0: self.dt_col})
         for t_level in self.temporal_levels:
-            df_timestamps[t_level] = df_timestamps[self.dt_col].apply(
-                lambda x: getattr(x, t_level)
+            self.temporal_partitions[t_level] = sorted(
+                df_timestamps[self.dt_col].apply(
+                    lambda x: getattr(x, t_level)
+                ).drop_duplicates()
             )
-        df_timestamps = df_timestamps[self.temporal_levels].drop_duplicates(
-        ).reset_index(drop=True)
-
-        # Format as string using temporal_level_encodings
-        for t_level in self.temporal_levels:
-            df_timestamps[t_level] = df_timestamps[t_level].apply(
-                lambda x: self.temporal_level_encodings[t_level] + str(x).zfill(2)
-            )
-        # Concat the strings belonging to different temporal levels
-        self.temporal_partitions = df_timestamps[self.temporal_levels].apply(
-            lambda row: ''.join(row), axis=1
-        )
-        self.temporal_partitions = sorted(self.temporal_partitions)
 
         if self.verbose:
             print()
@@ -189,8 +185,16 @@ class SpatialPartition():
         key_col = None,
         max_depth = None,
         simplify_n = None,
+        grid = None,
         verbose = False,
     ):
+
+        # Nested grid to overwrite the default PAIRS grid
+        self.grid = grid
+
+        # Definition of the morton curve on top of the nested grid
+        self.morton = mortoncurve.Morton(self.grid)
+
         # Are we dealing with raster or vector data?
         self.raster_or_vector = raster_or_vector
         assert self.raster_or_vector in ['raster', 'vector']
@@ -261,11 +265,11 @@ class SpatialPartition():
         print('partitions', partitions)
 
         # GeoDataFrame of 4 boxes
-        gdf_boxes = pandas.DataFrame([partitions, morton.base4_to_box(partitions)]).T.rename(
+        gdf_boxes = pandas.DataFrame([partitions, self.morton.base4_to_box(partitions)]).T.rename(
             columns={0: self.partition_col, 1: self.geom_col})
         gdf_boxes = geopandas.GeoDataFrame(
             gdf_boxes, geometry=self.geom_col
-        ).set_crs(morton.grid.crs)
+        ).set_crs(self.morton.grid.crs)
 
         # Vectorized intersections of all polygons with all boxes
         gdf_parts = geopandas.overlay(gdf[[self.id_col, self.geom_col]], gdf_boxes)
@@ -276,7 +280,11 @@ class SpatialPartition():
         """Create a separate quadtree for every geometry in gdf."""
         # initialize QTree and find the root node for each gemetry
         gdf['qt'] = gdf[self.geom_col].apply(lambda x: qtree.QTree(
-            x, self.max_spatial_level, max_depth=self.max_depth, simplify_n=self.simplify_n
+            x,
+            self.max_spatial_level,
+            max_depth=self.max_depth,
+            simplify_n=self.simplify_n,
+            grid=self.grid,
         ))
         # apply the quadtree algorithm
         gdf['qt'].apply(lambda x: x.quadtree_dfs())

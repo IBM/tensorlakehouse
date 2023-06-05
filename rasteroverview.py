@@ -17,11 +17,10 @@ import geopandas
 import pytz
 import xarray
 import dask
+import itertools
 
-sys.path.insert(0, '/data/mfreitag/software/dataservice_sdk-datacube/src/')
 import dataservice.query
-
-import morton
+import mortoncurve
 import qtree
 
 os.environ['USE_PYGEOS'] = '0'
@@ -33,11 +32,13 @@ class Rasteroverview():
 
     Attributes:
 
+        pixel_level             Pixel level
+        delta_pixel_overview    Difference between pixel level and overview level.
+        overviewstore_directory Base directory where dataset overviews are stored.
         dset_id                 Dataset ID
         layer_id                Layer ID
-        pixel_level             Pixel level
-        overviewstore_directory  Base directory where dataset overviews are stored.
-        delta_pixel_overview    Difference between pixel level and overview level.
+        dimension_values        Dictionary of valid dimension values indexed by dimension_names
+        dataservice_type        Currently supported: 'hbase' or 'local_filesystem'
         dt_col                  Name of timestamp column in DataFrame.
         geom_col                Name of geometry column in DataFrame.
         key_col                 Name of spatial key column in DataFrame.
@@ -45,10 +46,10 @@ class Rasteroverview():
         stats                   Statistics (metadata) concerning available timestamps,
                                 overview keys, and spatio-temporal partitions.
         overview_keys           List of the unique overview keys
-        temporal_levels         List of the timestamp hierarchy levels (year, month, ...)
-        temporal_partitions     List of the temporal partitions
+        temporal_levels         List of the timestamp hierarchy levels ('year', 'month', ...)
+        temporal_partitions     Dictionary of the temporal partitions
+        spatial_partition_level Level of the spatial partitions
         spatial_partitions      List of the spatial partitions
-        spatial_level           Level of the spatial partitions
         timestamps              available timestamps in datetime format
         
     Methods
@@ -69,6 +70,7 @@ class Rasteroverview():
 
     """
     # Default values for class attributes
+    DATASERVICE_TYPE           = 'hbase'
     OVERVIEWSTORE_DIRECTORY    = '/data/raster/overviews/'
     DELTA_PIXEL_OVERVIEW       = 5
     MAX_QUERY_PIXELS           = 5e8
@@ -84,23 +86,33 @@ class Rasteroverview():
 
     def __init__(
         self,
-        dset_id,
-        layer_id,
         pixel_level,
-        overviewstore_directory = None,
         delta_pixel_overview = None,
+        overviewstore_directory = None,
+        dset_id = None,
+        layer_id = None,
+        dimension_values = {},
+        dataservice_type = None,
         valid_range = None,
         dt_col = None,
         geom_col = None,
         key_col = None,
         numeric_or_categorical = None,
+        grid = None,
         verbose = False,
     ):
+
+        # Nested grid to overwrite the default PAIRS grid
+        self.grid = grid
+
+        # Definition of the morton curve on top of the nested grid
+        self.morton = mortoncurve.Morton(self.grid)
 
         # layer attributes
         self.dset_id          = dset_id
         self.layer_id         = layer_id
         self.pixel_level      = pixel_level
+        self.dimension_values = dimension_values
 
         # Overview level calculated relative to pixel level
         if delta_pixel_overview is None:
@@ -108,6 +120,12 @@ class Rasteroverview():
         else:
             self.delta_pixel_overview = delta_pixel_overview
         self.overview_level   = self.pixel_level - self.delta_pixel_overview
+
+        # Type of dataservice (e.g. 'hbase', 'cloud', 'local_filesystem')
+        if dataservice_type is None:
+            self.dataservice_type = self.DATASERVICE_TYPE
+        else:
+            self.dataservice_type = dataservice_type
 
         # overviewstore_directory base directory
         if overviewstore_directory is None:
@@ -123,7 +141,7 @@ class Rasteroverview():
         self.geom_col = self.GEOM_COL
 
         # Opportunity to limit the valid range here
-        self.valid_range = morton.valid_range if valid_range is None else valid_range
+        self.valid_range = self.morton.valid_range if valid_range is None else valid_range
 
         if numeric_or_categorical is None:
             self.numeric_or_categorical = self.NUMERIC_OR_CATEGORICAL
@@ -139,22 +157,25 @@ class Rasteroverview():
         self.timestamps = None
         self.temporal_levels = None
         self.temporal_partitions = None
-        self.temporal_level_encodings = None
         self.overview_keys = None
+        self.spatial_partition_level = None
         self.spatial_partitions = None
-        self.spatial_level = None
 
     def available_timestamps(
         self,
         dt_start = datetime(1970, 1, 1, tzinfo=pytz.utc),
         dt_end = datetime(2100, 12, 31, tzinfo=pytz.utc)-timedelta(seconds=1),
+        **kwargs
     ):
         """Query the dataservice for global timestamps.
 
         :param dt_start: starttime
         :param dt_end:   endtime
+        :param kwargs:   dataserviceendpoint
         """
-        epochtimes = dataservice.query.get_global_timestamps(self.layer_id, dt_start, dt_end)
+        epochtimes = dataservice.query.get_global_timestamps(
+            self.layer_id, dt_start, dt_end, **kwargs
+        )
 
         # The dataservice has a limit on the number of epochtimes returned: 100,000
         # So in case we get that many epochtimes, query by year
@@ -164,7 +185,11 @@ class Rasteroverview():
             for year in years:
                 dt0 = datetime(year, 1, 1, tzinfo=pytz.utc)
                 dt1 = datetime(year, 12, 31, tzinfo=pytz.utc)-timedelta(seconds=1)
-                epochtimes.extend(dataservice.query.get_global_timestamps(self.layer_id, dt0, dt1))
+                epochtimes.extend(
+                    dataservice.query.get_global_timestamps(
+                        self.layer_id, dt0, dt1, **kwargs
+                    )
+                )
 
         # We may get duplicate epochtimes if the data is distributed in multiple federated instances
         len_epochtimes = len(epochtimes)
@@ -187,7 +212,7 @@ class Rasteroverview():
     def qtree_spatial_overview(self, key_col=None, level_col=None, geom_col=None):
         """Determine overview cells using qtree algorithm."""
         # Get the gridded geometries (boxes) at the overview level
-        qt = qtree.QTree(self.valid_range, self.overview_level) # initialize
+        qt = qtree.QTree(self.valid_range, self.overview_level, grid=self.grid) # initialize
         qt.quadtree_dfs() # build the quadtree (depth first search)
         gdf_grid = qt.gridded_to_geodataframe(
             key_col=key_col, level_col=level_col, hash_col='q_key', geom_col=geom_col
@@ -201,7 +226,7 @@ class Rasteroverview():
 
         # # Building separate (very narrow) trees for each overview cell
         # gdf_grid['qt'] = gdf_grid[self.geom_col].apply(
-        #     lambda x: qtree.QTree(x, self.overview_level)
+        #     lambda x: qtree.QTree(x, self.overview_level, grid=self.grid)
         # )
         # # apply the quadtree algorithm
         # gdf_grid['qt'].apply(lambda x: x.quadtree_dfs())
@@ -219,26 +244,28 @@ class Rasteroverview():
             self.timestamps = t_part.timestamps
             self.temporal_levels = t_part.temporal_levels
             self.temporal_partitions = t_part.temporal_partitions
-            self.temporal_level_encodings = t_part.temporal_level_encodings
             self.stats = self.stats | t_part.stats
         else:
             self.temporal_levels = []
-            self.temporal_partitions = []
+            self.temporal_partitions = {}
 
         # if self.overview_keys is None:
         #     self.qtree_spatial_overview()
 
         if s_part is not None:
             self.spatial_partitions = s_part.spatial_partitions
-            self.spatial_level = s_part.spatial_level
+            self.spatial_partition_level = s_part.spatial_level
             self.stats = self.stats | s_part.stats
         else:
             self.spatial_partitions = ['0q']
-            self.spatial_level = 0
+            self.spatial_partition_level = 0
 
         if (t_part is not None) and (s_part is not None):
             # Calculate additional spatio-temporal stats
-            self._partition_stats()
+            try:
+                self._partition_stats()
+            except:
+                pass
 
     def _partition_stats(self):
         """Collect spatio-temporal partition statistics (counts per partition)."""
@@ -289,7 +316,7 @@ class Rasteroverview():
         maximum.name = 'max'
 
         # Mean, std, and quantiles are weighted by area
-        weights = morton.grid.area_weights(arr.lon, arr.lat)
+        weights = self.morton.grid.area_weights(arr.lon, arr.lat)
         #weights = numpy.cos(numpy.deg2rad(arr.lat))
         weights.name = "weights"
         arr_weighted = arr.weighted(weights)
@@ -311,7 +338,10 @@ class Rasteroverview():
         stats = xarray.merge([stats, ds_wq])
 
         stats = stats.drop(['lat', 'lon'])
-        return stats.to_pandas()
+        if len(stats.dims)>1:
+            return stats.to_dataframe()
+        else:
+            return stats.to_pandas()
 
     def xarray_stats_categorical(self, arr, histogram=True):
         """Unweighted categorical statistics for the spatial dimensions of an xarray.
@@ -331,8 +361,11 @@ class Rasteroverview():
         df['value'] = df['value'].astype(int).astype(str)
 
         # Sort (needed for first statistic)
-        df = df.sort_values(by=['time', 'ovw_x', 'ovw_y', 'lon', 'lat'])
-        grp = df[['ovw_x', 'ovw_y', 'time', 'value']].groupby(['ovw_x', 'ovw_y', 'time'])
+        dims = list(self.dimension_values)
+        df = df.sort_values(by = dims + ['time', 'ovw_x', 'ovw_y', 'lon', 'lat'])
+        grp = df[['ovw_x', 'ovw_y'] + dims + ['time', 'value']].groupby(
+            ['ovw_x', 'ovw_y'] + dims + ['time']
+        )
 
         # Get count, unique, top, freq statistics in one shot
         stats = grp.describe()['value']
@@ -353,8 +386,8 @@ class Rasteroverview():
             hist['value'] = hist['value'].astype(int).astype(str)
 
             # Unstack and fill the counts of missing values with zero.
-            hist = hist.sort_values(by=['time', 'value']).set_index(
-                ['ovw_x', 'ovw_y', 'time', 'value']
+            hist = hist.sort_values(by = dims + ['time', 'value']).set_index(
+                ['ovw_x', 'ovw_y'] + dims + ['time', 'value']
             ).unstack()
             hist = hist.fillna(0).astype(int)
 
@@ -366,21 +399,23 @@ class Rasteroverview():
             # Histogram columns will be merged with the other statistics.
             stats = pandas.concat([stats, hist], axis=1)
 
-        return stats.reset_index().set_index('time')
+        return stats.reset_index().set_index(dims + ['time'])
 
     def overview_statistics(
-        self, temporal_partition=None, spatial_partition=None, n_workers=8, chunk_n=None,
-        probe_local_timestamps=False, skip_existing=True
+        self, temporal_partition={}, spatial_partition=None, n_workers=8, chunk_n=None,
+        probe_local_timestamps=False, skip_existing=True, **kwargs
     ):
         """Calculate overviews and append or write to file.
         
-        temporal_partition calculating query timestamps based on temporal_partition
+        temporal_partition calculating query timestamps based on a specific
+                           temporal_partition. (E.g. specific year, month)
         spatial_partition  calculating query box based on spatial_partition
         n_workers          number of workers for the statistics calculation 
                            (the dataservice call uses one worker only)
         chunk_n            limit number of timestamps queried at a time
-        """
-        if temporal_partition is None:
+        :param kwargs:     cluster, dataserviceendpoint
+        """          
+        if len(temporal_partition)==0:
             # Query all timestamps
             query_epochtimes = [int(t.timestamp()) for t in sorted(self.available_timestamps())]
         else:
@@ -389,6 +424,15 @@ class Rasteroverview():
                 query_epochtimes = self._get_query_timestamps(temporal_partition)
             else:
                 query_epochtimes = self._get_query_timestamps(temporal_partition, self.timestamps)
+
+        dimensions_lst = []  # List of all valid dimensions dictionaries
+        if len(self.dimension_values)>0: # Debug consider dimension partitions
+            for elements in itertools.product(*self.dimension_values.values()):
+                # Looping through the cartesian product
+                dimensions={}
+                for i, dimension_name in enumerate(self.dimension_values):
+                    dimensions[dimension_name] = elements[i]
+                dimensions_lst.append(dimensions)
 
         if spatial_partition is None:
             # Query global
@@ -402,17 +446,19 @@ class Rasteroverview():
 
             if probe_local_timestamps:
                 # probe the query_key area in the four corners as well as the center.
-                query_epochtimes = self._probe_query_timestamps(query_key, query_epochtimes)
+                query_epochtimes = self._probe_query_timestamps(query_key, query_epochtimes, **kwargs)
 
         # check for existing timestamps and coverage in parquet files
         if skip_existing:
             filepath = self._filepath(spatial_partition, temporal_partition)
+            partition_directory = os.path.split(filepath)[0]
             try:
                 df1 = pandas.read_parquet(filepath, columns=[self.dt_col, self.key_col])
             except IOError:
                 # Likely nothing there yet
                 pass
             else:
+                # debug: consider dimensions here
                 df1 = df1.groupby(self.dt_col)[self.key_col].apply(set).reset_index()
                 df1 = df1[df1[self.key_col]==set(aggregation_keys)]
                 exclude_timestamps = set(df1[self.dt_col].apply(
@@ -428,34 +474,38 @@ class Rasteroverview():
                 print('Found', len(query_epochtimes), 'new timestamps')
 
             gdf_overview = self._overview_statistics(
-                query_epochtimes, query_key, aggregation_keys, n_workers=n_workers, chunk_n=chunk_n
+                query_epochtimes, query_key, aggregation_keys, dimensions_lst,
+                n_workers=n_workers, chunk_n=chunk_n, **kwargs
             )
 
-            # Append (if existing rows skipped) or overwrite (e.g. to reflect deleted data)
-            self.to_parquet(
-                gdf_overview, temporal_partition, spatial_partition, append=skip_existing
-            )
+            if len(gdf_overview)>0:
+                # Append (if existing rows skipped)
+                self.to_parquet(
+                    gdf_overview, temporal_partition, spatial_partition, append=True
+                )
 
-    def _probe_query_timestamps(self, query_key, query_epochtimes):
+    def _probe_query_timestamps(self, query_key, query_epochtimes, **kwargs):
         """Given a query key (partition), what timestamps are likely available?
 
         :param query_key:        spatial key on the partition level
         :param query_epochtimes: "global" timestamps (for current temporal partition)
+        :param kwargs:           cluster, dataserviceendpoint
         """
+        delta = self.overview_level - self.spatial_partition_level
         probe_keys = []
-        probe_keys.append(query_key + '0' * (self.overview_level-self.spatial_level)) #sw
-        probe_keys.append(query_key + '1' * (self.overview_level-self.spatial_level)) #se
-        probe_keys.append(query_key + '2' * (self.overview_level-self.spatial_level)) #nw
-        probe_keys.append(query_key + '3' * (self.overview_level-self.spatial_level)) #ne
-        if self.overview_level-self.spatial_level>1:
+        probe_keys.append(query_key + '0' * delta) #sw
+        probe_keys.append(query_key + '1' * delta) #se
+        probe_keys.append(query_key + '2' * delta) #nw
+        probe_keys.append(query_key + '3' * delta) #ne
+        if delta>1:
             # near center
             probe_keys.append(
-                query_key + '0' + '3' * (self.overview_level-self.spatial_level-1)
+                query_key + '0' + '3' * (delta-1)
             )
 
         dt_lst = []
         for probe_key in probe_keys:
-            x_coord, y_coord = morton.base4_to_center_coords(probe_key)
+            x_coord, y_coord = self.morton.base4_to_center_coords(probe_key)
             # Get the data from the dataservice
             arr = dataservice.query.to_xarray(
                 layer_id=self.layer_id,
@@ -465,6 +515,7 @@ class Rasteroverview():
                 latmax=y_coord,
                 lonmax=x_coord,
                 timestamps=query_epochtimes,
+                **kwargs
             )
             count = arr.count(dim=['lat', 'lon'])
             dt_lst += list(count[count>0]['time'].to_pandas())
@@ -476,16 +527,6 @@ class Rasteroverview():
 
         :param temporal_partition: temporal partition
         """
-        tmp = temporal_partition
-        values = []
-        for temporal_level in reversed(self.temporal_levels):
-            # parsing from the back of the string (reversed)
-            tmp, value = tmp.split(self.temporal_level_encodings[temporal_level])
-            value = int(value)
-            values.append(value)
-        values = list(reversed(values))
-        assert len(values)==len(self.temporal_levels)
-
         if timestamps is None:
             timestamps = self.available_timestamps()
 
@@ -497,15 +538,16 @@ class Rasteroverview():
             )
 
         # Filter by partiton values
-        for key, value in zip(self.temporal_levels, values):
-            df_timestamps = df_timestamps[df_timestamps[key]==value]
+        for temporal_level in self.temporal_levels:
+            df_timestamps = df_timestamps[df_timestamps[temporal_level]==temporal_partition[temporal_level]]
 
         # Sort and translate back to epoch time
         query_epochtimes = [int(t.timestamp()) for t in sorted(df_timestamps[self.dt_col])]
         return query_epochtimes
 
     def _overview_statistics(
-        self, query_epochtimes, query_key, aggregation_keys, n_workers=8, chunk_n=None
+        self, query_epochtimes, query_key, aggregation_keys, dimensions_lst, 
+        n_workers=8, chunk_n=None, **kwargs
     ):
         """
         query_epochtimes list of timestamps
@@ -519,14 +561,21 @@ class Rasteroverview():
         """
         HISTOGRAM = True
 
-        # query box
+        # query box 
         lonmin, latmin, lonmax, latmax = self.valid_range.bounds
-        west, south, east, north = morton.base4_to_box(query_key).bounds
-        res_x, res_y = morton.resolution(self.pixel_level)
-        latmin = max(latmin, south + res_y/2)
-        latmax = min(latmax, north - res_y/2)
-        lonmin = max(lonmin, west + res_x/2)
-        lonmax = min(lonmax, east - res_x/2)
+        west, south, east, north = self.morton.base4_to_box(query_key).bounds
+        latmin = max(latmin, south)
+        latmax = min(latmax, north)
+        lonmin = max(lonmin, west)
+        lonmax = min(lonmax, east)
+
+        if self.dataservice_type=='hbase':
+            # reduce query box by 1/2 pixel because the dataservice will buffer to the full cell
+            res_x, res_y = self.morton.resolution(self.pixel_level)
+            latmin = max(latmin, south + res_y/2)
+            latmax = min(latmax, north - res_y/2)
+            lonmin = max(lonmin, west + res_x/2)
+            lonmax = min(lonmax, east - res_x/2)
 
         # Number of timestamps queried at a time
         if chunk_n is None:
@@ -542,25 +591,147 @@ class Rasteroverview():
                 raise ValueError(s)
             else:
                 raise RuntimeError('Nothing found.')
-
+                
         df_stats = []
         for i, chunk in enumerate(self._chunks(query_epochtimes, chunk_n)):
-            print('chunk', i)
+            print('chunk', i, ': ', len(chunk))
+ 
+            if self.dataservice_type=='hbase':
+                # Get the data from the hbase dataservice
+                if len(dimensions_lst)==0:
+                    # No dimensions
+                    arr = dataservice.query.to_xarray(
+                        layer_id=self.layer_id,
+                        level=self.pixel_level,
+                        latmin=latmin,
+                        lonmin=lonmin,
+                        latmax=latmax,
+                        lonmax=lonmax,
+                        timestamps=chunk,
+                        **kwargs,
+                    )
+                else:
+                    lst = []
+                    for dimensions in dimensions_lst:
+                        arr = dataservice.query.to_xarray(
+                            layer_id=self.layer_id,
+                            level=self.pixel_level,
+                            latmin=latmin,
+                            lonmin=lonmin,
+                            latmax=latmax,
+                            lonmax=lonmax,
+                            timestamps=chunk,
+                            dimensions=dimensions,
+                            **kwargs,
+                        )
+                        lst.append(arr)
+                    arr = xarray.merge(lst)[self.layer_id]
 
-            # Get the data from the dataservice
-            arr = dataservice.query.to_xarray(
-                layer_id=self.layer_id,
-                level=self.pixel_level,
-                latmin=latmin,
-                lonmin=lonmin,
-                latmax=latmax,
-                lonmax=lonmax,
-                timestamps=chunk,
-            )
+                # Overview grid is automatically aligned with pixel grid
+                delta_x = 0
+                delta_y = 0
+
+            elif self.dataservice_type=='local_filesystem':
+                gdf_local_meta = kwargs.get('gdf_local_meta')
+                # Filter by query area
+                gdf_local_meta = gdf_local_meta[
+                    gdf_local_meta.intersects(self.morton.base4_to_box(query_key))
+                ].reset_index(drop=True)
+                lst = []
+                for elements in itertools.product(*({'time':chunk} | self.dimension_values).values()):
+                    # Filtering the metadata using specific epochtime and dimension values
+                    flt = {
+                        'time': datetime.utcfromtimestamp(elements[0]).replace(tzinfo=pytz.utc)
+                    } | {
+                        d:elements[i+1] for i, d in enumerate(self.dimension_values)
+                    }
+                    df_filtered = gdf_local_meta.loc[
+                        (gdf_local_meta[list(flt)] == pandas.Series(flt)).all(axis=1)
+                    ]
+                    if len(df_filtered)==0:
+                        if self.verbose:
+                            print('Warning: dimension combination not found', elements)
+                    else:
+                        # Get the filepath from metadata
+                        filepath = df_filtered['filepath'].values[0]
+    
+                        # Get the data from the local filesystem
+                        arr = xarray.open_dataarray(filepath)
+                        
+                        if len(df_filtered)>1:
+                            print('Warning: combining multiple files with the same dimensions', elements)
+                            # Get the additional filepaths from metadata
+                            filepaths = df_filtered['filepath'].values[1:]
+                            for filepath in filepaths:
+                                arr1 = xarray.open_dataarray(filepath)
+                                arr = arr.fillna(arr1)
+    
+                        try:
+                            # Clip according to the query bounds
+                            arr = arr.where(
+                                (arr.x>lonmin) &
+                                (arr.x<lonmax) &
+                                (arr.y>latmin) &
+                                (arr.y<latmax),
+                                drop=True
+                            )
+                        except ValueError as e:
+                            print('Warning at elements ', elements, ': ', e)
+                        else:
+                            # Build a multiindex for all the timestamps and dimension values,
+                            # so that we can simpliy concat the arrays.
+                            midx = pandas.MultiIndex.from_arrays(
+                                [[v] for v in list(flt.values())], names=list(flt)
+                            )
+        
+                            # Recast to 3D using the multiindex
+                            arr = xarray.DataArray(
+                                numpy.array(arr),
+                                coords = [midx, arr.y, arr.x],
+                                dims =  ['midx', 'y', 'x'],
+                            )
+                            
+                            # Asserting that the y axis values are always in descending order
+                            assert arr.y.values[1]<arr.y.values[0]
+                            
+                            lst.append(arr)
+
+                arr = xarray.concat(lst, dim='midx')
+                
+                # Concat apparently does the padding of non-concatenating correctly, 
+                # but it may reverse the y-axis direction, so switch back here if needed.
+                if arr.y.values[1]>arr.y.values[0]:
+                    arr = arr.reindex(y=arr.y[::-1])
+                
+                # Unstacking the multiindex
+                arr = arr.set_index(midx=['time'] + list(self.dimension_values)).unstack('midx')
+
+                # Align overview grid with pixel grid
+                delta_pixel_partition = self.pixel_level - self.spatial_partition_level
+                
+                x0 = arr.x.min().item()-self.morton.resolution(self.pixel_level)[0]/2
+                x0_idx_px = self.morton.x_coord_to_idx(x0, self.pixel_level)
+                delta_x = int(x0_idx_px % (2**delta_pixel_partition))
+                
+                y0 = arr.y.min().item()-self.morton.resolution(self.pixel_level)[1]/2
+                y0_idx_px = self.morton.y_coord_to_idx(y0, self.pixel_level)
+                delta_y = int(y0_idx_px % (2**delta_pixel_partition))
+
+                # Debug: for now just calling the coordinates lat/lon.
+                # Debug: we should however switch from lat/lon to y_coord, x_coord everywhere
+                arr = arr.rename({'x': 'lon'})
+                arr = arr.rename({'y': 'lat'})
+                
+            else:
+                raise NotImplementedError(self.dataservice_type)
 
             # Multiindex in order to select all the lat/lon values belonging to overview cells
-            ovw_x =[l//2**self.delta_pixel_overview for l in range(len(arr.lon))]
-            ovw_y =list(reversed([l//2**self.delta_pixel_overview for l in range(len(arr.lat))]))
+            ovw_x = [
+                l//2**self.delta_pixel_overview for l in range(delta_x, len(arr.lon)+delta_x)
+            ]
+            ovw_y = list(reversed([
+                l//2**self.delta_pixel_overview for l in range(delta_y, len(arr.lat)+delta_y)
+            ]))
 
             midx_x = pandas.MultiIndex.from_arrays(
                 [numpy.array(arr.lon), ovw_x], names=("lon", "ovw_x")
@@ -568,16 +739,32 @@ class Rasteroverview():
             midx_y = pandas.MultiIndex.from_arrays(
                 [numpy.array(arr.lat), ovw_y], names=("lat", "ovw_y")
             )
+            # Using __getattr__ instead of getattr because there can be a clash between
+            # an attribute name like "quantile" and a bound xarray method "quantile".
+            #coords = {name: getattr(arr, name) for name in self.dimension_values}
+            coords = {name: arr.__getattr__(name) for name in self.dimension_values}
+            coords = coords | {'time': arr.time, 'y': midx_y, 'x': midx_x}
+
+            # Getting the first three array dimensions in the right order
+            dims = [d.replace('lat', 'y').replace('lon', 'x') for d in arr.dims[:3]]
+            dims += list(arr.dims[3:])
+
             arr = xarray.DataArray(
                 numpy.array(arr),
-                dims = ['time', 'y', 'x'],
-                coords={'time':arr.time, 'y': midx_y, 'x': midx_x}
+                coords = coords,
+                dims =  dims,
             )
+            
+            # Renaming the dimension names by perpending 'dimension_' since there could be 
+            # clashes with keywords such as "quantile".
+            for name in self.dimension_values:
+                arr = arr.rename({name: 'dimension_' + name})
 
             # To do: crop array to valid range
             # (may only be necessary in special cases where we experiment with limited ranges)
 
-            # Cut up the array into overview-cell sized cubes (many timestamps but one overview key)
+            # Cut up the array into overview-cell sized cubes 
+            # (many timestamps and/or dimension values but only one overview key)
             arr_small_lst = []
             for x in sorted(set(ovw_x)):
                 for y in sorted(set(ovw_y)):
@@ -620,30 +807,38 @@ class Rasteroverview():
             df_stats[hist_cols] = df_stats[hist_cols].fillna(0).astype(int)
 
         # Get the quaternary key from the ovw_x and ovw_y positions within the xarray
-        #x_min, y_min = morton.base4_to_xy_indices(min(aggregation_keys))
-        x_min, y_min = morton.base4_to_xy_indices(
-            query_key + '0' * (self.overview_level-self.spatial_level)
+        #x_min, y_min = self.morton.base4_to_xy_indices(min(aggregation_keys))
+        x_min, y_min = self.morton.base4_to_xy_indices(
+            query_key + '0' * (self.overview_level-self.spatial_partition_level)
         )
         gdf_unique = df_stats[['ovw_y', 'ovw_x']].drop_duplicates().reset_index(drop=True)
-        xs = morton.x_idx_to_center_coord(gdf_unique['ovw_x'] + x_min, self.overview_level)
-        ys = morton.y_idx_to_center_coord(gdf_unique['ovw_y'] + y_min, self.overview_level)
-        keys = morton.get_key(numpy.array(ys), numpy.array(xs), [self.overview_level]*len(xs))
-        q_keys = morton.encode(keys, [self.overview_level]*len(xs))
+        xs = self.morton.x_idx_to_center_coord(gdf_unique['ovw_x'] + x_min, self.overview_level)
+        ys = self.morton.y_idx_to_center_coord(gdf_unique['ovw_y'] + y_min, self.overview_level)
+        keys = self.morton.get_key(numpy.array(ys), numpy.array(xs), [self.overview_level]*len(xs))
+        q_keys = self.morton.encode(keys, [self.overview_level]*len(xs))
         gdf_unique[self.key_col] = q_keys
 
         # Convert to geopandas GeoDataFrame
-        gdf_unique[self.geom_col] = gdf_unique[self.key_col].apply(morton.base4_to_box)
+        gdf_unique[self.geom_col] = gdf_unique[self.key_col].apply(self.morton.base4_to_box)
         gdf_unique = geopandas.GeoDataFrame(gdf_unique, geometry=self.geom_col)
         gdf_unique[self.geom_col] = gdf_unique.intersection(self.valid_range)
 
         # Catch the case when the valid range intersects with the query partition
         gdf_unique = gdf_unique[~gdf_unique[self.geom_col].is_empty].reset_index(drop=True)
-        assert set(gdf_unique[self.key_col]).issubset(set(aggregation_keys))
+        
+        # Debug: There may be another problem when the valid range intersects, where gdf_unique has additional keys
+        # print('debug gdf_unique', gdf_unique)
+        # print('debug set(aggregation_keys)', set(aggregation_keys))
+        # assert set(gdf_unique[self.key_col]).issubset(set(aggregation_keys))
 
         # Merge keys and stats
         gdf_overview = pandas.merge(
             gdf_unique,
-            df_stats.reset_index().rename(columns={'time': self.dt_col}),
+            df_stats.reset_index().rename(
+                # Keeping the dimension prefix due to possible clashes with statistic columns
+                #columns={'time': self.dt_col} | {'dimension_' + d: d for d in self.dimension_values}
+                columns={'time': self.dt_col}
+            ),
             on=['ovw_x', 'ovw_y']
         )
         del gdf_overview['ovw_x']
@@ -660,63 +855,66 @@ class Rasteroverview():
 
     def _parquet_directory(self):
         """Composing the parquet directory."""
-        parquet_directory = os.path.join(
-            self.overviewstore_directory,
-            self.dset_id,
-            self.layer_id,
-            'level' + str(self.overview_level)
-        )
+        parquet_directory = self.overviewstore_directory
+        if self.dset_id is not None:
+            parquet_directory = os.path.join(parquet_directory, 'dset_id=' + self.dset_id)
+        if self.layer_id is not None:
+            parquet_directory = os.path.join(parquet_directory, 'layer_id=' + self.layer_id)
+        parquet_directory = os.path.join(parquet_directory, 'overview_level=' + str(self.overview_level))
         if not os.path.exists(parquet_directory):
             os.makedirs(parquet_directory)
         return parquet_directory
 
-    def _filepath(self, spatial_partition, temporal_partition=None):
+    def _filepath(self, spatial_partition, temporal_partition={}):
         """Composing the filepath from metadata."""
         filepath = self._parquet_directory()
-        filename = self.layer_id
-        if temporal_partition is not None:
-            filepath = os.path.join(filepath, temporal_partition)
-            if not os.path.exists(filepath):
-                os.makedirs(filepath)
-            filename = '_'.join([filename, temporal_partition])
+        for temporal_level in self.temporal_levels:
+            filepath = os.path.join(
+                filepath,
+                temporal_level+'='+str(temporal_partition[temporal_level])
+            )
+        filepath = os.path.join(filepath, 'spatial_partition'+'='+spatial_partition)
+        if not os.path.exists(filepath):
+            os.makedirs(filepath)
 
-        filename = '_'.join([filename, spatial_partition])
-        filename = '.'.join([filename, 'parquet'])
-
+        filename = 'overview.parquet'
         return os.path.join(filepath, filename)
 
     def _decode_filepath(self, filepath):
         dirname, filename = os.path.split(filepath)
         filename = os.path.splitext(filename)[0]
-
-        # Decompose the filename into layer_id, temporal partition, spatial_partition
-        parts = filename.split('_')
-        assert len(parts)==2 or len(parts)==3
-        layer_id = parts[0]
-        spatial_partition = parts[-1]
-        if len(parts)==3:
-            # temporal partition is present
-            temporal_partition = parts[1]
-            # split off the temporal partition folder from the dirname
-            dirname, tail = os.path.split(dirname)
-            assert tail==temporal_partition
-        else:
-            temporal_partition = None
-
-        # split off the overview_level folder from the dirname
-        dirname, overview_level = os.path.split(dirname)
-        overview_level = int(overview_level.lstrip('level'))
-
-        # split off the layer_id folder from the dirname
+        
+        # split off the spatial partition folder from the dirname
         dirname, tail = os.path.split(dirname)
-        assert tail==layer_id
+        key, value = tail.split('=')
+        assert key=='spatial_partition'
+        spatial_partition = value
+        
+        temporal_partition = {}
+        while True:
+            # Continue splitting
+            dirname, tail = os.path.split(dirname)
+            try:
+                key, value = tail.split('=')
+            except ValueError:
+                break
+            if key in self.temporal_levels:
+                # Found another temporal partition
+                temporal_partition[key] = value
+            elif key=='overview_level':
+                overview_level = int(value)
+                assert overview_level==self.overview_level
+            elif key=='layer_id':
+                layer_id = int(value)
+                assert layer_id==self.layer_id
+            elif key=='dset_id':
+                dset_id = int(value)
+                assert dset_id==self.dset_id
+            else:
+                raise ValueError("Non-compliant filepath." )
 
-        # split off the dset_id folder from the dirname
-        overviewstore_directory, dset_id = os.path.split(dirname)
-        assert overviewstore_directory.rstrip('/')==self.overviewstore_directory.rstrip('/')
-        assert dset_id==self.dset_id
-        assert layer_id==self.layer_id
-        assert overview_level==self.overview_level
+        # Finally we should be left with the overviewstore_directory
+        assert dirname.rstrip('/')==self.overviewstore_directory.rstrip('/')
 
         return temporal_partition, spatial_partition
 
@@ -732,13 +930,21 @@ class Rasteroverview():
             else:
                 # Merge by concatenating and dropping duplicates (keeping the newer version)
                 gdf = pandas.concat([gdf_existing, gdf]).drop_duplicates(
-                    subset=[self.dt_col, self.key_col], keep='last'
+                    subset=[self.dt_col, self.key_col]+['dimension_' + d for d in self.dimension_values],
+                    keep='last',
                 )
-
+                
         if len(gdf)>0:
-            # Debug: to do: Dimensions need to be considered in the subset above and sorting below
-            gdf = gdf.sort_values(by=[self.dt_col, self.key_col]).reset_index(drop=True)
-            # Debug: Speedtest to do: try different sorting order [self.key_col, self.dt_col]
+            # Histogram columns may not be present in all parts
+            # Cast back to integer after filling with 0 since these may be float now.
+            hist_cols = [c for c in gdf.columns if c.startswith('count_')]
+            if len(hist_cols)>0:
+                gdf[hist_cols] = gdf[hist_cols].fillna(0).astype(int)
+
+            # Sorting so that these columns are used as indices in parquet file
+            gdf = gdf.sort_values(
+                by=[self.dt_col]+['dimension_' + d for d in self.dimension_values]+[self.key_col]
+            ).reset_index(drop=True)
 
             gdf.to_parquet(
                 path=filepath,
@@ -777,8 +983,10 @@ class Rasteroverview():
                 del df[self.geom_col]
 
             # Histogram columns may not be present in all parts
+            # Cast back to integer after filling with 0 since these may be float now.
             hist_cols = [c for c in df.columns if c.startswith('count_')]
-            df[hist_cols] = df[hist_cols].fillna(0).astype(int)
+            if len(hist_cols)>0:
+                df[hist_cols] = df[hist_cols].fillna(0).astype(int)
 
         return df
 
@@ -795,7 +1003,7 @@ class Rasteroverview():
 
         # Get latitude and longitude from base4 key
         df_unique = df[[self.key_col]].drop_duplicates().reset_index(drop=True)
-        df_unique['lon'], df_unique['lat'] = morton.base4_to_center_coords(df_unique[self.key_col])
+        df_unique['lon'], df_unique['lat'] = self.morton.base4_to_center_coords(df_unique[self.key_col])
         df = pandas.merge(df_unique, df, on=self.key_col)
         del df[self.key_col]
         df = df.rename(columns={self.dt_col: 'time'})
@@ -863,27 +1071,28 @@ class Rasteroverview():
         json_directory = self._parquet_directory()
         # We don's store the json file within the parquet directory, so go one level back.
         json_directory = os.path.split(json_directory)[0]
-        json_name = self.layer_id + '_level' + str(self.overview_level) + '.json'
+        json_name = 'level' + str(self.overview_level) + '.json'
         return os.path.join(json_directory, json_name)
 
     def to_json(self):
         """Dump attributes to a json file."""
         json_dict = {}
-        json_dict['dset_id'] = self.dset_id
-        json_dict['layer_id'] = self.layer_id
         json_dict['pixel_level'] = self.pixel_level
         json_dict['delta_pixel_overview'] = self.delta_pixel_overview
         json_dict['overview_level'] = self.overview_level
         json_dict['overviewstore_directory'] = self.overviewstore_directory
+        json_dict['dset_id'] = self.dset_id
+        json_dict['layer_id'] = self.layer_id
+        json_dict['dimension_values'] = self.dimension_values
         json_dict['dt_col'] = self.dt_col
         json_dict['geom_col'] = self.geom_col
         json_dict['temporal_levels'] = self.temporal_levels
-        json_dict['temporal_level_encodings'] = self.temporal_level_encodings
         json_dict['temporal_partitions'] = self.temporal_partitions
+        json_dict['spatial_partition_level'] = self.spatial_partition_level
         json_dict['spatial_partitions'] = self.spatial_partitions
-        json_dict['spatial_level'] = self.spatial_level
         json_dict['stats'] = self.stats
         json_dict['overview_keys'] = self.overview_keys
+        json_dict['numeric_or_categorical'] = self.numeric_or_categorical
 
         json_path = self._json_path()
         with open(json_path, 'w') as file:
@@ -896,6 +1105,230 @@ class Rasteroverview():
             json_dict = json.load(file)
         for key in json_dict:
             setattr(self, key, json_dict[key])
+
+    """FOR CONVENIENCE, WE PROVIDE AN OPTION TO WRITE RAW DATA TO DISK."""
+    def _raw_directory(self):
+        """Composing a directory for raw data."""
+        raw_directory = self.overviewstore_directory
+        if self.dset_id is not None:
+            raw_directory = os.path.join(raw_directory, 'dset_id=' + self.dset_id)
+        if self.layer_id is not None:
+            raw_directory = os.path.join(raw_directory, 'layer_id=' + self.layer_id)
+        raw_directory = os.path.join(raw_directory, 'raw')
+        if not os.path.exists(raw_directory):
+            os.makedirs(raw_directory)
+        return raw_directory
+
+    def _raw_filepath(self, spatial_partition, temporal_partition={}):
+        """Composing the filepath from metadata."""
+        filepath = self._raw_directory()
+        for temporal_level in self.temporal_levels:
+            filepath = os.path.join(
+                filepath,
+                temporal_level+'='+str(temporal_partition[temporal_level])
+            )
+        filepath = os.path.join(filepath, 'spatial_partition'+'='+spatial_partition)
+        if not os.path.exists(filepath):
+            os.makedirs(filepath)
+
+        filename = 'raw.zarr'
+        return os.path.join(filepath, filename)
+
+    def raw_data_only(
+        self, temporal_partition={}, spatial_partition=None, chunk_n=None,
+        probe_local_timestamps=False, **kwargs
+    ):
+        """Grab the raw data without creating overviews.
+        
+        leverages the partitioning to get exactly fitting x/y ranges
+        chunk_n            limit number of timestamps queried at a time
+        :param kwargs:     cluster, dataserviceendpoint
+        """          
+        if len(temporal_partition)==0:
+            # Query all timestamps
+            query_epochtimes = [int(t.timestamp()) for t in sorted(self.available_timestamps())]
+        else:
+            # Query partition timestamps
+            if self.timestamps is None:
+                query_epochtimes = self._get_query_timestamps(temporal_partition)
+            else:
+                query_epochtimes = self._get_query_timestamps(temporal_partition, self.timestamps)
+
+        dimensions_lst = []  # List of all valid dimensions dictionaries
+        if len(self.dimension_values)>0: # Debug consider dimension partitions
+            for elements in itertools.product(*self.dimension_values.values()):
+                # Looping through the cartesian product
+                dimensions={}
+                for i, dimension_name in enumerate(self.dimension_values):
+                    dimensions[dimension_name] = elements[i]
+                dimensions_lst.append(dimensions)
+
+        if spatial_partition is None:
+            # Query global
+            spatial_partition =  '0q'
+            query_key = '0q'
+        else:
+            # Query spatial partition
+            query_key = spatial_partition
+
+            if probe_local_timestamps:
+                # probe the query_key area in the four corners as well as the center.
+                query_epochtimes = self._probe_query_timestamps(query_key, query_epochtimes, **kwargs)
+
+        if len(query_epochtimes)==0:
+            if self.verbose:
+                print('No timestamps available')
+        else:
+            if self.verbose:
+                print('Found', len(query_epochtimes), 'new timestamps')
+
+            ds = self._raw_data_only(
+                query_epochtimes, query_key, dimensions_lst, chunk_n=chunk_n, **kwargs
+            )
+
+            # For now just write to multiple small zarr files.
+            # Eventually figure out how to write to a partition of larger zarr file
+            if ds.time.size>0:
+                filepath = self._raw_filepath(spatial_partition, temporal_partition)
+                ds.to_zarr(filepath)
+
+    def _raw_data_only(
+        self, query_epochtimes, query_key, dimensions_lst, chunk_n=None, **kwargs
+    ):
+        """
+        query_epochtimes list of timestamps
+        query_key        quaternary key to define the query area. (E.g., one spatial partition)
+                         Usually called as: query_key = spatial_partition
+        chunk_n          limit number of timestamps queried at a time
+        """
+        # query box 
+        lonmin, latmin, lonmax, latmax = self.valid_range.bounds
+        west, south, east, north = self.morton.base4_to_box(query_key).bounds
+        latmin = max(latmin, south)
+        latmax = min(latmax, north)
+        lonmin = max(lonmin, west)
+        lonmax = min(lonmax, east)
+
+        if self.dataservice_type=='hbase':
+            # reduce query box by 1/2 pixel because the dataservice will buffer to the full cell
+            res_x, res_y = self.morton.resolution(self.pixel_level)
+            latmin = max(latmin, south + res_y/2)
+            latmax = min(latmax, north - res_y/2)
+            lonmin = max(lonmin, west + res_x/2)
+            lonmax = min(lonmax, east - res_x/2)
+
+        # Number of timestamps queried at a time
+        if chunk_n is None:
+            max_query_pixels_per_ts = (
+                self.stats['max_ovw_keys_per_spatial_part']
+                * 4**self.delta_pixel_overview
+            )
+            chunk_n = int(self.MAX_QUERY_PIXELS // max_query_pixels_per_ts)
+
+        if chunk_n==0:
+            if self.stats['number_global_timestamps']>0:
+                s = 'Too many query pixels per timestamp. Define smaller spatial partitions'
+                raise ValueError(s)
+            else:
+                raise RuntimeError('Nothing found.')
+                
+        ds = []
+        for i, chunk in enumerate(self._chunks(query_epochtimes, chunk_n)):
+            print('chunk', i, ': ', len(chunk))
+ 
+            if self.dataservice_type=='hbase':
+                # Get the data from the hbase dataservice
+                if len(dimensions_lst)==0:
+                    # No dimensions
+                    arr = dataservice.query.to_xarray(
+                        layer_id=self.layer_id,
+                        level=self.pixel_level,
+                        latmin=latmin,
+                        lonmin=lonmin,
+                        latmax=latmax,
+                        lonmax=lonmax,
+                        timestamps=chunk,
+                        **kwargs,
+                    )
+                else:
+                    lst = []
+                    for dimensions in dimensions_lst:
+                        arr = dataservice.query.to_xarray(
+                            layer_id=self.layer_id,
+                            level=self.pixel_level,
+                            latmin=latmin,
+                            lonmin=lonmin,
+                            latmax=latmax,
+                            lonmax=lonmax,
+                            timestamps=chunk,
+                            dimensions=dimensions,
+                            **kwargs,
+                        )
+                        lst.append(arr)
+                    arr = xarray.merge(lst)[self.layer_id]
+
+            elif self.dataservice_type=='local_filesystem':
+                gdf_local_meta = kwargs.get('gdf_local_meta')
+                lst = []
+                for elements in itertools.product(*({'time':chunk} | self.dimension_values).values()):
+                    # Filtering the metadata using specific epochtime and dimension values
+                    flt = {
+                        'time': datetime.utcfromtimestamp(elements[0]).replace(tzinfo=pytz.utc)
+                    } | {
+                        d:elements[i+1] for i, d in enumerate(self.dimension_values)
+                    }
+                    df_filtered = gdf_local_meta.loc[
+                        (gdf_local_meta[list(flt)] == pandas.Series(flt)).all(axis=1)
+                    ]
+                    # Get the filepath from metadata
+                    filepath = df_filtered['filepath'].values[0]
+
+                    # Get the data from the local filesystem
+                    arr = xarray.open_dataarray(filepath)
+                    
+                    # Clip according to the query bounds
+                    arr = arr.where(
+                        (arr.x>lonmin) &
+                        (arr.x<lonmax) &
+                        (arr.y>latmin) &
+                        (arr.y<latmax),
+                        drop=True
+                    )
+
+                    # Build a multiindex for all the timestamps and dimension values,
+                    # so that we can simpliy concat the arrays.
+                    midx = pandas.MultiIndex.from_arrays(
+                        [[v] for v in list(flt.values())], names=list(flt)
+                    )
+
+                    # Recast to 3D using the multiindex
+                    arr = xarray.DataArray(
+                        numpy.array(arr),
+                        coords = [midx, arr.y, arr.x],
+                        dims =  ['midx', 'y', 'x'],
+                    )
+                    lst.append(arr)
+
+                arr = xarray.concat(lst, dim='midx')
+
+                # Debug: Unstacking the multiindex may be expensive
+                arr = arr.set_index(midx=['time'] + list(self.dimension_values)).unstack('midx')
+                #arr = arr.set_index(midx=['time', 'band', 'tile']).unstack('midx')
+
+                # Debug: for now just calling the coordinates lat/lon.
+                # Debug: we should however switch from lat/lon to y_coord, x_coord everywhere
+                arr = arr.rename({'x': 'lon'})
+                arr = arr.rename({'y': 'lat'})
+                
+            else:
+                raise NotImplementedError(self.dataservice_type)
+
+            ds.append(
+                arr.rename(self.layer_id).to_dataset().astype(numpy.float32)
+            )
+
+        ds = xarray.merge(ds)
+        return ds
 
 
 class NpEncoder(json.JSONEncoder):

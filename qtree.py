@@ -17,7 +17,7 @@ import shapely
 import pandas
 import geopandas
 
-import morton
+import mortoncurve
 
 
 class Node():
@@ -45,13 +45,13 @@ class Node():
         encode                  Quaternary representation of node.
         add_child               Add a child node.
     """
-    def __init__(self, level=0, key=0):
+    def __init__(self, morton, level=0, key=0):
         self.level = level
         self.key = key
 
         # Nodes encompass half-open intervals [south,north) and [west,east),
         # so that points (and some lines) are assigned to exactly one box on each resolution level.
-        self.epsilon = morton.EPSILON
+        #self.epsilon = morton.grid.epsilon
 
         # is_leaf is true when node does not have any children (genuine leaf node).
         # Polygon completely contains the node. The set of "is_leaf" can be used to find
@@ -79,8 +79,8 @@ class Node():
         # (and some lines) are assigned to exactly one box on each resolution level.
         self.res_x, self.res_y = morton.resolution(self.level)
         self.west, self.south = morton.coordinates(key, level)
-        self.east = self.west + self.res_x - self.epsilon
-        self.north = self.south + self.res_y - self.epsilon
+        self.east = self.west + self.res_x - morton.grid.epsilon
+        self.north = self.south + self.res_y - morton.grid.epsilon
 
     def __repr__(self):
         """Adding the quaternay hash string to the representation."""
@@ -123,7 +123,7 @@ class QTree():
         node.is_qualified_leaf      polygon intersects node
 
     Methods:
-        quadtree_dfs(self)          Walking the z-order Quadtree recursively (depth first search).
+        quadtree_dfs                Walking the z-order Quadtree recursively (depth first search).
         gridded                     Get the grid keys as a numpy array.
         gridded_to_geodataframe     Get the polyKeys as a geopandas GeoDataFrame.
         seeker                      Descend the QTree from root to a specific node.
@@ -131,7 +131,7 @@ class QTree():
         to_geodataframe             Convert the quadtree into a geopandas GeoDataFrame.
     """
 
-    def __init__(self, poly, max_level, max_depth=None, head_only=False, simplify_n=None):
+    def __init__(self, poly, max_level, max_depth=None, head_only=False, simplify_n=None, grid=None):
         """
         :param poly:          Polygon on a coordinate reference system as defined in morton.grid.crs
         :param max_level:     Maximum level when traversing the tree
@@ -139,6 +139,7 @@ class QTree():
         :param head_only:     If true, don't descend into the tree. 
                               Just return the head node (highest level containing full polygon)
         :param simplify_n:    Simplify the quadtree by merging n=4 or n=3+ quadrants
+        :param grid:          Nestedgrid
         """
         self.poly = poly
         self.max_level = max_level
@@ -146,15 +147,21 @@ class QTree():
         self.head_only = head_only
         self.simplify_n = simplify_n
 
+        # Nested grid to overwrite the default PAIRS grid
+        self.grid = grid
+
+        # Definition of the morton curve on top of the nested grid
+        self.morton = mortoncurve.Morton(self.grid)
+
         # Nodes encompass half-open intervals [south,north) and [west,east), so that points
         # (and some lines) are assigned to exactly one box on each resolution level.
-        self.epsilon = morton.EPSILON
+        self.epsilon = self.morton.grid.epsilon
 
         # Reserved for gridding the qtree at fixed level
         self._keys = None
 
         # Root Node
-        self.root = Node() # Level 0,  Key 0
+        self.root = Node(self.morton) # Level 0,  Key 0
 
         # Remember the node at which the entire polygon fits into a qtree cell
         # Allows snapping to head of qtree (just before the first split), bypassing lower levels.
@@ -217,25 +224,25 @@ class QTree():
 
         count_children_leafs = 0
         if intersects[0]:
-            node_sw = Node(node.level+1, (node.key<<2)) #south-west
+            node_sw = Node(self.morton, node.level+1, (node.key<<2)) #south-west
             node.add_child('0', node_sw)
             self._quadtree_dfs(node_sw)
             if node_sw.is_qualified_leaf:
                 count_children_leafs+=1
         if intersects[1]:
-            node_se = Node(node.level+1, (node.key<<2)+1) #south-east
+            node_se = Node(self.morton, node.level+1, (node.key<<2)+1) #south-east
             node.add_child('1', node_se)
             self._quadtree_dfs(node_se)
             if node_se.is_qualified_leaf:
                 count_children_leafs+=1
         if intersects[2]:
-            node_nw = Node(node.level+1, (node.key<<2)+2) #north-west
+            node_nw = Node(self.morton, node.level+1, (node.key<<2)+2) #north-west
             node.add_child('2', node_nw)
             self._quadtree_dfs(node_nw)
             if node_nw.is_qualified_leaf:
                 count_children_leafs+=1
         if intersects[3]:
-            node_ne = Node(node.level+1, (node.key<<2)+3) #north-east
+            node_ne = Node(self.morton, node.level+1, (node.key<<2)+3) #north-east
             node.add_child('3', node_ne)
             self._quadtree_dfs(node_ne)
             if node_ne.is_qualified_leaf:
@@ -332,17 +339,17 @@ class QTree():
         if level_col is not None:
             gdf_grid[level_col] = [level]*len(keys)
         if hash_col is not None:
-            gdf_grid[hash_col] = morton.encode(keys, [level]*len(keys))
+            gdf_grid[hash_col] = self.morton.encode(keys, [level]*len(keys))
         if geom_col is not None:
-            gdf_grid[geom_col] = morton.key_to_box(keys, level)
+            gdf_grid[geom_col] = self.morton.key_to_box(keys, level)
 
         gdf_grid = pandas.DataFrame(gdf_grid)
 
         if hash_col is not None:
             gdf_grid = gdf_grid.sort_values(by=hash_col).reset_index(drop=True)
         if geom_col is not None:
-            gdf_grid = geopandas.GeoDataFrame(gdf_grid, geometry=geom_col).set_crs(morton.grid.crs)
-            gdf_grid[geom_col] = morton.valid_range.intersection(gdf_grid[geom_col])
+            gdf_grid = geopandas.GeoDataFrame(gdf_grid, geometry=geom_col).set_crs(self.morton.grid.crs)
+            gdf_grid[geom_col] = self.morton.valid_range.intersection(gdf_grid[geom_col])
 
         return gdf_grid
 
@@ -350,7 +357,7 @@ class QTree():
         """Descend the QTree (starting at root) to the node defined by quaternary hash."""
         node = self.root
         try:
-            for letter in q_key:
+            for letter in q_key[2:]:
                 # descending sucessivele levels
                 node = node.children[letter]
             return node
@@ -439,8 +446,8 @@ class QTree():
         if hash_col is not None:
             gdf_qt = gdf_qt.sort_values(by=hash_col).reset_index(drop=True)
         if geom_col is not None:
-            gdf_qt = geopandas.GeoDataFrame(gdf_qt, geometry=geom_col).set_crs(morton.grid.crs)
-        gdf_qt[geom_col] = morton.valid_range.intersection(gdf_qt[geom_col])
+            gdf_qt = geopandas.GeoDataFrame(gdf_qt, geometry=geom_col).set_crs(self.morton.grid.crs)
+        gdf_qt[geom_col] = self.morton.valid_range.intersection(gdf_qt[geom_col])
 
         return gdf_qt
 
@@ -450,12 +457,12 @@ def encode_qt_dict(qt_dict):
     q_key = []
     for level in sorted(qt_dict.keys()):
         if len(qt_dict[level])>0:
-            q_key.extend(morton.encode(qt_dict[level], level))
+            q_key.extend(self.morton.encode(qt_dict[level], level))
     return q_key
 
 def to_qt_dict(q_key: str):
     """Convert the quaternary string representation back to a qt_dict dictionary (decode)."""
-    key, level = morton.decode(q_key)
+    key, level = self.morton.decode(q_key)
     df_tmp = pandas.DataFrame({'level': level, 'key': key})
     return dict(df_tmp.groupby('level')['key'].apply(numpy.array))
 
@@ -519,8 +526,8 @@ def _flatten_dict(qt_dict):
 # #         geom_col: shapely.box(a[:, 3].astype(float), a[:, 4].astype(float), a[:, 5].astype(float), a[:, 6].astype(float))
 # #     })
 # #     gdf_qt = gdf_qt.sort_values(by=hash_col).reset_index(drop=True)
-# #     gdf_qt = geopandas.GeoDataFrame(gdf_qt, geometry=geom_col).set_crs(morton.grid.crs)
-# #     gdf_qt['geom_col'] = morton.valid_range.intersection(gdf_qt['geom_col'])
+# #     gdf_qt = geopandas.GeoDataFrame(gdf_qt, geometry=geom_col).set_crs(self.morton.grid.crs)
+# #     gdf_qt['geom_col'] = self.morton.valid_range.intersection(gdf_qt['geom_col'])
 # #     return gdf_qt
 
 # def qt_to_geodataframe(qt_dict, key_col='key', level_col='level', hash_col='q_key', geom_col='geometry') -> geopandas.GeoDataFrame:
@@ -550,13 +557,13 @@ def _flatten_dict(qt_dict):
 #                 gdf_qt[hash_col].extend(q_key)
 #             if geom_col is not None:
 #                 gdf_qt[geom_col].extend([shapely.box(n.west, n.south, n.east, n.north) for n in qt_dict[l]])
-#                 #gdf_qt[geom_col].extend(numpy.array(morton.key_to_box(qt_dict[l], l)))
+#                 #gdf_qt[geom_col].extend(numpy.array(self.morton.key_to_box(qt_dict[l], l)))
 #     gdf_qt = pandas.DataFrame(gdf_qt)
 #     if hash_col is not None:
 #         gdf_qt = gdf_qt.sort_values(by=hash_col).reset_index(drop=True)
 #     if geom_col is not None:
-#         gdf_qt = geopandas.GeoDataFrame(gdf_qt, geometry=geom_col).set_crs(morton.grid.crs)
-#     gdf_qt[geom_col] = morton.valid_range.intersection(gdf_qt[geom_col])
+#         gdf_qt = geopandas.GeoDataFrame(gdf_qt, geometry=geom_col).set_crs(self.morton.grid.crs)
+#     gdf_qt[geom_col] = self.morton.valid_range.intersection(gdf_qt[geom_col])
 
 #     return gdf_qt
 
@@ -612,10 +619,10 @@ def _flatten_dict(qt_dict):
 #     level = parent_level + 1
 
 #     # All children keys belonging to level "level"
-#     keys = morton.children_keys(parent_keys, 1).flatten()
+#     keys = self.morton.children_keys(parent_keys, 1).flatten()
 
 #     # Corresponding bounding boxes
-#     boxes = morton.key_to_box(keys, level)
+#     boxes = self.morton.key_to_box(keys, level)
 
 #     # Check for full containment. These keys are recorded as leaf keys and don't have to be devided further
 #     full_containments = shapely.contains(poly, boxes)
@@ -728,7 +735,7 @@ def _flatten_dict(qt_dict):
 #     """
 #     boxes = []
 #     for l in sorted(qt_dict.keys()):
-#         boxes.append(numpy.array(morton.key_to_box(qt_dict[l], l)))
+#         boxes.append(numpy.array(self.morton.key_to_box(qt_dict[l], l)))
 #     return numpy.hstack(boxes)
 
 # def gridCellsPAIRS_bfs(qt_dict, level):
