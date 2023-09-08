@@ -321,7 +321,13 @@ class QTree():
         return numpy.array(self._keys)
 
     def gridded_to_geodataframe(
-        self, key_col='key', level_col='level', hash_col='q_key', geom_col='geometry', level=None
+        self,
+        key_col='key',
+        level_col='level',
+        hash_col='q_key',
+        geom_col='geometry',
+        level=None,
+        crop_valid_range=True,
     ):
         """Get the polyKeys in one shot.
         
@@ -349,7 +355,8 @@ class QTree():
             gdf_grid = gdf_grid.sort_values(by=hash_col).reset_index(drop=True)
         if geom_col is not None:
             gdf_grid = geopandas.GeoDataFrame(gdf_grid, geometry=geom_col).set_crs(self.morton.grid.crs)
-            gdf_grid[geom_col] = self.morton.valid_range.intersection(gdf_grid[geom_col])
+            if crop_valid_range:
+                gdf_grid[geom_col] = self.morton.valid_range.intersection(gdf_grid[geom_col])
 
         return gdf_grid
 
