@@ -67,6 +67,8 @@ class PAIRS:
         # Define the valid range (west, south, east, north)
         self.valid_bounds = [-180, -90, 180, 90]
 
+        self.valid_bounds_wgs84 = [-180, -90, 180, 90]
+
     def area_weights(self, x_coord, y_coord):
         """Weights for area normalizations (return 1 if equal area grid)."""
         return numpy.cos(numpy.deg2rad(y_coord))
@@ -146,6 +148,8 @@ class WorldCommensurate:
 
         # Define the valid range (west, south, east, north)
         self.valid_bounds = [-180, -90, 180 - self.epsilon, 90 - self.epsilon]
+
+        self.valid_bounds_wgs84 = [-180, -90, 180 - self.epsilon, 90 - self.epsilon]
 
     def area_weights(self, x_coord, y_coord):
         """Weights for area normalizations (return 1 if equal area grid)."""
@@ -229,6 +233,8 @@ class WorldFitting:
 
         # Define the valid range (west, south, east, north)
         self.valid_bounds = [-180, -90, 180 - self.epsilon, 90 - self.epsilon]
+
+        self.valid_bounds_wgs84 = [-180, -90, 180 - self.epsilon, 90 - self.epsilon]
 
     def area_weights(self, x_coord, y_coord):
         """Weights for area normalizations (return 1 if equal area grid)."""
@@ -318,6 +324,8 @@ class WorldMercator:
             20037508.34 - self.epsilon,  # 18764656.23-self.epsilon,
         ]
 
+        self.valid_bounds_wgs84 = [-180, -90, 180, 90]
+
     def area_weights(self, x_coord, y_coord):
         """Weights for area normalizations (return 1 if equal area grid)."""
         return numpy.cos(y_coord / 20037508.34 * numpy.pi / 2)
@@ -405,7 +413,14 @@ class UTM14N:
             833978.56,   # 96 deg west
             9329005.18,  # 84 deg north
         ]
-
+        
+        self.valid_bounds_wgs84 = [
+            -102,   # 102 deg west
+            0.0,         # 0 deg north (equator)
+            -96,   # 96 deg west
+            84,  # 84 deg north
+        ]
+        
     def area_weights(self, x_coord, y_coord):
         """Weights for area normalizations (return 1 if equal area grid)."""
         return y_coord*0.+1.
@@ -472,7 +487,200 @@ class UTM13N:
             833978.56,   # 102 deg west
             9329005.18,  # 84 deg north
         ]
+        
+        self.valid_bounds_wgs84 = [
+            -108,   # 108 deg west
+            0.0,         # 0 deg north (equator)
+            -102,   # 102 deg west
+            84,  # 84 deg north
+        ]
+        
+    def area_weights(self, x_coord, y_coord):
+        """Weights for area normalizations (return 1 if equal area grid)."""
+        return y_coord*0.+1.
 
+    def _y_coord_to_meters(self, y_coord):
+        """Calculate the length of a degree of longitude and latitude in meters.
+
+        :param y_coord:  y coordinate of pixel
+        """
+        return 0.9996, 0.9996
+
+    def pixel_area(self, x_coord, y_coord, res_x, res_y):
+        """Pixel area [square meters].
+
+        Pixel with lateral dimensions res_x, res_y at position (x_coord, y_coord).
+        :param x_coord:  x coordinate of pixel (e.g. longitude)
+        :param y_coord:  y coordinate of pixel (e.g. latitude)
+        :param res_x:    width of pixel
+        :param res_y:    height of pixel
+        """
+        return 0.9996 * res_x * 0.9996 * res_y
+
+@dataclass
+class UTM30m:
+    """WGS 84 / UTM zone n(N/S) (EPSG:32601 - 32660, 32701 - 32760).
+
+    Transverse Mercator.
+    """
+    def __init__(self, zone):
+        # parse the zone string
+        if zone.endswith('N'):
+            self.north_or_south = 'north'
+            self.zone_number = int(zone.rsplit('N')[0])
+        elif zone.endswith('S'):
+            self.north_or_south = 'south'
+            self.zone_number = int(zone.rsplit('S')[0])
+        else:
+            raise ValueError('UTM zone string not understood')
+            
+        assert (self.zone_number>=1) and (self.zone_number<=60)
+        
+        # Coordinate reference system
+        if self.north_or_south=='north':
+            self.crs = f'EPSG:326{self.zone_number:02}'
+        else:
+            # southern hemisphere
+            self.crs = f'EPSG:327{self.zone_number:02}'
+
+        if self.north_or_south=='north':
+            # Define the origin of the grid (lower-left corner)
+            self.origin = Origin(
+                x = 0.0,  # Origin set so that we get a commensurate square at level 0
+                y = 0.0,  # Origin at equator --> We may need to change this
+            )
+
+            # Define x and y extent (corresponds to pixel resolution at level 0)
+            self.res0 = Res0(
+                x = 30*(2**20),
+                y = 30*(2**20),  # (31457280) commensurate with 30m and encompassing 84deg North
+            )
+        else:
+            raise NotImplementedError("To be implemented")
+
+        # Extent of the level0 box (typically a square so pixels will be square as well)
+        self.level0_bounds = [
+            self.origin.x,
+            self.origin.y,
+            self.origin.x + self.res0.x,
+            self.origin.y + self.res0.y,
+        ] #west, south, east, north
+
+        self.max_levels = 29
+
+        # Define an epsilon here, smaller than the resolution of the highest level
+        # These are used to approximate half-open intervals [south,north) and [west,east),
+        # so that points (and some lines) are assigned to exactly one box on each resolution level.
+        self.epsilon = 1e-7
+
+        if self.north_or_south=='north':
+            west = numpy.arange(-180, 180, 6)[self.zone_number-1]
+            east = numpy.arange(-180, 180, 6)[self.zone_number]
+            south = 0
+            north = 84
+        else:
+            raise NotImplementedError("To be implemented")
+        
+        # Define the valid range (west, south, east, north)
+        self.valid_bounds_wgs84 = [west, south, east, north]
+        
+        self.valid_bounds = [
+            166021.44,   # 102 deg west
+            0.0,         # 0 deg north (equator)
+            833978.56,   # 96 deg west
+            9329005.18,  # 84 deg north
+        ]
+        
+    def area_weights(self, x_coord, y_coord):
+        """Weights for area normalizations (return 1 if equal area grid)."""
+        return y_coord*0.+1.
+
+    def _y_coord_to_meters(self, y_coord):
+        """Calculate the length of a degree of longitude and latitude in meters.
+
+        :param y_coord:  y coordinate of pixel
+        """
+        return 0.9996, 0.9996
+
+    def pixel_area(self, x_coord, y_coord, res_x, res_y):
+        """Pixel area [square meters].
+
+        Pixel with lateral dimensions res_x, res_y at position (x_coord, y_coord).
+        :param x_coord:  x coordinate of pixel (e.g. longitude)
+        :param y_coord:  y coordinate of pixel (e.g. latitude)
+        :param res_x:    width of pixel
+        :param res_y:    height of pixel
+        """
+        return 0.9996 * res_x * 0.9996 * res_y
+    
+    
+@dataclass
+class UTM30m_North:
+    """WGS 84 / UTM zone n North (EPSG:32601 - 32660).
+    
+    Southern coordinates are represented with negative y values.
+    This grid is commensurate with the system HLS uses for their rasters
+    Transverse Mercator.
+    """
+    def __init__(self, zone):
+        # parse the zone string
+        if zone.endswith('N'):
+            self.north_or_south = 'north'
+            self.zone_number = int(zone.rsplit('N')[0])
+        elif zone.endswith('S'):
+            self.north_or_south = 'south'
+            self.zone_number = int(zone.rsplit('S')[0])
+            raise ValueError('For Southern latitudes use Northern UTM zones with negative y values')
+        else:
+            raise ValueError('UTM zone string not understood')
+            
+        assert (self.zone_number>=1) and (self.zone_number<=60)
+        
+        # Coordinate reference system
+        self.crs = f'EPSG:326{self.zone_number:02}'
+
+        # Define the origin of the grid (lower-left corner)
+        self.origin = Origin(
+            x = 0.0,  # Origin set so that we get a commensurate square at level 0
+            y = -30*(2**19),  # Origin 1/2 Res0 (15728640)
+        )
+
+        # Define x and y extent (corresponds to pixel resolution at level 0)
+        self.res0 = Res0(
+            x = 30*(2**20),
+            y = 30*(2**20),  # (31457280) commensurate with 30m and encompassing 84deg North
+        )
+
+        # Extent of the level0 box (typically a square so pixels will be square as well)
+        self.level0_bounds = [
+            self.origin.x,
+            self.origin.y,
+            self.origin.x + self.res0.x,
+            self.origin.y + self.res0.y,
+        ] #west, south, east, north
+
+        self.max_levels = 29
+
+        # Define an epsilon here, smaller than the resolution of the highest level
+        # These are used to approximate half-open intervals [south,north) and [west,east),
+        # so that points (and some lines) are assigned to exactly one box on each resolution level.
+        self.epsilon = 1e-7
+
+        west = numpy.arange(-180, 180, 6)[self.zone_number-1]
+        east = numpy.arange(-180, 180, 6)[self.zone_number]
+        south = -80
+        north = 84
+        
+        # Define the valid range (west, south, east, north)
+        self.valid_bounds_wgs84 = [west, south, east, north]
+        
+        self.valid_bounds = [
+            166021.44,   # 102 deg west
+            -8883084.96,  # 80 deg south
+            833978.56,   # 96 deg west
+            9329005.18,  # 84 deg north
+        ]
+        
     def area_weights(self, x_coord, y_coord):
         """Weights for area normalizations (return 1 if equal area grid)."""
         return y_coord*0.+1.
