@@ -821,10 +821,10 @@ def search_hsi(
             gdf_hsi = geopandas.read_parquet(
                 storage_url,
                 storage_options={
-                    'key' : service_credentials['access_key_id'],
-                    'secret' : service_credentials['secret_access_key'],
-                    #'key' : service_credentials['cos_hmac_keys']['access_key_id'],
-                    #'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
+                    #'key' : service_credentials['access_key_id'],
+                    #'secret' : service_credentials['secret_access_key'],
+                    'key' : service_credentials['cos_hmac_keys']['access_key_id'],
+                    'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
                     'client_kwargs' : {'endpoint_url': endpoint_url}
                 },
                 columns=columns,
