@@ -26,6 +26,7 @@ def stac_search_available(
     search_aoi,
     year = None,
     month = None,
+    day = None,
     fields = None,
     filter_band = None,
     filter_crs = None, #DEBUG, DOES NOT WORK YET SINCE RAW DATA HAS WRONG CRS
@@ -53,23 +54,32 @@ def stac_search_available(
         fields = FIELDS
     
     # Temporal search parameters
-    if month is None:
-        if year is None:
-            dt_start = None
+    if day is None:
+        if month is None:
+            if year is None:
+                dt_start = None
+            else:
+                dt_start = datetime(year, 1, 1)
+                dt_end = (datetime(year+1, 1, 1)-timedelta(seconds=1))
         else:
-            dt_start = datetime(year, 1, 1)
-            dt_end = (datetime(year+1, 1, 1)-timedelta(seconds=1))
+            if year is None:
+                raise ValueError
+            else:
+                dt_start = datetime(year, month, 1)
+                if month<12:
+                    dt_end = (datetime(year, month+1, 1)-timedelta(seconds=1))
+                elif month==12:
+                    dt_end = (datetime(year+1, 1, 1)-timedelta(seconds=1))
+                else:
+                    raise ValueError
     else:
         if year is None:
             raise ValueError
+        elif month is None:
+            raise ValueError
         else:
-            dt_start = datetime(year, month, 1)
-            if month<12:
-                dt_end = (datetime(year, month+1, 1)-timedelta(seconds=1))
-            elif month==12:
-                dt_end = (datetime(year+1, 1, 1)-timedelta(seconds=1))
-            else:
-                raise ValueError
+            dt_start = datetime(year, month, day)
+            dt_end = datetime(year, month, day)+timedelta(seconds=24*3600-1)
 
     # Translate datetime to format stac understands
     dt_string = None
@@ -184,6 +194,7 @@ def stac_search_items_to_raster_local_metadata(
     search_items,
     cos_bucket,
     grid,
+    dataservice_type, # 'local_filesystem', 'remote_filesystem'
 ):
     # Create metadataframe from stac search_items
     gdf_local_meta = geopandas.GeoDataFrame([{
@@ -198,14 +209,16 @@ def stac_search_items_to_raster_local_metadata(
     } for item in search_items])
 
     # Local path from remote path
-    # Either (A) download file to temporary folder
-    # gdf_local_meta['filepath'] = gdf_local_meta['remote_path'].apply(
-    #     lambda x: os.path.join('/data/raster/tmp/', os.path.split(x)[1])
-    # )
-    # Or (B) mounted s3fs
-    gdf_local_meta['filepath'] = gdf_local_meta['remote_path'].apply(
-        lambda x: os.path.join('/home/mfreitag/data', x.split(cos_bucket+'/')[-1])
-    )
+    if dataservice_type=='remote_filesystem':
+        # Either (A) download file from remote folder
+        gdf_local_meta['filepath'] = gdf_local_meta['remote_path'].apply(lambda x: 's3://' + x)
+    elif dataservice_type=='local_filesystem':
+        # Or (B) use mounted s3fs
+        gdf_local_meta['filepath'] = gdf_local_meta['remote_path'].apply(
+            lambda x: os.path.join('/home/mfreitag/data', x.split(cos_bucket+'/')[-1])
+        )
+    else:
+        raise NotImplementedError()
     
     # Gather additional properties from filepath
     gdf_local_meta['time'] = gdf_local_meta['filepath'].apply(_dt_from_filepath)
@@ -236,11 +249,11 @@ def setup_hsi(
     grid,
     gdf_local_meta,
     bands,
-    numeric_or_categorical,
+    numeric_or_categorical, 
+    dataservice_type, # 'local_filesystem', 'remote_filesystem'
     verbose = False,
 ):
     """Create the Hierarchical Spatial Index from Data in COS."""
-    DATESERVICE_TYPE = 'local_filesystem'
     PIXEL_LEVEL = 20 # 30m UTM30m grid
     DELTA_PIXEL_OVERVIEW = 5
     SPATIAL_PARTITION_LEVEL = 7
@@ -275,7 +288,7 @@ def setup_hsi(
     if verbose:
         print('crs                     ', crs)
         print('overviewstore_directory ', overviewstore_directory)
-        print('dataservice_type        ', DATESERVICE_TYPE)
+        print('dataservice_type        ', dataservice_type)
         print('dimension_values        ', dimension_values)
         print('delta_pixel_overview    ', DELTA_PIXEL_OVERVIEW)
         print('overview level          ', PIXEL_LEVEL - DELTA_PIXEL_OVERVIEW)
@@ -294,7 +307,7 @@ def setup_hsi(
         dset_id=None,
         layer_id=None,
         dimension_values=dimension_values,
-        dataservice_type=DATESERVICE_TYPE,
+        dataservice_type=dataservice_type,
         valid_range=None,
         numeric_or_categorical=numeric_or_categorical,
         grid=grid,
@@ -821,10 +834,10 @@ def search_hsi(
             gdf_hsi = geopandas.read_parquet(
                 storage_url,
                 storage_options={
-                    'key' : service_credentials['access_key_id'],
-                    'secret' : service_credentials['secret_access_key'],
-                    #'key' : service_credentials['cos_hmac_keys']['access_key_id'],
-                    #'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
+                    #'key' : service_credentials['access_key_id'],
+                    #'secret' : service_credentials['secret_access_key'],
+                    'key' : service_credentials['cos_hmac_keys']['access_key_id'],
+                    'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
                     'client_kwargs' : {'endpoint_url': endpoint_url}
                 },
                 columns=columns,

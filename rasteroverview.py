@@ -38,7 +38,7 @@ class Rasteroverview():
         dset_id                 Dataset ID
         layer_id                Layer ID
         dimension_values        Dictionary of valid dimension values indexed by dimension_names
-        dataservice_type        Currently supported: 'hbase' or 'local_filesystem'
+        dataservice_type        Currently supported: 'hbase', 'local_filesystem', 'remote_filesystem'
         dt_col                  Name of timestamp column in DataFrame.
         geom_col                Name of geometry column in DataFrame.
         key_col                 Name of spatial key column in DataFrame.
@@ -72,6 +72,7 @@ class Rasteroverview():
     # Default values for class attributes
     DATASERVICE_TYPE           = 'hbase'
     OVERVIEWSTORE_DIRECTORY    = '/data/raster/overviews/'
+    TMP_DIRECTORY              = '/data/raster/tmp'
     DELTA_PIXEL_OVERVIEW       = 5
     MAX_QUERY_PIXELS           = 5e8
     DT_COL                     = 'time' #'timestamp'
@@ -89,6 +90,7 @@ class Rasteroverview():
         pixel_level,
         delta_pixel_overview = None,
         overviewstore_directory = None,
+        tmp_directory = None,
         dset_id = None,
         layer_id = None,
         dimension_values = {},
@@ -121,7 +123,7 @@ class Rasteroverview():
             self.delta_pixel_overview = delta_pixel_overview
         self.overview_level   = self.pixel_level - self.delta_pixel_overview
 
-        # Type of dataservice (e.g. 'hbase', 'cloud', 'local_filesystem')
+        # Type of dataservice (e.g. 'hbase', 'local_filesystem', 'remote_filesystem')
         if dataservice_type is None:
             self.dataservice_type = self.DATASERVICE_TYPE
         else:
@@ -132,6 +134,12 @@ class Rasteroverview():
             self.overviewstore_directory = self.OVERVIEWSTORE_DIRECTORY
         else:
             self.overviewstore_directory = overviewstore_directory
+
+        # tmp_directory
+        if tmp_directory is None:
+            self.tmp_directory = self.TMP_DIRECTORY
+        else:
+            self.tmp_directory = tmp_directory
 
         # Table specific column information
         self.dt_col = self.DT_COL if dt_col is None else dt_col
@@ -614,7 +622,7 @@ class Rasteroverview():
             else:
                 raise RuntimeError('Nothing found.')
                 
-        if self.dataservice_type=='local_filesystem':
+        if self.dataservice_type in ['local_filesystem', 'remote_filesystem']:
             gdf_local_meta = kwargs.get('gdf_local_meta')
             # Filter by query area
             gdf_local_meta = gdf_local_meta[
@@ -663,7 +671,7 @@ class Rasteroverview():
                 delta_x = 0
                 delta_y = 0
 
-            elif self.dataservice_type=='local_filesystem':
+            elif self.dataservice_type in ['local_filesystem', 'remote_filesystem']:
                 lst = []
                 for elements in itertools.product(*({'time':chunk} | self.dimension_values).values()):
                     # Filtering the metadata using specific epochtime and dimension values
@@ -681,9 +689,25 @@ class Rasteroverview():
                     else:
                         # Get the filepath from metadata
                         filepath = df_filtered['filepath'].values[0]
-    
-                        # Get the data from the local filesystem
-                        arr = xarray.open_dataarray(filepath)
+                        if self.dataservice_type=='local_filesystem':
+                            # Get the data from the local filesystem
+                            arr = xarray.open_dataarray(filepath)
+                        elif self.dataservice_type=='remote_filesystem':
+                            # Download the remote data to a temporary directory
+                            try:
+                                local_path = os.path.join(
+                                    self.tmp_directory,
+                                    os.path.split(filepath)[1]
+                                )
+                                remote_fs = kwargs.get('remote_fs')
+                                remote_fs.download(filepath, local_path)
+                            except IOerror as e:
+                                print(e)
+                                return
+                            else:
+                                arr = xarray.open_dataarray(local_path)
+                                if os.path.isfile(local_path):
+                                    os.remove(local_path)
                         
                         if len(df_filtered)>1:
                             print('Warning: combining multiple files with the same dimensions', elements)
@@ -910,7 +934,9 @@ class Rasteroverview():
         gdf_unique[self.key_col] = q_keys
 
         # Convert to geopandas GeoDataFrame
-        gdf_unique[self.geom_col] = gdf_unique[self.key_col].apply(self.morton.base4_to_box)
+        # debug
+        #gdf_unique[self.geom_col] = gdf_unique[self.key_col].apply(self.morton.base4_to_box)
+        gdf_unique[self.geom_col] = self.morton.base4_to_box(gdf_unique[self.key_col])
         gdf_unique = geopandas.GeoDataFrame(gdf_unique, geometry=self.geom_col)
         gdf_unique[self.geom_col] = gdf_unique.intersection(self.valid_range)
 
