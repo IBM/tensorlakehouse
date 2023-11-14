@@ -331,7 +331,7 @@ class Morton():
         The level will be encoded in the length of the string
         """
         # Just making sure several data types are working (int, lists, arrays)
-        level = numpy.array(level)
+        level = numpy.array(level, dtype=numpy.int64) # numpy.int64 for windows compatibility
         if len(level.shape)==0:
             try:
                 len(key)
