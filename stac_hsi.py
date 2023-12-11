@@ -424,18 +424,39 @@ def hsi_worker(
 def upload_hsi_cos(
     src,
     dst,
+    dataservice_type, # 'local_filesystem', 'remote_filesystem'
     verbose = False,
+    **kwargs,
 ):
+    """
+    Upload all the parquet files in the src directory to dst.
+    If dataservice_type=='remote_filesystem' please provide a remote_fs with write credentials in the kwargs.
+    """
     for src_path in glob(os.path.join(src, '**/*.parquet'), recursive=True):
         dst_path = dst + src_path.split(src)[-1]
-        if not os.path.exists(dst_path):
-            dst_dir = os.path.dirname(dst_path)
-            if not os.path.exists(dst_dir):
-                os.makedirs(dst_dir)
-            shutil.copy(src_path, dst_path)
+        
+        if dataservice_type=='local_filesystem':
+            # Using local (or mounted) drive to upload to
+            if not os.path.exists(dst_path):
+                dst_dir = os.path.dirname(dst_path)
+                if not os.path.exists(dst_dir):
+                    os.makedirs(dst_dir)
+                shutil.copy(src_path, dst_path)
+            else:
+                if verbose:
+                    print('WARNING: file exists', dst_path)
+        elif dataservice_type=='remote_filesystem':
+            # Using s3fs to upload data to COS
+            remote_fs = kwargs.get('remote_fs')
+            if not remote_fs.exists(dst_path):
+                remote_fs.upload(src_path, dst_path)
+            else:
+                if verbose:
+                    print('WARNING: file exists', dst_path)
+        elif dataservice_type=='hbase':
+            raise NotImplementedError('hbase not supported for hsi upload.')
         else:
-            if verbose:
-                print('WARNING: file exists', dst_path)
+            raise ValueError(f'"{dataservice_type}" dataservice_type not understood.')
     return
 
 
@@ -450,9 +471,10 @@ def register_hsi_collection_stac(
     outpath,
 ):
     ISO_8601 = '%Y-%m-%dT%H:%M:%SZ'
-    stac = pystac_client.Client.open(STAC_URL)
-    stac_collections = list(stac.get_all_collections())
-    collection = stac_collections[[c.id for c in stac_collections].index(hsi_collection_id)]
+    # # Debug
+    # stac = pystac_client.Client.open(STAC_URL)
+    # stac_collections = list(stac.get_all_collections())
+    # collection = stac_collections[[c.id for c in stac_collections].index(hsi_collection_id)]
 
     stac_collection_dict = {
         "id": hsi_collection_id,
@@ -496,42 +518,92 @@ def register_hsi_items_stac(
     hsi_directory,
     grid,
     json_folder,
+    dataservice_type,
+    **kwargs,
 ):
+    """
+    Register HSI items in STAC.
+    If dataservice_type=='remote_filesystem' please provide
+    remote_fs, service_credentials, and endpoint_url in the kwargs.
+    """
+    if dataservice_type=='remote_filesystem':
+        remote_fs = kwargs.get('remote_fs')
+        service_credentials = kwargs.get('service_credentials')
+        endpoint_url = kwargs.get('endpoint_url')
+        
     ISO_8601 = '%Y-%m-%dT%H:%M:%SZ'
     REQUIRED_STATS_CATEGORICAL = {'count', 'top', 'freq', 'unique', 'first'}
     REQUIRED_STATS_NUMERIC = {'count', 'min', 'max', 'mean', 'std', 'first'}
     OPTIONAL_STATS_CATEGORICAL_STARTSWITH = 'count_' # Value counts (histogram columns)
     OPTIONAL_STATS_NUMERIC_ENDSWITH = '%' # Quantiles
 
-    # Accessing in mounted cos
-    storage_urls = glob(os.path.join(hsi_directory, '*/*/*/*.parquet'))
+    if dataservice_type=='local_filesystem':
+        # Accessing in local (or mounted) drive
+        storage_urls = glob(os.path.join(hsi_directory, '*/*/*/*.parquet'))
+    elif dataservice_type=='remote_filesystem':
+        # Using s3fs to access
+        storage_urls = remote_fs.glob(os.path.join(hsi_directory, '**/*.parquet'))
+
     print('storage_urls', len(storage_urls))
+    #print(*storage_urls, sep='\n')
 
     for i, storage_url_part in enumerate(storage_urls):
+        print('debug storage_url_part', storage_url_part)
         if not os.path.exists(json_folder):
             os.makedirs(json_folder)
         json_filepath = f'{json_folder}/item{i}.json'
 
-        #gdf1 = geopandas.read_parquet(storage_url_part)
-        gdf1 = dask_geopandas.read_parquet(storage_url_part)
-        # gdf1 = dask_geopandas.read_parquet(
-        #     storage_url_part,
-        #     storage_options={
-        #         'key' : service_credentials['cos_hmac_keys']['access_key_id'],
-        #         'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
-        #         'client_kwargs' : {'endpoint_url': endpoint_url}
-        #     },
-        # )
-
         crs = int(grid.crs.split('EPSG:')[-1])
-
-        # Spatial extent in native coordinates and in wgs84 coordinates
-        # # Either based on overview cells (slow)
-        # geometry = shapely.to_geojson(
-        #     gdf1.buffer(grid.epsilon).unary_union
-        # )
-        # Or based on partition (fast):
-        poly_native = gdf1.spatial_partitions.unary_union
+        if dataservice_type=='local_filesystem':
+            href = os.path.join(
+                's3://' + cos_bucket,
+                'hsi',
+                storage_url_part.split('/hsi/')[1]
+            )
+            try:
+                # If available and installed properly, dask_geopandas can read the metadata faster
+                gdf1 = dask_geopandas.read_parquet(storage_url_part)
+            except:
+                # Read with geopandas
+                gdf1 = geopandas.read_parquet(storage_url_part)
+                # Spatial extent in native coordinates based on overview cells (slow)
+                poly_native = gdf1.buffer(grid.epsilon).unary_union
+                gdf1 = gdf1.set_crs(crs)
+            else:
+                # Spatial extent in native coordinates based on partition (fast):
+                poly_native = gdf1.spatial_partitions.unary_union
+                gdf1 = gdf1.set_crs(crs).compute()
+                
+        elif dataservice_type=='remote_filesystem':
+            href = 's3://' + storage_url_part
+            try:
+                # If available and installed properly, dask_geopandas can read the metadata faster
+                gdf1 = dask_geopandas.read_parquet(
+                    's3://'+storage_url_part,
+                    storage_options={
+                        'key' : service_credentials['cos_hmac_keys']['access_key_id'],
+                        'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
+                        'client_kwargs' : {'endpoint_url': endpoint_url},
+                    },
+                )
+            except:
+                # Read with geopandas
+                gdf1 = geopandas.read_parquet(
+                    's3://'+storage_url_part,
+                    storage_options={
+                        'key' : service_credentials['cos_hmac_keys']['access_key_id'],
+                        'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
+                        'client_kwargs' : {'endpoint_url': endpoint_url},
+                    },
+                )
+                # Spatial extent in native coordinates based on overview cells (slow)
+                poly_native = gdf1.buffer(grid.epsilon).unary_union
+                gdf1 = gdf1.set_crs(crs)
+            else:
+                # Spatial extent in native coordinates based on partition (fast):
+                poly_native = gdf1.spatial_partitions.unary_union
+                gdf1 = gdf1.set_crs(crs).compute()
+        
         poly_wgs84 = geopandas.GeoDataFrame([
             {'geometry': poly_native}
         ]).set_crs(crs).to_crs(4326).loc[0, 'geometry']
@@ -539,8 +611,6 @@ def register_hsi_items_stac(
         geometry_wgs84 = json.loads(shapely.to_geojson(poly_wgs84))
         total_bounds_native = list(poly_native.bounds)
         total_bounds_wgs84 = list(poly_wgs84.bounds)
-
-        gdf1 = gdf1.set_crs(crs).compute()
 
         table_columns = []
         for col in gdf1.columns:
@@ -684,11 +754,7 @@ def register_hsi_items_stac(
             ],
             "assets": {
                 "data": {
-                    #"href": storage_url_part,
-                    "href": os.path.join(
-                        's3://' + cos_bucket,
-                        storage_url_part.split('/home/mfreitag/data/')[1]
-                    ),
+                    "href": href,
                     "type": "table/parquet; application=geoparquet; profile=cloud-optimized",
                     "title": hsi_collection_id,
                     "roles": [
@@ -696,15 +762,6 @@ def register_hsi_items_stac(
                     ],
                     "description": ""
                 },
-                # "raw data": {
-                #     "href": storage_url_zarr,
-                #     "type": "image/zarr; application=zarr; profile=cloud-optimized",
-                #     "title": hsi_collection_id,
-                #     "roles": [
-                #         "data"
-                #     ],
-                #     "description": ""
-                # }
             }
         }
 
