@@ -1,11 +1,6 @@
 import os
-import sys
 import warnings
 from glob import glob
-
-sys.path.insert(1, os.path.abspath(".."))
-from pairs_python.core import pairs_quadtree as pqt
-
 import time
 import math
 import numpy
@@ -18,6 +13,8 @@ from functools import partial
 import json
 from multiprocessing import Pool
 from pathos.pools import ProcessPool
+
+import pairs_quadtree
 
 
 class Vectorstore():
@@ -172,9 +169,9 @@ class Vectorstore():
     @staticmethod
     def quadtree(poly, level):
         # Get the quadtree cells only
-        polyQuadTree, _ = pqt.QuadTreePAIRS(poly, max_level=level)
+        polyQuadTree, _ = pairs_quadtree.quadTreePAIRS_dfs(poly, max_level=level)
         # Get all the keys on the same resolution level
-        polyCells = pqt.QuadTreeCellsPAIRS(polyQuadTree, level)
+        polyCells = pairs_quadtree.quadTreeCellsPAIRS_dfs(polyQuadTree, level)
         return polyCells
     
     def quadtree2(self, poly):
@@ -215,8 +212,8 @@ class Vectorstore():
     def _quadtree2geodataframe(self, quadtree):
         poly_squares=[]
         for square in quadtree:
-            south, west = pqt.getLatLon(square[1], square[0])
-            res = pqt.getResolution(square[0])
+            south, west = pairs_quadtree.getLatLon(square[1], square[0])
+            res = pairs_quadtree.getResolution(square[0])
             north = south + res
             east = west + res
             poly_squares.append(shapely.geometry.box(west, south, east, north))
@@ -232,9 +229,9 @@ class Vectorstore():
     
     def _polyCells2geodataframe(self, cells):
         poly_cells=[]
-        res = pqt.getResolution(self.spatial_level)
+        res = pairs_quadtree.getResolution(self.spatial_level)
         for cell in cells:
-            south, west = pqt.getLatLon(cell, self.spatial_level)
+            south, west = pairs_quadtree.getLatLon(cell, self.spatial_level)
             north = south + res
             east = west + res
             poly_cells.append(shapely.geometry.box(west, south, east, north))
@@ -251,7 +248,7 @@ class Vectorstore():
     def _create_spatial_partition_columns(self, gdf):
         for sp in self.spatial_partitions:
             levelsUp = self.spatial_level - self._spatialPartitionLevel(sp)
-            getParentKey_part = partial(pqt.getParentKey, levelsUp=levelsUp)
+            getParentKey_part = partial(pairs_quadtree.getParentKey, levelsUp=levelsUp)
             gdf[sp] = gdf[self.spatial_key_col].apply(getParentKey_part)
     
     def _get_partitions(self):
@@ -264,10 +261,10 @@ class Vectorstore():
             
     def _create_filter_key_column(self, gdf, level): 
         # Bottom left keys
-        gdf[f'filter_key_level{level}'] = pqt.getKey_vect(gdf['bb_miny'], gdf['bb_minx'], level)
+        gdf[f'filter_key_level{level}'] = pairs_quadtree.getKey(gdf['bb_miny'], gdf['bb_minx'], level)
 
         # Top_right_keys
-        top_right_keys = pqt.getKey_vect(gdf['bb_maxy'], gdf['bb_maxx'], level)
+        top_right_keys = pairs_quadtree.getKey(gdf['bb_maxy'], gdf['bb_maxx'], level)
         # Overwrite in cases where there would be more than one cell
         gdf.loc[gdf[f'filter_key_level{level}']!=top_right_keys, f'filter_key_level{level}'] = numpy.nan
 
@@ -347,7 +344,7 @@ class Vectorstore():
         # Get the center lat/lon of the spatial cell
         key = gdf.loc[0, self.spatial_key_col]
         level = gdf.loc[0, self.spatial_level_col]
-        lat, lon = pqt.getCenterLatLon(key, level)
+        lat, lon = pairs_quadtree.getCenterLatLon(key, level)
 
         # local_azimuthal_projection preserves angle (e.g. circles stay circles)
         #local_azimuthal_projection = f"+proj=aeqd +R=6371000 +units=m +lat_0={lat} +lon_0={lon}"
@@ -686,13 +683,13 @@ class Vectorstore():
         for k in self.temporal_keys:
             self.query_df_meta[k] = getattr(query_dt, k)
         self.query_df_meta[self.spatial_level_col] = self.spatial_level
-        self.query_df_meta[self.spatial_key_col] = pqt.getKey(query_latitude, query_longitude, self.spatial_level)
+        self.query_df_meta[self.spatial_key_col] = pairs_quadtree.getKey(query_latitude, query_longitude, self.spatial_level)
         self.query_df_meta = pandas.DataFrame([self.query_df_meta])
 
         # Spatial key for the partition
         for sp in self.spatial_partitions:
             levelsUp = self.spatial_level-self._spatialPartitionLevel(sp)
-            getParentKey_part = partial(pqt.getParentKey, levelsUp=levelsUp)
+            getParentKey_part = partial(pairs_quadtree.getParentKey, levelsUp=levelsUp)
             self.query_df_meta[sp] = self.query_df_meta[self.spatial_key_col].astype(int).apply(getParentKey_part)
 
         self.query_df_meta[self.composite_key_col] = self._generate_composite_keys(self.query_df_meta)

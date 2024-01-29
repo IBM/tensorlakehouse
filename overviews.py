@@ -1,8 +1,4 @@
 import os
-import sys
-sys.path.insert(1, os.path.abspath(".."))
-from pairs_python.core import pairs_quadtree as pqt
-
 import time
 import numpy
 import pandas
@@ -11,6 +7,7 @@ import pytz
 import geopandas
 from functools import partial
 
+import pairs_quadtree
 import vectorstore
 
 
@@ -519,7 +516,7 @@ class Overviews(vectorstore.Vectorstore):
         self.pyramid_levels = list(range(self.overview_level + 1))
         for pyramid_level in self.pyramid_levels:
             levelsUp = self.overview_level - pyramid_level
-            getParentKey_part = partial(pqt.getParentKey, levelsUp=levelsUp)
+            getParentKey_part = partial(pairs_quadtree.getParentKey, levelsUp=levelsUp)
             gdf['pyramid_level' + str(pyramid_level)] = gdf[self.spatial_key_col].apply(getParentKey_part)
             
     def pyramid_keys(self):
