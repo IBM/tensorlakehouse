@@ -391,15 +391,6 @@ def hsi_worker(
         # Only spatial partitions present
         spatial_partition = elements
         temporal_partition = {}
-        raster.overview_statistics(
-            temporal_partition, 
-            spatial_partition, 
-            probe_local_timestamps=False, 
-            skip_existing=SKIP_EXISTING,
-            n_workers = 1,
-            chunk_n = CHUNK_N,
-            **kwargs,
-        )
     else:
         # Both spatial and temporal partitions exist
         spatial_partition, temporal_elements = elements
@@ -409,16 +400,16 @@ def hsi_worker(
         for i, temporal_level in enumerate(raster.temporal_levels):
             temporal_partition[temporal_level] = temporal_elements[i]
 
-        raster.overview_statistics(
-            temporal_partition, 
-            spatial_partition, 
-            probe_local_timestamps=False, 
-            skip_existing=SKIP_EXISTING,
-            n_workers = 1,
-            chunk_n = CHUNK_N,
-            **kwargs
-        )
-    return
+    raster.overview_statistics(
+        temporal_partition, 
+        spatial_partition, 
+        probe_local_timestamps=False, 
+        skip_existing=SKIP_EXISTING,
+        n_workers = 1,
+        chunk_n = CHUNK_N,
+        **kwargs,
+    )
+    return spatial_partition, temporal_partition
 
 
 def upload_hsi_cos(
@@ -543,6 +534,9 @@ def register_hsi_items_stac(
     elif dataservice_type=='remote_filesystem':
         # Using s3fs to access
         storage_urls = remote_fs.glob(os.path.join(hsi_directory, '**/*.parquet'))
+        if len(storage_urls)==0:
+            # Maybe there are zero subdirectories to glob
+            storage_urls = remote_fs.glob(os.path.join(hsi_directory, '*.parquet'))
 
     print('storage_urls', len(storage_urls))
     #print(*storage_urls, sep='\n')
@@ -863,7 +857,7 @@ def search_hsi(
 
     if verbose:
         print('Found', len(search_items), 'search items')
-        
+
     filters = filters + [
             ('time', '>=', dt_start),
             ('time', '<=', dt_end),
