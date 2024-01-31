@@ -87,7 +87,7 @@ def getMortonInv(z: numpy.array) -> Tuple[numpy.array, numpy.array]:
     y = (y | y >> 16)   & 0x00000000ffffffff
     return y, x
 
-def getResolution(level: int) -> numpy.float:
+def getResolution(level: int) -> float:
     """
     Calculating pixel resolution based on level.
     :param level:   resolution level
