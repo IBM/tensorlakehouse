@@ -214,9 +214,10 @@ def stac_search_items_to_raster_local_metadata(
         gdf_local_meta['filepath'] = gdf_local_meta['remote_path'].apply(lambda x: 's3://' + x)
     elif dataservice_type=='local_filesystem':
         # Or (B) use mounted s3fs
-        gdf_local_meta['filepath'] = gdf_local_meta['remote_path'].apply(
-            lambda x: os.path.join('/home/mfreitag/data', x.split(cos_bucket+'/')[-1])
-        )
+        raise NotImplementedError()
+        # gdf_local_meta['filepath'] = gdf_local_meta['remote_path'].apply(
+        #     lambda x: os.path.join('/path/to/mount/point', x.split(cos_bucket+'/')[-1])
+        # )
     else:
         raise NotImplementedError()
     
@@ -510,6 +511,7 @@ def register_hsi_items_stac(
     grid,
     json_folder,
     dataservice_type,
+    load_hsi_stac_filepath, #'/path/to/shellscript/load_hsi_stac.sh',
     **kwargs,
 ):
     """
@@ -766,7 +768,7 @@ def register_hsi_items_stac(
     # glob(os.path.join(json_folder, '*.json'))
     
     # Upload using shellscript
-    os.system('/data/mfreitag/software/vector/load_hsi_stac.sh >/dev/null 2>&1')
+    os.system(f'{load_hsi_stac_filepath} >/dev/null 2>&1')
     
     return
 
