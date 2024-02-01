@@ -687,35 +687,68 @@ class Rasteroverview():
                         if self.verbose:
                             print('Warning: dimension combination not found', elements)
                     else:
-                        # Get the filepath from metadata
-                        filepath = df_filtered['filepath'].values[0]
                         if self.dataservice_type=='local_filesystem':
-                            # Get the data from the local filesystem
-                            arr = xarray.open_dataarray(filepath)
+                            # Data is present locally (maybe on mounted drive)
+                            local_paths = df_filtered['filepath'].values
                         elif self.dataservice_type=='remote_filesystem':
                             # Download the remote data to a temporary directory
-                            try:
-                                local_path = os.path.join(
-                                    self.tmp_directory,
-                                    os.path.split(filepath)[1]
-                                )
-                                remote_fs = kwargs.get('remote_fs')
-                                remote_fs.download(filepath, local_path)
-                            except IOerror as e:
-                                print(e)
-                                return
-                            else:
-                                arr = xarray.open_dataarray(local_path)
-                                if os.path.isfile(local_path):
-                                    os.remove(local_path)
-                        
-                        if len(df_filtered)>1:
+                            local_paths = []
+                            for remote_path in df_filtered['filepath'].values:
+                                try:
+                                    local_path = os.path.join(
+                                        self.tmp_directory,
+                                        os.path.split(remote_path)[1]
+                                    )
+                                    remote_fs = kwargs.get('remote_fs')
+                                    remote_fs.download(remote_path, local_path)
+                                except IOerror as e:
+                                    print(e)
+                                    return
+                                else:
+                                    local_paths.append(local_path)
+
+                        if len(local_paths)>1:
                             print('Warning: combining multiple files with the same dimensions', elements)
-                            # Get the additional filepaths from metadata
-                            filepaths = df_filtered['filepath'].values[1:]
-                            for filepath in filepaths:
-                                arr1 = xarray.open_dataarray(filepath)
-                                arr = arr.fillna(arr1)
+                        i=0
+                        for local_path in local_paths:
+                            if i==0:
+                                arr = xarray.load_dataarray(local_path)
+                            else:
+                                arr.fillna(xarray.load_dataarray(local_path))
+                            if (self.dataservice_type=='remote_filesystem') and os.path.isfile(local_path):
+                                # clean up
+                                os.remove(local_path)
+                            i+=1
+                        
+                        # # Get the filepath from metadata
+                        # filepath = df_filtered['filepath'].values[0]
+                        # if self.dataservice_type=='local_filesystem':
+                        #     # Get the data from the local filesystem
+                        #     arr = xarray.open_dataarray(filepath)
+                        # elif self.dataservice_type=='remote_filesystem':
+                        #     # Download the remote data to a temporary directory
+                        #     try:
+                        #         local_path = os.path.join(
+                        #             self.tmp_directory,
+                        #             os.path.split(filepath)[1]
+                        #         )
+                        #         remote_fs = kwargs.get('remote_fs')
+                        #         remote_fs.download(filepath, local_path)
+                        #     except IOerror as e:
+                        #         print(e)
+                        #         return
+                        #     else:
+                        #         arr = xarray.open_dataarray(local_path)
+                        #         if os.path.isfile(local_path):
+                        #             os.remove(local_path)
+                        
+                        # if len(df_filtered)>1:
+                        #     print('Warning: combining multiple files with the same dimensions', elements)
+                        #     # Get the additional filepaths from metadata
+                        #     filepaths = df_filtered['filepath'].values[1:]
+                        #     for filepath in filepaths:
+                        #         arr1 = xarray.open_dataarray(filepath)
+                        #         arr = arr.fillna(arr1)
     
                         try:
                             # Clip according to the query bounds
@@ -969,13 +1002,10 @@ class Rasteroverview():
                     lambda x: datetime.utcfromtimestamp(x).replace(tzinfo=pytz.utc)
                 )
             except OSError as e:
-                if e.errno == 75:
-                    # Value too large for defined data type
-                    gdf_overview[self.dt_col] = gdf_overview[self.dt_col].apply(
-                        lambda x: datetime.utcfromtimestamp(x/1e9).replace(tzinfo=pytz.utc)
-                    )
-                else:
-                    raise
+                # Maybe value was too large (nano second timestamp definition)
+                gdf_overview[self.dt_col] = gdf_overview[self.dt_col].apply(
+                    lambda x: datetime.utcfromtimestamp(x/1e9).replace(tzinfo=pytz.utc)
+                )
 
         gdf_overview = gdf_overview.set_crs(self.grid.crs)
         return gdf_overview

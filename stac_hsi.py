@@ -247,6 +247,7 @@ def stac_search_items_to_raster_local_metadata(
 
 def setup_hsi(
     overviewstore_directory,
+    tmp_directory,
     grid,
     gdf_local_meta,
     bands,
@@ -289,6 +290,7 @@ def setup_hsi(
     if verbose:
         print('crs                     ', crs)
         print('overviewstore_directory ', overviewstore_directory)
+        print('tmp_directory           ', tmp_directory)
         print('dataservice_type        ', dataservice_type)
         print('dimension_values        ', dimension_values)
         print('delta_pixel_overview    ', DELTA_PIXEL_OVERVIEW)
@@ -305,6 +307,7 @@ def setup_hsi(
         pixel_level=PIXEL_LEVEL,
         delta_pixel_overview=DELTA_PIXEL_OVERVIEW,
         overviewstore_directory=overviewstore_directory,
+        tmp_directory=tmp_directory,
         dset_id=None,
         layer_id=None,
         dimension_values=dimension_values,
@@ -517,11 +520,12 @@ def register_hsi_items_stac(
     """
     Register HSI items in STAC.
     If dataservice_type=='remote_filesystem' please provide
-    remote_fs, service_credentials, and endpoint_url in the kwargs.
+    remote_fs, access_key_id, secret_access_key, and endpoint_url in the kwargs.
     """
     if dataservice_type=='remote_filesystem':
         remote_fs = kwargs.get('remote_fs')
-        service_credentials = kwargs.get('service_credentials')
+        access_key_id = kwargs.get('access_key_id')
+        secret_access_key = kwargs.get('secret_access_key')
         endpoint_url = kwargs.get('endpoint_url')
         
     ISO_8601 = '%Y-%m-%dT%H:%M:%SZ'
@@ -577,8 +581,8 @@ def register_hsi_items_stac(
                 gdf1 = dask_geopandas.read_parquet(
                     's3://'+storage_url_part,
                     storage_options={
-                        'key' : service_credentials['cos_hmac_keys']['access_key_id'],
-                        'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
+                        'key' : access_key_id,
+                        'secret' : secret_access_key,
                         'client_kwargs' : {'endpoint_url': endpoint_url},
                     },
                 )
@@ -587,8 +591,8 @@ def register_hsi_items_stac(
                 gdf1 = geopandas.read_parquet(
                     's3://'+storage_url_part,
                     storage_options={
-                        'key' : service_credentials['cos_hmac_keys']['access_key_id'],
-                        'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
+                        'key' : access_key_id,
+                        'secret' : secret_access_key,
                         'client_kwargs' : {'endpoint_url': endpoint_url},
                     },
                 )
@@ -775,7 +779,8 @@ def register_hsi_items_stac(
 
 def search_hsi(
     stac,
-    service_credentials,
+    access_key_id, 
+    secret_access_key,
     endpoint_url,
     hsi_collection_id,
     search_aoi = None,
@@ -887,10 +892,8 @@ def search_hsi(
             gdf_hsi = geopandas.read_parquet(
                 storage_url,
                 storage_options={
-                    #'key' : service_credentials['access_key_id'],
-                    #'secret' : service_credentials['secret_access_key'],
-                    'key' : service_credentials['cos_hmac_keys']['access_key_id'],
-                    'secret' : service_credentials['cos_hmac_keys']['secret_access_key'],
+                    'key' : access_key_id,
+                    'secret' : secret_access_key,
                     'client_kwargs' : {'endpoint_url': endpoint_url}
                 },
                 columns=columns,
