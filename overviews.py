@@ -18,8 +18,8 @@ class Overviews(vectorstore.Vectorstore):
     """
     
     # Default values for variables
-    VECTORSTORE_DIRECTORY      = '/data/vector/vectorstore/'
-    OVERVIEWSTORE_DIRECTORY    = '/data/vector/overviews/'
+    VECTORSTORE_DIRECTORY      = 'data/vector/vectorstore/'
+    OVERVIEWSTORE_DIRECTORY    = 'data/vector/overviews/'
 
     # Overview statistics
     NUMERIC_LAYERS             = []

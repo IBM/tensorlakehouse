@@ -375,9 +375,13 @@ def setup_hsi(
     del gdf_grid_partitions['area']
         
     if verbose:
-        # Plot spatial partitions covering total bounds
-        ax = gdf_grid_partitions.plot(color='none')
-        gdf_total_bounds.plot(ax=ax, alpha=0.2)
+        try:
+            # Plot spatial partitions covering total bounds
+            ax = gdf_grid_partitions.plot(color='none')
+            gdf_total_bounds.plot(ax=ax, alpha=0.2)
+        except:
+            print('Skipping spatial partitions plot.')
+            pass
         
     return raster, gdf_grid, gdf_grid_partitions, gdf_total_bounds
 

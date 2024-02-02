@@ -29,7 +29,7 @@ class Vectorfusion():
     
     # Default values for variables
     ISO_8601           = '%Y-%m-%dT%H:%M:%SZ'
-    AOISTORE_DIRECTORY = '/data/vector/aoipolygons/'
+    AOISTORE_DIRECTORY = 'data/vector/aoipolygons/'
     MIN_SPATIAL_LEVEL = 7
     MAX_SPATIAL_LEVEL = 15
     COMPLETE_WORLD     = shapely.geometry.box(-180, -90, 180, 90)

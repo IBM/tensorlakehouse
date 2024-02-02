@@ -71,8 +71,8 @@ class Rasteroverview():
     """
     # Default values for class attributes
     DATASERVICE_TYPE           = 'hbase'
-    OVERVIEWSTORE_DIRECTORY    = '/data/raster/overviews/'
-    TMP_DIRECTORY              = '/data/raster/tmp'
+    OVERVIEWSTORE_DIRECTORY    = 'data/raster/overviews/'
+    TMP_DIRECTORY              = 'data/raster/tmp'
     DELTA_PIXEL_OVERVIEW       = 5
     MAX_QUERY_PIXELS           = 5e8
     DT_COL                     = 'time' #'timestamp'
