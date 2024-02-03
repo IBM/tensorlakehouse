@@ -21,7 +21,7 @@ import uuid
 import pystac_client
 
 def stac_search_available(
-    STAC_URL,
+    stac_url,
     collection_id,
     search_aoi,
     year = None,
@@ -92,7 +92,7 @@ def stac_search_available(
         print('search_aoi', search_aoi)
         
     # pystac_client search
-    stac = pystac_client.Client.open(STAC_URL)
+    stac = pystac_client.Client.open(stac_url)
     stac_search_result = stac.search(
         limit = LIMIT,
         collections = [collection_id],
@@ -460,7 +460,7 @@ def upload_hsi_cos(
 
 
 def register_hsi_collection_stac(
-    STAC_URL,
+    stac_url,
     hsi_collection_id,
     bbox,
     dt_start,
@@ -471,7 +471,7 @@ def register_hsi_collection_stac(
 ):
     ISO_8601 = '%Y-%m-%dT%H:%M:%SZ'
     # # Debug
-    # stac = pystac_client.Client.open(STAC_URL)
+    # stac = pystac_client.Client.open(stac_url)
     # stac_collections = list(stac.get_all_collections())
     # collection = stac_collections[[c.id for c in stac_collections].index(hsi_collection_id)]
 
@@ -519,6 +519,7 @@ def register_hsi_items_stac(
     json_folder,
     dataservice_type,
     load_hsi_stac_filepath, #'/path/to/shellscript/load_hsi_stac.sh',
+    stac_url,
     **kwargs,
 ):
     """
@@ -526,6 +527,7 @@ def register_hsi_items_stac(
     If dataservice_type=='remote_filesystem' please provide
     remote_fs, access_key_id, secret_access_key, and endpoint_url in the kwargs.
     """
+    CERTIFICATE = "ca.cert.txt"
     if dataservice_type=='remote_filesystem':
         remote_fs = kwargs.get('remote_fs')
         access_key_id = kwargs.get('access_key_id')
@@ -543,10 +545,10 @@ def register_hsi_items_stac(
         storage_urls = glob(os.path.join(hsi_directory, '*/*/*/*.parquet'))
     elif dataservice_type=='remote_filesystem':
         # Using s3fs to access
-        storage_urls = remote_fs.glob(os.path.join(hsi_directory, '**/*.parquet'))
+        storage_urls = remote_fs.glob(os.path.join(hsi_directory, '**/*.parquet').replace('\\', '/'))
         if len(storage_urls)==0:
             # Maybe there are zero subdirectories to glob
-            storage_urls = remote_fs.glob(os.path.join(hsi_directory, '*.parquet'))
+            storage_urls = remote_fs.glob(os.path.join(hsi_directory, '*.parquet').replace('\\', '/'))
 
     print('storage_urls', len(storage_urls))
     #print(*storage_urls, sep='\n')
@@ -567,16 +569,15 @@ def register_hsi_items_stac(
             try:
                 # If available and installed properly, dask_geopandas can read the metadata faster
                 gdf1 = dask_geopandas.read_parquet(storage_url_part)
+                # Spatial extent in native coordinates based on partition (fast):
+                poly_native = gdf1.spatial_partitions.unary_union
+                gdf1 = gdf1.set_crs(crs).compute()
             except:
                 # Read with geopandas
                 gdf1 = geopandas.read_parquet(storage_url_part)
                 # Spatial extent in native coordinates based on overview cells (slow)
                 poly_native = gdf1.buffer(grid.epsilon).unary_union
                 gdf1 = gdf1.set_crs(crs)
-            else:
-                # Spatial extent in native coordinates based on partition (fast):
-                poly_native = gdf1.spatial_partitions.unary_union
-                gdf1 = gdf1.set_crs(crs).compute()
                 
         elif dataservice_type=='remote_filesystem':
             href = 's3://' + storage_url_part
@@ -590,6 +591,9 @@ def register_hsi_items_stac(
                         'client_kwargs' : {'endpoint_url': endpoint_url},
                     },
                 )
+                # Spatial extent in native coordinates based on partition (fast):
+                poly_native = gdf1.spatial_partitions.unary_union
+                gdf1 = gdf1.set_crs(crs).compute()
             except:
                 # Read with geopandas
                 gdf1 = geopandas.read_parquet(
@@ -603,10 +607,6 @@ def register_hsi_items_stac(
                 # Spatial extent in native coordinates based on overview cells (slow)
                 poly_native = gdf1.buffer(grid.epsilon).unary_union
                 gdf1 = gdf1.set_crs(crs)
-            else:
-                # Spatial extent in native coordinates based on partition (fast):
-                poly_native = gdf1.spatial_partitions.unary_union
-                gdf1 = gdf1.set_crs(crs).compute()
         
         poly_wgs84 = geopandas.GeoDataFrame([
             {'geometry': poly_native}
@@ -775,8 +775,13 @@ def register_hsi_items_stac(
     # See what json files are there
     # glob(os.path.join(json_folder, '*.json'))
     
+    # Debug: catch the case where the collection_id contains space characters
+    arg_collection_id = hsi_collection_id.replace(" ", "%20")
+    
     # Upload using shellscript
-    os.system(f'{load_hsi_stac_filepath} >/dev/null 2>&1')
+    #os.system(f'{load_hsi_stac_filepath} >/dev/null 2>&1')
+    #print(os.system(f'{load_hsi_stac_filepath}'))
+    os.system(f'{load_hsi_stac_filepath} --collection_id={arg_collection_id} --json_folder={json_folder} --stac_url={stac_url} --CERTIFICATE={CERTIFICATE}')
     
     return
 
