@@ -347,7 +347,31 @@ class Vectorstore():
             )].reset_index(drop=True)
         
         return
-        
+
+
+    def _index(self):
+        """Create dictionaries containing entire bfs quadtrees (indexed by level) for every geometry id."""
+
+        if self.max_depth>0:
+            # List of q_keys by level and geometry ID
+            self.df_idx = self.gdf_concat[[self.id_col, 'level', 'q_key']].groupby(
+                [self.id_col, 'level']
+            )['q_key'].apply(list).reset_index(level=0)
+            # Dictionaries containing entire bfs quadtrees (indexed by level) for every geometry id
+            self.df_idx = self.df_idx.groupby(
+                self.id_col
+            ).apply(lambda x: x['q_key'].to_dict()).rename('qtree').reset_index()
+            self.df_idx = pandas.merge(
+                self.gdf_head.rename(columns={'q_key': 'head'}),
+                self.df_idx,
+                on=self.id_col,
+            )
+        else:
+            self.df_idx = self.gdf_head.rename(columns={'q_key': 'head'})
+            self.df_idx['qtree'] = None
+            # self.df_idx['level'] = self.df_idx['q_key'].apply(lambda x: len(x)-2)
+            # self.df_idx['qtree'] = self.df_idx[['level', 'q_key']].apply(lambda row: {row[0]: [row[1]]}, axis=1)
+
 
     def ingest_geodataframe(self, gdf):
         """Calculate the head, qtree index, and target keys for each geometry.
@@ -440,8 +464,63 @@ class Vectorstore():
             print('Time for finalizing gdf_target (D) in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
+        self._index()
+        
+        if self.verbose:
+            print('Time for creating gdf_idx (E) in seconds', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
+
+        assert set(self.gdf_concat[self.id_col])==set(gdf[self.id_col])
 
 
+    def create_partitions(self, target_rows=100000):
+        """Partition the table.
+
+        Create spatial partitions of roughly equal size.
+        :param target_rows:  Approximate number of rows per parquet file.
+        """
+
+        self.target_rows = target_rows
+        self.gdf_partition = pandas.DataFrame()
+        df_count = self.df_idx.groupby('head')[self.id_col].count().rename('head_count').reset_index()
+        # Initialize partition key with head
+        df_count['partition'] = df_count['head']
+        df_count['count'] = df_count['head_count']
+        
+        # Breadth First Search starting at highest resolution level
+        df_count['level'] = df_count['partition'].apply(lambda x: len(x)-2)
+        level = df_count['level'].max()
+        n_rows = self.target_rows/2
+        while level>=0:
+            
+            # Check if any of the counts at specific level have reached target_rows
+            df_level = df_count[df_count['level']==level]
+            df_count = df_count[df_count['level']!=level]
+            
+            # Separate the keys with number of rows above target_rows
+            if level==0:
+                n_rows = 0
+            self.gdf_partition = pandas.concat([
+                self.gdf_partition,
+                df_level[df_level['count']>=n_rows].reset_index(drop=True),
+            ])
+            df_level = df_level[df_level['count']<n_rows].reset_index(drop=True)
+            
+            # Get the parent keys and decrease the level for the next iteration
+            df_level['partition'] = df_level['partition'].apply(lambda x: x[:-1])
+            level-=1
+            df_level['level'] = level
+            
+            df_count = pandas.concat([df_count, df_level])
+            df_count['count'] = df_count.groupby('partition')['head_count'].transform('sum')
+            
+        assert len(df_count)==0
+
+        if self.verbose:
+            print('Number of partitions suggested', len(self.gdf_partition['partition'].drop_duplicates()))
+
+        self.gdf_partition['geometry'] = self.gdf_partition['partition'].apply(lambda x: self.morton.base4_to_box(x))
+        self.gdf_partition = geopandas.GeoDataFrame(self.gdf_partition)
 
     
     # @staticmethod
