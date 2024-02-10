@@ -5,6 +5,7 @@
         Vectorstore    Generating vector store.
 """
 import os
+os.environ['USE_PYGEOS'] = '0'
 import warnings
 from glob import glob
 import time
@@ -24,8 +25,6 @@ import nestedgrid
 import mortoncurve
 import qtree
 
-os.environ['USE_PYGEOS'] = '0'
-
 class Vectorstore():
     """Generates quadtree-based indices for Vector data and persist them in parquet files.
     
@@ -34,9 +33,7 @@ class Vectorstore():
     Attributes:
 
         vectorstore_directory   Base directory where the vectorstore is persisted.
-        vectorstore_directory   Base directory where the vectorstore is persisted.
-        vectorstore_directory   Base directory where the vectorstore is persisted.
-        vectorstore_directory   Base directory where the vectorstore is persisted.
+        dimension_values        Dictionary of valid dimension values indexed by dimension_names.
         
     Methods
 
@@ -107,6 +104,7 @@ class Vectorstore():
         dataset,
         vectorstore_directory = None,
         valid_range = None,
+        dimension_values = {},
         dt_col = None,
         geom_col = None, 
         id_col = None,
@@ -142,14 +140,24 @@ class Vectorstore():
 
         # Dataset name
         self.dataset                      = dataset
+
+        # Dataset dimensions other than space and time
+        self.dimension_values = dimension_values
         
         # Vectorstore base directory
         self.vectorstore_directory        = self.VECTORSTORE_DIRECTORY if vectorstore_directory is None else vectorstore_directory
         
         # Dataset directory is subfolder in vectorstore_directory 
-        self.dataset_directory            = os.path.join(self.vectorstore_directory, self.dataset)
+        self.dataset_directory            = os.path.join(self.vectorstore_directory, self.dataset).replace('\\', '/')
         if not os.path.exists(self.dataset_directory): os.makedirs(self.dataset_directory)
- 
+
+        # Parquet directory is subfolder in dataset_directory 
+        self.parquet_directory            = os.path.join(
+            self.dataset_directory, 
+            'grid=' + self.morton.grid.__repr__()
+        ).replace('\\', '/')
+        if not os.path.exists(self.parquet_directory): os.makedirs(self.parquet_directory)
+
         # Policy how to deal with polygons that intersect spatial cells ("cut", "original", "both")
         self.intersection_policy = self.INTERSECTION_POLICY if intersection_policy is None else intersection_policy
         assert(self.intersection_policy in ['cut', 'original', 'both'])
@@ -171,6 +179,9 @@ class Vectorstore():
 
         # Opportunity to limit the valid range here
         self.valid_range = self.morton.valid_range if valid_range is None else valid_range
+
+        # List of the timestamp hierarchy levels ('year', 'month', ...)
+        self.temporal_levels = []
 
         self.verbose = verbose
 
@@ -467,7 +478,7 @@ class Vectorstore():
         self._index()
         
         if self.verbose:
-            print('Time for creating gdf_idx (E) in seconds', round(time.time()-stopwatch_start, 3))
+            print('Time for creating df_idx (E) in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
         assert set(self.gdf_concat[self.id_col])==set(gdf[self.id_col])
@@ -497,9 +508,21 @@ class Vectorstore():
             df_level = df_count[df_count['level']==level]
             df_count = df_count[df_count['level']!=level]
             
-            # Separate the keys with number of rows above target_rows
             if level==0:
+                # Reached the coarsest level
                 n_rows = 0
+                # Try to assign these records to the finest possible partition
+                min_len = df_level['head'].apply(len).min()-2
+                for l in numpy.arange(0, min_len):
+                    #potential partition level
+                    p = df_level.loc[0, 'head'][:l+2]
+                    if not df_level['head'].apply(lambda x: x.startswith(p)).all():
+                        # mixed keys at this level, so stop and go back to previous level
+                        l-=1
+                        break
+                df_level['partition'] = df_level.loc[0, 'head'][:l+2]
+ 
+            # Separate the keys with number of rows above target_rows
             self.gdf_partition = pandas.concat([
                 self.gdf_partition,
                 df_level[df_level['count']>=n_rows].reset_index(drop=True),
@@ -522,89 +545,109 @@ class Vectorstore():
         self.gdf_partition['geometry'] = self.gdf_partition['partition'].apply(lambda x: self.morton.base4_to_box(x))
         self.gdf_partition = geopandas.GeoDataFrame(self.gdf_partition)
 
+        # Add the partition column to df_idx
+        try:
+            del self.df_idx['partition']
+        except:
+            pass
+        self.df_idx = pandas.merge(
+            self.df_idx,
+            self.gdf_partition[['head', 'partition']],
+            on='head',
+        )
+
     
-    # @staticmethod
-    # def polygons2geodataframe(lst_polygons, geom_col, crs=4326):
-    #     gdf_poly = pandas.DataFrame(lst_polygons)
-    #     gdf_poly.columns=[geom_col]
-    #     gdf_poly = geopandas.GeoDataFrame(gdf_poly, geometry=geom_col)
-    #     gdf_poly = gdf_poly.set_crs(epsg=crs)
-    #     return gdf_poly
+    def _filepath(self, temporal_partition, spatial_partition, create_path=True):
+        """Composing the filepath from metadata."""
+        filepath = self.parquet_directory
+        for temporal_level in self.temporal_levels:
+            filepath = os.path.join(
+                filepath,
+                temporal_level+'='+str(temporal_partition[temporal_level])
+            ).replace('\\', '/')
+        # Note, currently not building any sub-directories associated with spatial levels
+        if create_path and not os.path.exists(filepath): os.makedirs(filepath)
+
+        filename = spatial_partition + '.parquet'
+        return os.path.join(filepath, filename).replace('\\', '/')
+
     
-    # @staticmethod
-    # def quadtree(poly, level):
-    #      # Get the quadtree cells
-    #     qt = qtree.QTree(poly, level) # initialize
-    #     polyCells = qt.gridded() # build the quadtree (depth first search)
-    #     return polyCells
+    def _decode_filepath(self, filepath):
+        dirname, filename = os.path.split(filepath)
+        spatial_partition = os.path.splitext(filename)[0]
+        
+        temporal_partition = {}
+        while True:
+            # Continue splitting
+            dirname, tail = os.path.split(dirname)
+            try:
+                key, value = tail.split('=')
+            except ValueError:
+                break
+            if key in self.temporal_levels:
+                # Found another temporal partition
+                temporal_partition[key] = value
+            elif key=='grid':
+                assert value==self.morton.grid.__repr__()
+            else:
+                raise ValueError("Non-compliant filepath." )
+
+        # Now we should arrive at the dataset directory
+        assert tail==self.dataset
+
+        # Finally we should be left with the vectorstore_directory
+        assert dirname.rstrip('/')==self.vectorstore_directory.rstrip('/')
+
+        return temporal_partition, spatial_partition
+
     
-    # def quadtree2(self, poly):
-    #     """
-    #     version of quadtree that works better for complicated polygons
-    #     """
-    #     # Get all the cells within the total bounds
-    #     bounds_cells = self.quadtree(shapely.box(*poly.bounds), self.spatial_level)
-    #     gdf_bounds_cells = self._polyCells2geodataframe(bounds_cells)
-    #     # Filter the cells that overlap the polygon
-    #     mask = gdf_bounds_cells.intersects(poly)
-    #     df_masked = gdf_bounds_cells[mask].reset_index(drop=True)
-    #     polyCells = df_masked['spatial_key'].to_list()
-    #     return polyCells
+    def _select_partition(self, temporal_partition, spatial_partition):
+        gdf_part = pandas.merge(
+            self.gdf,
+            self.df_idx[self.df_idx['partition']==spatial_partition][[self.id_col, 'head']],
+            on=self.id_col,
+        ).rename(columns={'head': 'q_key'})
+        return gdf_part
 
-    # def _quadtreeGDF(self, poly):
-    #     """
-    #     version of quadtree that works better for sparse polygons and returns a GeoDataFrame
-    #     """
-    #     # Get all the cells within the total bounds
-    #     polyCells = self.quadtree(poly, self.spatial_level)
-    #     gdf_cells = self._polyCells2geodataframe(polyCells)
-    #     return gdf_cells
-
-    # def _quadtreeGDF2(self, poly):
-    #     """
-    #     version of quadtree that works better for complicated polygons and returns a GeoDataFrame
-    #     """
-    #     # Get all the cells within the total bounds
-    #     bounds_cells = self.quadtree(shapely.box(*poly.bounds), self.spatial_level)
-    #     gdf_bounds_cells = self._polyCells2geodataframe(bounds_cells)
-    #     # Filter the cells that overlap the polygon
-    #     mask = gdf_bounds_cells.intersects(poly)
-    #     gdf_masked = gdf_bounds_cells[mask].reset_index(drop=True)
-    #     #polyCells = gdf_masked[self.spatial_key_col].to_list()
-    #     return gdf_masked
-
-    # def _quadtree2geodataframe(self, quadtree):
-    #     poly_squares=[]
-    #     for square in quadtree:
-    #         west, south = self.morton.coordinates(square[1], square[0])
-    #         res_x, res_y = self.morton.resolution(square[0])
-    #         north = south + res_y
-    #         east = west + res_x
-    #         poly_squares.append(shapely.geometry.box(west, south, east, north))
-
-    #     df_squares = pandas.DataFrame(poly_squares)
-    #     df_squares.columns=[self.geom_col]
-    #     df_squares = pandas.concat([
-    #         pandas.DataFrame(quadtree).rename(columns={0: self.spatial_level_col, 1:self.spatial_key_col}), 
-    #         df_squares
-    #     ], axis=1)
-    #     gdf_squares = geopandas.GeoDataFrame(df_squares, geometry=self.geom_col).set_crs(epsg=4326)
-    #     return gdf_squares
     
-    # def _polyCells2geodataframe(self, cells):
-    #     poly_cells=[]
-    #     res_x, res_y = self.morton.resolution(self.spatial_level)
-    #     for cell in cells:
-    #         west, south = self.morton.coordinates(cell, self.spatial_level)
-    #         north = south + res_y
-    #         east = west + res_x
-    #         poly_cells.append(shapely.geometry.box(west, south, east, north))
+    def _to_parquet(self, temporal_partition, spatial_partition, append=False):
+        """Write GeoDataFrame partition to parquet."""
+        gdf_part = self._select_partition(temporal_partition, spatial_partition)
+        filepath = self._filepath(temporal_partition, spatial_partition)
+        if append:
+            try:
+                # See if there is something already present
+                gdf_existing = geopandas.read_parquet(filepath)
+            except IOError:
+                pass
+            else:
+                # Merge by concatenating and dropping duplicates (keeping the newer version)
+                gdf_part = pandas.concat([gdf_existing, gdf_part]).drop_duplicates(
+                    subset=[self.dt_col, self.key_col]+['dimension_' + d for d in self.dimension_values],
+                    keep='last',
+                )
+                
+        if len(gdf_part)>0:
+            # Sorting so that these columns are used as indices in parquet file
+            gdf_part = gdf_part.sort_values(
+                by=[self.dt_col]+['dimension_' + d for d in self.dimension_values]+[self.key_col]
+            ).reset_index(drop=True)
 
-    #     gdf_cells = pandas.DataFrame(cells).rename(columns={0: self.spatial_key_col})
-    #     gdf_cells[self.spatial_level_col] = self.spatial_level
-    #     gdf_cells[self.geom_col] = poly_cells
-    #     gdf_cells = geopandas.GeoDataFrame(gdf_cells, geometry=self.geom_col).set_crs(epsg=4326)
-    #     return gdf_cells
+            gdf_part.to_parquet(
+                path=filepath,
+                row_group_size=100000,
+                engine='pyarrow',
+                compression='snappy',
+                #partition_cols=self.partition_cols
+            )
+
+
+    def to_parquet(self, append=False):
+        for spatial_partition in sorted(set(self.gdf_partition['partition'])):
+            # To do: loop through temporal partitions (and other dimensions that we choose to make into partitions.
+            temporal_partition = {} 
+            self._to_parquet(temporal_partition, spatial_partition)
+
     
     # def _spatialPartitionLevel(self, sp):
     #     return int(sp.split(self.spatial_partition_identifier)[-1])
@@ -775,106 +818,8 @@ class Vectorstore():
     #         verbose=verbose,
     #     )
     #     return gdf
-    
-    def ingest_geodataframe_old(self, gdf, gdf_dissolved=None, epsilon=None, verbose=False):
-        """
-        Load and transform GeoDataFrame into a spatially indexed GeoDataFrame, aligned with GeoDN raster data.
-        """
-        if verbose:
-            stopwatch_start = time.time()
-        self.gdf = gdf
-        assert(self.dt_col in self.gdf.columns)
-        assert(self.geom_col in self.gdf.columns)
-        assert(self.id_col in self.gdf.columns)
-        
-        # (A) CREATE COLUMNS FOR THE TEMPORAL KEYS USING ATTRIBUTES SUCH AS year, month, day
-        for k in self.temporal_keys:
-            self.gdf[k] = self.gdf[self.dt_col].apply(lambda x: getattr(x, k))
-        if verbose:
-            print('Time for (A) in seconds', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-            
-        # (B) CREATE A "spatial_key" COLUMN, ALIGNED WITH THE GEOLAB GRID
-        # (B1) GET THE GEOLAB GRID FOR THE AREA OF INTEREST
-        # Calculate dissolved aoi in order to create the quadtree keys
-        if gdf_dissolved is None:
-            self.gdf_dissolved = self.gdf[[self.id_col, self.geom_col]].drop_duplicates(
-                subset=self.id_col)[[self.geom_col]].dissolve()
-        else:
-            self.gdf_dissolved = gdf_dissolved
-        
-        # Get Geodataframe of geolab cells (all on the same spatial_level resolution)
-        #bounds_area = shapely.box(*self.gdf_dissolved.loc[0, 'geometry'].bounds).area
-        #geom_area = self.gdf_dissolved.loc[0, 'geometry'].area
-        #if geom_area<bounds_area/10:
-        if (not hasattr(self.gdf_dissolved.loc[0, self.geom_col], 'geoms')) or (len(self.gdf_dissolved.loc[0, self.geom_col].geoms)<1000):
-            # Use sparse version of quadtree
-            self.gdf_dissolved_cells = self._quadtreeGDF(self.gdf_dissolved.loc[0, self.geom_col])
-        else:
-            # Use simplified version of quadtree
-            self.gdf_dissolved_cells = self._quadtreeGDF2(self.gdf_dissolved.loc[0, self.geom_col])
-        
-        # Rounding errors can lead to duplication of geometries with edges along cell boundaries
-        if epsilon is not None:
-            # Negative buffer by something like epsilon=1e-13
-            self.gdf_dissolved_cells[self.geom_col] = self.gdf_dissolved_cells[self.geom_col].buffer(-epsilon)
-        
-        if verbose:
-            print('gdf_dissolved_cells', len(self.gdf_dissolved_cells))
-            print('Time for (B1) in seconds', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-        
-        # (B2) JOIN ORIGINAL GEODATAFRAME TO GET THE SPATIAL KEY  
-        # Joining original GeoDataFram with spatial cells may result in multiple copies of a row. 
-        # intersection_policy specifies how to deal with the geometry in such cases
-
-        # Drop duplicate geometries before calculating spatial overlays (e.g. when we have multiple timestamps for the same geometry) 
-        self.gdf_unique = self.gdf[[self.id_col, self.geom_col]].drop_duplicates(subset=self.id_col).reset_index(drop=True)
-        if verbose:
-            print('len(gdf_unique)    ', len(self.gdf_unique))
-
-        if self.intersection_policy=='cut':
-            # Use geopandas.overlay (intersection) to cut the polygons at their intersection
-            self.gdf_intersection = geopandas.overlay(self.gdf_unique ,self.gdf_dissolved_cells , how='intersection')
-        elif self.intersection_policy=='original':
-            # Use geopandas.sjoin (spatial join) to keep geometries intact
-            self.gdf_intersection = geopandas.sjoin(self.gdf_unique, self.gdf_dissolved_cells, how='left', predicate='intersects').dropna(
-                subset=['index_right']).drop(columns=['index_right'])
-        elif self.intersection_policy=='both':
-            # Cut the intersecting polygons but keep originals in another column: 'geometry_original'
-            self.gdf_intersection = pandas.merge(
-                geopandas.overlay(self.gdf_unique ,self.gdf_dissolved_cells , how='intersection'), 
-                self.gdf_unique.rename(columns={self.geom_col: self.geom_col + '_original'}), 
-                on=self.id_col
-            )
-        
-        if verbose:
-            print('Time for (B2) in seconds', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-            
-        # (C1) KEEP TRACK OF THE POLYGONS THAT INTERSECT THE SPATIAL CELLS
-        self.gdf_intersection[self.intersection_flag_col] = False
-        self.gdf_intersection.loc[self.gdf_intersection[self.id_col].duplicated(keep=False), self.intersection_flag_col] = True
-        
-        # (C2) JOIN IN THE MANY COLUMNS WE DROPPED WHEN FORMING "self.gdf_unique".
-        del self.gdf[self.geom_col]
-        self.gdf_intersection = pandas.merge(self.gdf_intersection, self.gdf, on=self.id_col)
-                
-        # (C3) COMBINE THE TEMPORAL AND SPATIAL KEYS INTO ONE "composite_key".
-        self.gdf_intersection[self.composite_key_col] = self._generate_composite_keys(self.gdf_intersection)
-        
-        # (C4) CREATE COLUMNS FOR SPATIAL PARTITIONING
-        self._create_spatial_partition_columns(self.gdf_intersection)
-        if verbose:
-            print('Time for (C) in seconds', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-        
-        # (D) CREATE FILTER-KEY COLUMNS WITH KEYS FULLY CONTAINING THE GEOMETRY BOUNDING BOX AT VARIOUS RESOLUTION LEVELS
-        self.gdf_intersection = self._create_filter_key_columns(self.gdf_intersection, epsilon=epsilon)
-        if verbose:
-            print('Time for (D) in seconds', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-        
+    #
+    #    
     # def to_parquet(
     #     self, 
     #     append=False, 
