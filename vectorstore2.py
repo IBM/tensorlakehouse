@@ -643,10 +643,11 @@ class Vectorstore():
 
 
     def to_parquet(self, append=False):
+        """Write entire GeoDataFrame (all partitions) to parquet."""
         for spatial_partition in sorted(set(self.gdf_partition['partition'])):
             # To do: loop through temporal partitions (and other dimensions that we choose to make into partitions.
             temporal_partition = {} 
-            self._to_parquet(temporal_partition, spatial_partition)
+            self._to_parquet(temporal_partition, spatial_partition, append=append)
 
     
     # def _spatialPartitionLevel(self, sp):
