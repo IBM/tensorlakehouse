@@ -19,7 +19,7 @@ import shapely
 from functools import partial
 import json
 from multiprocessing import Pool
-from pathos.pools import ProcessPool
+#from pathos.pools import ProcessPool
 
 import nestedgrid
 import mortoncurve
@@ -45,7 +45,7 @@ class Vectorstore():
     """
 
     # Default values for class attributes
-    VECTORSTORE_DIRECTORY      = 'data/vector/vectorstore/'
+    VECTORSTORE_DIRECTORY      = 'data/vectorstore/'
 
     # GeoDataFrame colum conventions (used when loading data from gdf or vectorstore)
     DT_COL                     = 'time'
@@ -57,11 +57,12 @@ class Vectorstore():
     GEOM_AREA_COL              = 'geom_area'
     GEOM_LENGTH_COL            = 'geom_length'
 
-    # Maximum resolution level for qtree head
-    MAX_LEVEL                  = 16
-    # Target level for qtree (only reached when max_depth allows it)
+    # Target level for qtree (only reached when max_depth allows it).
     TARGET_LEVEL               = 8
-    # Maximum depth of qtree index, measured from "head" level
+    # Maximum depth of qtree index, measured from the "head" level.
+    # Set to target_level to ensure the generation of a "complete" qtree index for every geometry.
+    # Set to 0 in order to skip generation of q_tree index (we will be relying on "head" node only).
+    # Set to value in between 0 and target_level to limit the size of the q_tree index.
     MAX_DEPTH                  = 5
 
     # Policy how to deal with polygons that intersect spatial cells ("cut", "original", "both")
@@ -173,7 +174,7 @@ class Vectorstore():
         self.key_col = self.KEY_COL if key_col is None else key_col
         self.idx_geom_col = self.IDX_GEOM_COL if idx_geom_col is None else idx_geom_col
 
-        self.max_level = self.MAX_LEVEL if max_level is None else max_level
+        self.max_level = self.morton.grid.max_levels if max_level is None else max_level
         self.target_level = self.TARGET_LEVEL if target_level is None else target_level
         self.max_depth = self.MAX_DEPTH if max_depth is None else max_depth
 
@@ -286,7 +287,7 @@ class Vectorstore():
     
         # Generate 4 child columns representing the 4 quadrants we need to check for intersections
         self.df_children = pandas.DataFrame(
-            self.gdf_tree['q_key'].apply(lambda x: self._children(x)).to_list(),
+            self.gdf_tree[self.key_col].apply(lambda x: self._children(x)).to_list(),
             columns=self.CHILDREN
         )
         
@@ -308,14 +309,14 @@ class Vectorstore():
         
         # # Stack the child q_keys
         # self.df_children = pandas.concat([self.gdf_tree[self.id_col], self.df_children[children]], axis=1)
-        # self.df_children = self.df_children.set_index(self.id_col).stack().reset_index(level=1, drop=True).rename('q_key').reset_index()
+        # self.df_children = self.df_children.set_index(self.id_col).stack().reset_index(level=1, drop=True).rename(self.key_col).reset_index()
         
         # Stack the child q_keys and bounding geometries
         df1 = pandas.concat([self.gdf_tree[self.id_col], self.df_children], axis=1)
         self.df_children = pandas.DataFrame()
         for child in self.CHILDREN:
             df2 = df1[[self.id_col, child, child+'_bounds']].dropna().rename(columns={
-                child: 'q_key',
+                child: self.key_col,
                 child+'_bounds': 'idx_bounds',
             })
             self.df_children = pandas.concat([self.df_children, df2])
@@ -327,21 +328,21 @@ class Vectorstore():
         # Remember the keys that have reached the target level
         self.gdf_target = pandas.concat([
             self.gdf_target,
-            self.df_children[self.df_children['q_key'].apply(len)>=self.target_level+2].reset_index(drop=True)[self.gdf_target.columns],
+            self.df_children[self.df_children[self.key_col].apply(len)>=self.target_level+2].reset_index(drop=True)[self.gdf_target.columns],
         ]).reset_index(drop=True)
     
         if final_iteration:
             # Everything remaining needs to be assigned to gdf_target
             self.gdf_target = pandas.concat([
                 self.gdf_target,
-                self.df_children[self.df_children['q_key'].apply(len)<self.target_level+2].reset_index(drop=True),
+                self.df_children[self.df_children[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True),
             ]).reset_index(drop=True)[self.gdf_target.columns]
             self.gdf_tree = geopandas.GeoDataFrame()
         else:
             # Update the keys we need to work on in the next iteration
             self.gdf_tree = pandas.merge(
                 self.gdf_tree[[self.id_col, 'geometry']].drop_duplicates(),
-                self.df_children[self.df_children['q_key'].apply(len)<self.target_level+2].reset_index(drop=True),
+                self.df_children[self.df_children[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True),
                 on=self.id_col,
             )
     
@@ -365,23 +366,23 @@ class Vectorstore():
 
         if self.max_depth>0:
             # List of q_keys by level and geometry ID
-            self.df_idx = self.gdf_concat[[self.id_col, 'level', 'q_key']].groupby(
+            self.df_idx = self.gdf_concat[[self.id_col, 'level', self.key_col]].groupby(
                 [self.id_col, 'level']
-            )['q_key'].apply(list).reset_index(level=0)
+            )[self.key_col].apply(list).reset_index(level=0)
             # Dictionaries containing entire bfs quadtrees (indexed by level) for every geometry id
             self.df_idx = self.df_idx.groupby(
                 self.id_col
-            ).apply(lambda x: x['q_key'].to_dict()).rename('qtree').reset_index()
+            ).apply(lambda x: x[self.key_col].to_dict()).rename('qtree').reset_index()
             self.df_idx = pandas.merge(
-                self.gdf_head.rename(columns={'q_key': 'head'}),
+                self.gdf_head.rename(columns={self.key_col: 'head'}),
                 self.df_idx,
                 on=self.id_col,
             )
         else:
-            self.df_idx = self.gdf_head.rename(columns={'q_key': 'head'})
+            self.df_idx = self.gdf_head.rename(columns={self.key_col: 'head'})
             self.df_idx['qtree'] = None
-            # self.df_idx['level'] = self.df_idx['q_key'].apply(lambda x: len(x)-2)
-            # self.df_idx['qtree'] = self.df_idx[['level', 'q_key']].apply(lambda row: {row[0]: [row[1]]}, axis=1)
+            # self.df_idx['level'] = self.df_idx[self.key_col].apply(lambda x: len(x)-2)
+            # self.df_idx['qtree'] = self.df_idx[['level', self.key_col]].apply(lambda row: {row[0]: [row[1]]}, axis=1)
 
 
     def ingest_geodataframe(self, gdf):
@@ -419,18 +420,18 @@ class Vectorstore():
             stopwatch_start = time.time()
 
         # Remember all head geometries
-        self.gdf_head = self.gdf_unique[[self.id_col, 'q_key']]
+        self.gdf_head = self.gdf_unique[[self.id_col, self.key_col]]
         print('gdf_head  ', len(self.gdf_head))
         
         # Concat builds upon the head geometries
         self.gdf_concat = self.gdf_head.copy()
         
         # Remember the geometries that have already reached the target level
-        self.gdf_target = self.gdf_unique[self.gdf_unique['q_key'].apply(len)>=self.target_level+2].reset_index(drop=True)[[self.id_col, 'q_key']]
+        self.gdf_target = self.gdf_unique[self.gdf_unique[self.key_col].apply(len)>=self.target_level+2].reset_index(drop=True)[[self.id_col, self.key_col]]
         print('gdf_target', len(self.gdf_target))
         
         # Determine the geometries for which we have to build an entire quadtree, rather than just the head node.
-        self.gdf_tree = self.gdf_unique[self.gdf_unique['q_key'].apply(len)<self.target_level+2].reset_index(drop=True)
+        self.gdf_tree = self.gdf_unique[self.gdf_unique[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True)
         print('gdf_tree  ', len(self.gdf_tree))
         
         depth = 0
@@ -450,12 +451,12 @@ class Vectorstore():
             stopwatch_start = time.time()
 
         # Finalize the quadtree index
-        self.gdf_concat['level'] = self.gdf_concat['q_key'].apply(lambda x: len(x)-2)
-        df_unique = self.gdf_concat[['q_key']].drop_duplicates(subset='q_key').reset_index(drop=True)
-        df_unique['geometry'] = self.morton.base4_to_box(df_unique['q_key'])
-        self.gdf_concat = pandas.merge(self.gdf_concat, df_unique, on='q_key')
+        self.gdf_concat['level'] = self.gdf_concat[self.key_col].apply(lambda x: len(x)-2)
+        df_unique = self.gdf_concat[[self.key_col]].drop_duplicates(subset=self.key_col).reset_index(drop=True)
+        df_unique['geometry'] = self.morton.base4_to_box(df_unique[self.key_col])
+        self.gdf_concat = pandas.merge(self.gdf_concat, df_unique, on=self.key_col)
         self.gdf_concat = geopandas.GeoDataFrame(self.gdf_concat)
-        self.gdf_concat = self.gdf_concat.sort_values(by=['q_key', 'level', self.id_col]).reset_index(drop=True)
+        self.gdf_concat = self.gdf_concat.sort_values(by=[self.key_col, 'level', self.id_col]).reset_index(drop=True)
         self.gdf_concat
 
         if self.verbose:
@@ -463,12 +464,12 @@ class Vectorstore():
             stopwatch_start = time.time()
 
         # Finalize the target cells
-        self.gdf_target['level'] = self.gdf_target['q_key'].apply(lambda x: len(x)-2)
-        df_unique = self.gdf_target[['q_key']].drop_duplicates(subset='q_key').reset_index(drop=True)
-        df_unique['geometry'] = self.morton.base4_to_box(df_unique['q_key'])
-        self.gdf_target = pandas.merge(self.gdf_target, df_unique, on='q_key')
+        self.gdf_target['level'] = self.gdf_target[self.key_col].apply(lambda x: len(x)-2)
+        df_unique = self.gdf_target[[self.key_col]].drop_duplicates(subset=self.key_col).reset_index(drop=True)
+        df_unique['geometry'] = self.morton.base4_to_box(df_unique[self.key_col])
+        self.gdf_target = pandas.merge(self.gdf_target, df_unique, on=self.key_col)
         self.gdf_target = geopandas.GeoDataFrame(self.gdf_target)
-        self.gdf_target = self.gdf_target.sort_values(by=['q_key', 'level', self.id_col]).reset_index(drop=True)
+        self.gdf_target = self.gdf_target.sort_values(by=[self.key_col, 'level', self.id_col]).reset_index(drop=True)
         self.gdf_target
 
         if self.verbose:
@@ -494,48 +495,70 @@ class Vectorstore():
         self.target_rows = target_rows
         self.gdf_partition = pandas.DataFrame()
         df_count = self.df_idx.groupby('head')[self.id_col].count().rename('head_count').reset_index()
-        # Initialize partition key with head
-        df_count['partition'] = df_count['head']
-        df_count['count'] = df_count['head_count']
         
+        # Initialize partition key with head at target_level+1 so maximum partition becomes target_level
+        #df_count['partition'] = df_count['head']
+        df_count['partition'] = df_count['head'].apply(lambda x: x[:self.target_level+1+2])
+
+        df_count['count'] = df_count['head_count']
+
         # Breadth First Search starting at highest resolution level
         df_count['level'] = df_count['partition'].apply(lambda x: len(x)-2)
         level = df_count['level'].max()
         n_rows = self.target_rows/2
-        while level>=0:
-            
+        while level>=0 and len(df_count)>0:
+            # print('debug level', level)
+
             # Check if any of the counts at specific level have reached target_rows
             df_level = df_count[df_count['level']==level]
             df_count = df_count[df_count['level']!=level]
-            
-            if level==0:
-                # Reached the coarsest level
-                n_rows = 0
-                # Try to assign these records to the finest possible partition
-                min_len = df_level['head'].apply(len).min()-2
-                for l in numpy.arange(0, min_len):
-                    #potential partition level
-                    p = df_level.loc[0, 'head'][:l+2]
-                    if not df_level['head'].apply(lambda x: x.startswith(p)).all():
-                        # mixed keys at this level, so stop and go back to previous level
-                        l-=1
-                        break
-                df_level['partition'] = df_level.loc[0, 'head'][:l+2]
- 
-            # Separate the keys with number of rows above target_rows
-            self.gdf_partition = pandas.concat([
-                self.gdf_partition,
-                df_level[df_level['count']>=n_rows].reset_index(drop=True),
-            ])
-            df_level = df_level[df_level['count']<n_rows].reset_index(drop=True)
-            
-            # Get the parent keys and decrease the level for the next iteration
-            df_level['partition'] = df_level['partition'].apply(lambda x: x[:-1])
-            level-=1
-            df_level['level'] = level
-            
-            df_count = pandas.concat([df_count, df_level])
+
+            if len(df_level)>0:
+                if level==0:
+                    # Reached the coarsest level
+                    n_rows = 0
+                    # Assign all remaining records to the finest possible partition
+                    stop_l = min(
+                        df_level['head'].apply(len).min()-2,
+                        self.target_level+1
+                    )
+                    l = 0
+                    while l<stop_l:
+                        l+=1
+                        # Check potential partition level
+                        # print('debug 00000', level)
+                        # print('debug lllll', l)
+                        p = df_level.loc[0, 'head'][:l+2]
+                        if not df_level['head'].apply(lambda x: x.startswith(p)).all():
+                            # mixed keys at this level, so stop and go back to previous level
+                            l-=1
+                            break
+
+                    df_level['partition'] = df_level.loc[0, 'head'][:l+2]
+
+                # Separate the keys with number of rows above target_rows
+                self.gdf_partition = pandas.concat([
+                    self.gdf_partition,
+                    df_level[df_level['count']>=n_rows].reset_index(drop=True),
+                ])
+                df_level = df_level[df_level['count']<n_rows].reset_index(drop=True)
+
+                # Get the parent keys and decrease the level for the next iteration
+                df_level['partition'] = df_level['partition'].apply(lambda x: x[:-1])
+                df_level['level'] = level-1
+                df_count = pandas.concat([df_count, df_level])
+
             df_count['count'] = df_count.groupby('partition')['head_count'].transform('sum')
+            # print('debug df_level', len(df_level))
+            # print('debug df_count', len(df_count))
+            # print('debug length (df_level, df_count)', len(set(df_level['partition'])), len(set(df_count['partition'])))
+            if len(set(df_count['partition']))==1:
+                # Nothing to gain by decreasing level further
+                n_rows = 0
+            level-=1
+            # #debug
+            # if level==6:
+            #     break
             
         assert len(df_count)==0
 
@@ -556,7 +579,7 @@ class Vectorstore():
             on='head',
         )
 
-    
+
     def _filepath(self, temporal_partition, spatial_partition, create_path=True):
         """Composing the filepath from metadata."""
         filepath = self.parquet_directory
@@ -606,26 +629,36 @@ class Vectorstore():
             self.gdf,
             self.df_idx[self.df_idx['partition']==spatial_partition][[self.id_col, 'head']],
             on=self.id_col,
-        ).rename(columns={'head': 'q_key'})
+        ).rename(columns={'head': self.key_col})
         return gdf_part
 
     
-    def _to_parquet(self, temporal_partition, spatial_partition, append=False):
+    def _to_parquet(self, temporal_partition, spatial_partition, gdf_part=None, append=False):
         """Write GeoDataFrame partition to parquet."""
-        gdf_part = self._select_partition(temporal_partition, spatial_partition)
+        if gdf_part is None:
+            gdf_part = self._select_partition(temporal_partition, spatial_partition)
+        debug_len_part = len(gdf_part)
         filepath = self._filepath(temporal_partition, spatial_partition)
         if append:
             try:
                 # See if there is something already present
                 gdf_existing = geopandas.read_parquet(filepath)
+                debug_len_existing = len(gdf_existing)
+                # print('debug_len_existing', debug_len_existing)
             except IOError:
                 pass
             else:
                 # Merge by concatenating and dropping duplicates (keeping the newer version)
+                # print('debug gdf_part', len(gdf_part))
+                # print('gdf_existing', gdf_existing)
+                # print('gdf_part', gdf_part)
                 gdf_part = pandas.concat([gdf_existing, gdf_part]).drop_duplicates(
-                    subset=[self.dt_col, self.key_col]+['dimension_' + d for d in self.dimension_values],
+                    subset=[self.dt_col, self.id_col]+['dimension_' + d for d in self.dimension_values],
                     keep='last',
                 )
+                debug_len_concat = len(gdf_part)
+                # print('debug_len_concat', debug_len_concat)
+                assert debug_len_concat==(debug_len_existing+debug_len_part)
                 
         if len(gdf_part)>0:
             # Sorting so that these columns are used as indices in parquet file
@@ -649,6 +682,52 @@ class Vectorstore():
             temporal_partition = {} 
             self._to_parquet(temporal_partition, spatial_partition, append=append)
 
+
+    def _read_parquet(
+        self,
+        filepath,
+        columns=None,
+        filters=None,  # List[Tuple] or List[List[Tuple]]
+        q_key=None,    # inclusive all children
+        dt_start=None, # inclusive
+        dt_end=None,   # exclusive
+    ):
+        """Query the parquet vector store using spatial, temporal and/or dimension filters."""
+        if filters is None:
+            filters = []
+        if q_key is not None:
+            key, level = self.morton.decode(q_key)
+            q_key_end = self.morton.encode(key+1, level)[0]
+            filters.append((self.key_col, '>=', q_key))
+            filters.append((self.key_col, '<', q_key_end))
+            
+        if dt_start is not None:
+            filters.append((self.dt_col, '>=', dt_start))
+        if dt_end is not None:
+            filters.append((self.dt_col, '<', dt_end))
+            
+        if self.verbose:
+            print('filepath', filepath)
+            print('columns ', columns)
+            print('filters ', filters)
+        try:
+            if len(filters)>0:
+                if (columns is None) or (self.geom_col in columns):
+                    gdf = geopandas.read_parquet(filepath, columns=columns, filters=filters)
+                else:
+                    gdf = pandas.read_parquet(filepath, columns=columns, filters=filters)
+            else:
+                if (columns is None) or (self.geom_col in columns):
+                    gdf = geopandas.read_parquet(filepath, columns=columns)
+                else:
+                    gdf = pandas.read_parquet(filepath, columns=columns)
+        except Exception as e:
+            if self.verbose:
+                print(e)
+                print('Problem loading file', filepath)
+            gdf = geopandas.GeoDataFrame()
+            
+        return gdf
     
     # def _spatialPartitionLevel(self, sp):
     #     return int(sp.split(self.spatial_partition_identifier)[-1])
@@ -764,41 +843,6 @@ class Vectorstore():
         
     #     return gdf.to_crs(lambert_azimuthal_ea)
         
-    # def _read_parquet(self, filepath, dt_start=None, dt_end=None, columns=None, geometry_area=False, geometry_length=False, verbose=False):
-    #     """
-    #     Query the parquet vector store using temporal filters if applicable.
-    #     Temporal and spatial partitioning is done by hand
-    #     Temporal filtering is happening in pyarrow.
-    #     Spatial filtering is done after the data has been received.
-    #     """        
-    #     filters = []
-    #     if dt_start is not None:
-    #         filters.append((self.dt_col, '>=', dt_start))
-    #     if dt_end is not None:
-    #         filters.append((self.dt_col, '<=', dt_end))
-    #     if verbose:
-    #         print('filepath', filepath)
-    #         #print('filters', filters)
-    #     try:
-    #         if len(filters)>0:
-    #             gdf = geopandas.read_parquet(filepath, columns=columns, filters=filters)
-    #         else:
-    #             gdf = geopandas.read_parquet(filepath, columns=columns)
-    #     except Exception as e:
-    #         if verbose:
-    #             print(e)
-    #             print('Problem loading file', filepath)
-    #         gdf = geopandas.GeoDataFrame()
-            
-    #     # Add area and/or length columns if requested
-    #     if geometry_area or geometry_length:
-    #         gdf_lambert_ea = self._reproject_to_local_equal_area_grid(gdf)
-    #         if geometry_area:
-    #             gdf[self.geom_area_col] = gdf_lambert_ea.area
-    #         if geometry_length:
-    #             gdf[self.geom_length_col] = gdf_lambert_ea.length
-                
-    #     return gdf
 
     # def read_selected_parquet(
     #     self, composite_key, dt_start=None, dt_end=None, columns=None, geometry_area=False, geometry_length=False, verbose=False
