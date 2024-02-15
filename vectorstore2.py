@@ -273,6 +273,30 @@ class Vectorstore():
         return gdf
         
 
+    def _base4_to_box(self, arr):
+        """Translate keys to shapely boxes.
+    
+        Speed up and harden bulk-operarions of the base4_to_box method of mortoncurve using pandas.
+        :param arr:  1D array of quaternary keys.
+        :returns: 1D array of shapely geometries (boxes) that correspond to the keys.
+        """
+
+        df = pandas.DataFrame({'q_key': numpy.array(arr)})
+        
+        # Do the expensive operation on as few rows as possible
+        df_unique = df[['q_key']].drop_duplicates()
+        try:
+            df_unique['geometry'] = self.morton.base4_to_box(df_unique['q_key'])
+        except OverflowError as e:
+            print(e)
+            print('Failed to use numpy due to large integers. Switching to pandas')
+            df_unique['geometry'] = df_unique['q_key'].apply(self.morton.base4_to_box)
+            
+        df = pandas.merge(df, df_unique, on='q_key')
+        
+        return numpy.array(df['geometry'])
+
+    
     def _children(self, q_key):
         """Generate list of children keys."""
         q0 = q_key + "0"
@@ -281,7 +305,7 @@ class Vectorstore():
         q3 = q_key + "3"
         return [q0, q1, q2, q3]
 
-    
+
     def _recursive_bfs(self, final_iteration=False):
         """Calculate the next level of children keys."""
     
@@ -293,13 +317,8 @@ class Vectorstore():
         
         # Create the children bounding boxes
         for child in self.CHILDREN:
-            try:
-                self.df_children[child + '_bounds'] = self.morton.base4_to_box(self.df_children[child])
-            except OverflowError as e:
-                print(e)
-                print(child, 'failed to use numpy due to large integers. Switching to pandas')
-                self.df_children[child + '_bounds'] = self.df_children[child].apply(self.morton.base4_to_box)
-    
+            self.df_children[child + '_bounds'] = self._base4_to_box(self.df_children[child])
+
         # Check for intersection of original geometry with children
         for child in self.CHILDREN:
             mask = self.gdf_tree.intersects(
@@ -399,39 +418,34 @@ class Vectorstore():
         assert(self.id_col in self.gdf.columns)
 
         # Drop duplicate geometries before calculating spatial index (e.g. when we have multiple timestamps for the same geometry) 
-        self.gdf_unique = self.gdf[[self.id_col, self.geom_col]].drop_duplicates(subset=self.id_col).reset_index(drop=True)
+        self.gdf1 = self.gdf[[self.id_col, self.geom_col]].drop_duplicates(subset=self.id_col).reset_index(drop=True)
         if self.verbose:
-            print('len(gdf_unique)    ', len(self.gdf_unique))
+            print('len(gdf1) ', len(self.gdf1))
 
         # Fast algorithm for smallest z-order squares that still contain the entire geometries.
-        self.gdf_unique = self._index_head(self.gdf_unique)
+        self.gdf1 = self._index_head(self.gdf1)
 
         # Get the bounding geometries
-        try:
-            # The numpy method is much faster if integers are small enough
-            self.gdf_unique[self.idx_geom_col] = self.morton.base4_to_box(self.gdf_unique[self.key_col])
-        except OverflowError as e:
-            print(e)
-            print('Failed to use numpy due to large integers. Switching to pandas')
-            self.gdf_unique[self.idx_geom_col] = self.gdf_unique[self.key_col].apply(lambda x: self.morton.base4_to_box(x))
+        self.gdf1[self.idx_geom_col] = self._base4_to_box(self.gdf1[self.key_col])
 
         if self.verbose:
             print('Time for initialization (A) in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
         # Remember all head geometries
-        self.gdf_head = self.gdf_unique[[self.id_col, self.key_col]]
+        self.gdf_head = self.gdf1[[self.id_col, self.key_col]]
         print('gdf_head  ', len(self.gdf_head))
         
         # Concat builds upon the head geometries
         self.gdf_concat = self.gdf_head.copy()
         
         # Remember the geometries that have already reached the target level
-        self.gdf_target = self.gdf_unique[self.gdf_unique[self.key_col].apply(len)>=self.target_level+2].reset_index(drop=True)[[self.id_col, self.key_col]]
+        self.gdf_target = self.gdf1[self.gdf1[self.key_col].apply(len)>=self.target_level+2].reset_index(
+            drop=True)[[self.id_col, self.key_col]]
         print('gdf_target', len(self.gdf_target))
         
         # Determine the geometries for which we have to build an entire quadtree, rather than just the head node.
-        self.gdf_tree = self.gdf_unique[self.gdf_unique[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True)
+        self.gdf_tree = self.gdf1[self.gdf1[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True)
         print('gdf_tree  ', len(self.gdf_tree))
         
         depth = 0
@@ -452,17 +466,9 @@ class Vectorstore():
 
         # Finalize the quadtree index
         self.gdf_concat['level'] = self.gdf_concat[self.key_col].apply(lambda x: len(x)-2)
-        df_unique = self.gdf_concat[[self.key_col]].drop_duplicates(subset=self.key_col).reset_index(drop=True)
-        try:
-            df_unique['geometry'] = self.morton.base4_to_box(df_unique[self.key_col])
-        except OverflowError as e:
-            print(e)
-            print('failed to use numpy due to large integers. Switching to pandas')
-            df_unique['geometry'] = df_unique[self.key_col].apply(self.morton.base4_to_box)
-        self.gdf_concat = pandas.merge(self.gdf_concat, df_unique, on=self.key_col)
+        self.gdf_concat['geometry'] = self._base4_to_box(self.gdf_concat[self.key_col])
         self.gdf_concat = geopandas.GeoDataFrame(self.gdf_concat)
         self.gdf_concat = self.gdf_concat.sort_values(by=[self.key_col, 'level', self.id_col]).reset_index(drop=True)
-        self.gdf_concat
 
         if self.verbose:
             print('Time for finalizing gdf_concat (C) in seconds', round(time.time()-stopwatch_start, 3))
@@ -470,14 +476,7 @@ class Vectorstore():
 
         # Finalize the target cells
         self.gdf_target['level'] = self.gdf_target[self.key_col].apply(lambda x: len(x)-2)
-        df_unique = self.gdf_target[[self.key_col]].drop_duplicates(subset=self.key_col).reset_index(drop=True)
-        try:
-            df_unique['geometry'] = self.morton.base4_to_box(df_unique[self.key_col])
-        except OverflowError as e:
-            print(e)
-            print('failed to use numpy due to large integers. Switching to pandas')
-            df_unique['geometry'] = df_unique[self.key_col].apply(self.morton.base4_to_box)
-        self.gdf_target = pandas.merge(self.gdf_target, df_unique, on=self.key_col)
+        self.gdf_target['geometry'] = self._base4_to_box(self.gdf_target[self.key_col])
         self.gdf_target = geopandas.GeoDataFrame(self.gdf_target)
         self.gdf_target = self.gdf_target.sort_values(by=[self.key_col, 'level', self.id_col]).reset_index(drop=True)
         self.gdf_target
@@ -572,10 +571,7 @@ class Vectorstore():
             
         assert len(df_count)==0
 
-        if self.verbose:
-            print('Number of partitions suggested', len(self.gdf_partition['partition'].drop_duplicates()))
-
-        self.gdf_partition['geometry'] = self.gdf_partition['partition'].apply(lambda x: self.morton.base4_to_box(x))
+        self.gdf_partition['geometry'] = self._base4_to_box(self.gdf_partition['partition'])
         self.gdf_partition = geopandas.GeoDataFrame(self.gdf_partition)
 
         # Add the partition column to df_idx
@@ -602,57 +598,114 @@ class Vectorstore():
         return df_partitions
 
 
-    def _shard(self, source_partition, target_partitions):
+    def _shard(self, temporal_partition, source_partition, target_partitions):
         """Shard the contents of source_partition to higher-resolution existing partitions whenever possible."""
 
-        source_filepath = os.path.join(self.parquet_directory, source_partition+'.parquet')
+        source_filepath = self._filepath(temporal_partition, source_partition)
         if os.path.exists(source_filepath):
             gdf_source = geopandas.read_parquet(source_filepath)
+            initial_length = len(gdf_source)
     
-            if self.verbose:
-                print(f"{'source_partition':20} {'target_partition':20} {'records stay':20} {'records move':20}")
             for target_partition in target_partitions:
                 gdf_shard = gdf_source[gdf_source['q_key'].apply(
                     lambda x: x.startswith(target_partition)
                 )].sort_values(by='q_key').reset_index(drop=True)
                 
-                if self.verbose:
-                    print(f"{source_partition:20} {target_partition:20} {str(len(gdf_source)):20} {str(len(gdf_shard))}")
-                    
                 if len(gdf_shard)>0:
                     # Move the source records to the target partition
-                    self._to_parquet({}, target_partition, gdf_part=gdf_shard, append=True)
+                    self._to_parquet(temporal_partition, target_partition, gdf_part=gdf_shard, append=True)
     
                     # Remove the sharded records from the source DataFrame
                     gdf_source = gdf_source[~gdf_source['q_key'].apply(
                         lambda x: x.startswith(target_partition)
                     )]
     
-            # Remove the source records from the source partition
+                if self.verbose and len(gdf_shard)>0:
+                    print(f"{source_partition:25} {target_partition:25} {str(len(gdf_source)):15} {str(len(gdf_shard)):15}")
+                    
+            # Remove the sharded records from the source partition
             if len(gdf_source)==0:
                 # Erase the source partition
                 os.remove(source_filepath)
-            else:
+            elif len(gdf_source)<initial_length:
                 # Overwrite the source partition
-                self._to_parquet({}, source_partition, gdf_part=gdf_source, append=False)
+                self._to_parquet(temporal_partition, source_partition, gdf_part=gdf_source, append=False)
+                
+            return gdf_source
+        else:
+            return geopandas.GeoDataFrame()
 
 
-    def repartition(self):
-        # Potential source partitions for sharding
+    def _split(self, temporal_partition, source_partition, target_rows, gdf_source=None):
+        
+        source_filepath = self._filepath(temporal_partition, source_partition)
+        if gdf_source is None:
+            gdf_source = self._read_parquet(source_filepath)
+        initial_length = len(gdf_source)
+        children = self._children(source_partition)
+        
+        # Keep partition flag: Parent records that can't be distributed to children are present.
+        keep_partition = any(gdf_source['q_key'].apply(lambda x: x==source_partition))
+        
+        for child in children:
+            gdf_child = gdf_source[gdf_source['q_key'].apply(lambda x: x.startswith(child))]
+            n_records = len(gdf_child)
+
+            if n_records>0:
+                if (
+                    n_records<=target_rows/2
+                ) and not (
+                    os.path.exists(self._filepath(temporal_partition, child))
+                ) and (
+                    keep_partition
+                ):
+                    # Don't split
+                    pass
+                else:
+                    # Split the records off and assign to the child
+        
+                    # Move the source records to the child partition
+                    self._to_parquet(temporal_partition, child, gdf_part=gdf_child, append=True)
+        
+                    # Remove the child records from the source DataFrame
+                    gdf_source = gdf_source[~gdf_source['q_key'].apply(lambda x: x.startswith(child))]
+
+                    if self.verbose:
+                        print(f"{source_partition:25} {child:25} {str(len(gdf_source)):15} {str(len(gdf_child)):15}")
+                    if len(gdf_source)==0:
+                        break
+    
+        # Remove the child records from the source partition
+        if len(gdf_source)==0:
+            # Erase the source partition
+            os.remove(source_filepath)
+        elif len(gdf_source)<initial_length:
+            # Overwrite the source partition
+            self._to_parquet(temporal_partition, source_partition, gdf_part=gdf_source, append=False)
+
+
+    def repartition(self, temporal_partition, target_rows=100000):
+        """Repartrition parquet files to balance number of rows in each file as much as possible."""
+        
+        # Potential source partitions for sharding and/or splitting
         df_partitions = self._existing_partitions()
+        
         # Exclude the highest partition level (self.target_level) from being sharded further
         df_source_partitions = df_partitions[df_partitions['partition_level']<self.target_level].sort_values(
             by='partition_level').reset_index(drop=True)
 
         # Start with the coarsest source partitions
-        for level in sorted(set(df_source_partitions['partition_level'])):
-            print('level', level)
+        for level in numpy.arange(min(df_source_partitions['partition_level']), self.max_level):
+            if self.verbose:
+                print('level', level)
+                print(f"{'source_partition':25} {'child partition':25} {'records stay':15} {'records move':15}")
     
             # Source partitions of specific level
             source_partitions = sorted(set(df_source_partitions[df_source_partitions['partition_level']==level]['partition']))
             for source_partition in source_partitions:
 
-                # Get the target partitions for this source_partition
+                # (1) Sharding into existing high-resolution partitions.
+                # Get the target partitions for this source_partition.
                 df = df_partitions[(df_partitions['partition_level']>level) & (
                     df_partitions['partition'].apply(lambda x: x.startswith(source_partition))
                 )
@@ -660,8 +713,15 @@ class Vectorstore():
                 target_partitions = list(df['partition'])
 
                 # Shard the contents of source_partition to higher-resolution existing partitions whenever possible.
-                self._shard(source_partition, target_partitions)
-    
+                gdf_source = self._shard(temporal_partition, source_partition, target_partitions)
+
+                # (2) Split contents of partition into new children partitions if enough records exist
+                if len(gdf_source)>0:
+                    self._split(temporal_partition, source_partition, target_rows, gdf_source=gdf_source)
+
+        # ToDo: Combine multiple tiny files at high resolution to lower-resolution combined files
+  
+
 
     def _filepath(self, temporal_partition, spatial_partition, create_path=True):
         """Composing the filepath from metadata."""
@@ -707,7 +767,7 @@ class Vectorstore():
         return temporal_partition, spatial_partition
 
     
-    def _select_partition(self, temporal_partition, spatial_partition):
+    def _filter_partition(self, temporal_partition, spatial_partition):
         gdf_part = pandas.merge(
             self.gdf,
             self.df_idx[self.df_idx['partition']==spatial_partition][[self.id_col, 'head']],
@@ -719,7 +779,7 @@ class Vectorstore():
     def _to_parquet(self, temporal_partition, spatial_partition, gdf_part=None, append=False):
         """Write GeoDataFrame partition to parquet."""
         if gdf_part is None:
-            gdf_part = self._select_partition(temporal_partition, spatial_partition)
+            gdf_part = self._filter_partition(temporal_partition, spatial_partition)
         debug_len_part = len(gdf_part)
         filepath = self._filepath(temporal_partition, spatial_partition)
         if append:
