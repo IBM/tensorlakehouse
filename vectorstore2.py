@@ -637,6 +637,7 @@ class Vectorstore():
 
 
     def _split(self, temporal_partition, source_partition, target_rows, gdf_source=None):
+        """Split contents of partition into new children partitions if enough records exist."""
         
         source_filepath = self._filepath(temporal_partition, source_partition)
         if gdf_source is None:
@@ -651,37 +652,104 @@ class Vectorstore():
             gdf_child = gdf_source[gdf_source['q_key'].apply(lambda x: x.startswith(child))]
             n_records = len(gdf_child)
 
-            if n_records>0:
-                if (
-                    n_records<=target_rows/2
-                ) and not (
-                    os.path.exists(self._filepath(temporal_partition, child))
-                ) and (
-                    keep_partition
-                ):
-                    # Don't split
-                    pass
-                else:
-                    # Split the records off and assign to the child
-        
-                    # Move the source records to the child partition
-                    self._to_parquet(temporal_partition, child, gdf_part=gdf_child, append=True)
-        
-                    # Remove the child records from the source DataFrame
-                    gdf_source = gdf_source[~gdf_source['q_key'].apply(lambda x: x.startswith(child))]
+            if (n_records>target_rows/2) or (
+                (os.path.exists(self._filepath(temporal_partition, child)) and (n_records>0) and keep_partition)
+            ):
+                # Split the records off and assign to the child
+    
+                # Move the source records to the child partition
+                self._to_parquet(temporal_partition, child, gdf_part=gdf_child, append=True)
+    
+                # Remove the child records from the source DataFrame
+                gdf_source = gdf_source[~gdf_source['q_key'].apply(lambda x: x.startswith(child))]
 
-                    if self.verbose:
-                        print(f"{source_partition:25} {child:25} {str(len(gdf_source)):15} {str(len(gdf_child)):15}")
-                    if len(gdf_source)==0:
-                        break
+                if self.verbose:
+                    print(f"{source_partition:25} {child:25} {str(len(gdf_source)):15} {str(len(gdf_child)):15}")
+                if len(gdf_source)==0:
+                    break
     
         # Remove the child records from the source partition
         if len(gdf_source)==0:
             # Erase the source partition
             os.remove(source_filepath)
-        elif len(gdf_source)<initial_length:
+            return geopandas.GeoDataFrame()
+        else:
             # Overwrite the source partition
             self._to_parquet(temporal_partition, source_partition, gdf_part=gdf_source, append=False)
+            return gdf_source
+
+
+    def _combine(self, temporal_partition, target_rows, df_rows):
+        """Shard the contents of source_partition to higher-resolution existing partitions whenever possible."""
+
+        df_small = df_rows[df_rows['n_rows']<=target_rows/2].sort_values(
+            by='partition_level', ascending=False).reset_index(drop=True)
+        
+        merge_partitions = list(df_small['partition'])
+        while len(merge_partitions)>0:
+            merge_partition = merge_partitions[0]
+            if len(merge_partition)==2:
+                # The root level cannot be merged any further
+                break
+        
+            parent = merge_partition[:-1]
+            ancestor = parent
+            ancestors = []
+            while len(ancestor)>=2:
+                ancestors.append(ancestor)
+                ancestor = ancestor[:-1]
+                
+            # Potential siblings or cousing to merge with on the parent or grandparent node
+            # Note we are not merging more distant cousins
+            df1 = df_rows[(
+                (
+                    df_rows['partition'].apply(lambda x: x.startswith(merge_partition[:-2]))
+                ) & (
+                    df_rows['n_rows']<=target_rows/2
+                ) & (
+                    df_rows['partition']!=merge_partition
+                )
+            )]
+            
+            # Direct ancestor partitions already present
+            df2 = df_rows[(df_rows['partition'].isin(ancestors))]
+            
+            df3 = pandas.concat([df1, df2]).drop_duplicates().reset_index(drop=True)
+            
+            if len(df3)>0:
+                if os.path.exists(self._filepath(temporal_partition, parent)):
+                    # Merge the child and parent partitions on the parent node
+                    print('Merge: ', merge_partition, '->', parent)
+                    source_filepath = self._filepath(temporal_partition, merge_partition)
+                    if os.path.exists(source_filepath):
+                        gdf_source = geopandas.read_parquet(source_filepath)
+                    self._to_parquet(temporal_partition, parent, gdf_part=gdf_source, append=True)
+                    os.remove(source_filepath)
+                    
+                    # Assign the rows from the child to the parent
+                    n_rows = df_rows.loc[df_rows['partition']==merge_partition, 'n_rows'].values[0]
+                    df_rows.loc[df_rows['partition']==parent, 'n_rows']+=n_rows
+                    df_rows = df_rows[df_rows['partition']!=merge_partition].reset_index(drop=True)
+                    
+                else:
+                    # Move the child partition to the parent
+                    print('Rename:', merge_partition, '->', parent)
+                    os.rename(
+                        self._filepath(temporal_partition, merge_partition),
+                        self._filepath(temporal_partition, parent)
+                    )
+                    
+                    # Assign the rows from the child to the parent
+                    df_rows.loc[df_rows['partition']==merge_partition, 'partition_level']-=1
+                    df_rows.loc[df_rows['partition']==merge_partition, 'partition'] = parent
+            else:
+                # Remove the child record (even if the partition stays)
+                df_rows = df_rows[df_rows['partition']!=merge_partition].reset_index(drop=True)
+        
+            # Re-calculate the small partitions
+            df_small = df_rows[df_rows['n_rows']<=target_rows/2].sort_values(
+                by='partition_level', ascending=False).reset_index(drop=True)
+            merge_partitions = list(df_small['partition'])
 
 
     def repartition(self, temporal_partition, target_rows=100000):
@@ -694,11 +762,20 @@ class Vectorstore():
         df_source_partitions = df_partitions[df_partitions['partition_level']<self.target_level].sort_values(
             by='partition_level').reset_index(drop=True)
 
+        # Keep track of the number or rows within each source partition after sharding and splitting
+        dict_n_rows = {}
+        
         # Start with the coarsest source partitions
         for level in numpy.arange(min(df_source_partitions['partition_level']), self.max_level):
+            if level>min(df_source_partitions['partition_level']):
+                # Update source partitions, since partitions may have changed
+                df_partitions = self._existing_partitions()
+                df_source_partitions = df_partitions[df_partitions['partition_level']<self.target_level].sort_values(
+                    by='partition_level').reset_index(drop=True)
+
             if self.verbose:
                 print('level', level)
-                print(f"{'source_partition':25} {'child partition':25} {'records stay':15} {'records move':15}")
+                print(f"{'source partition':25} {'target partition':25} {'records stay':15} {'records move':15}")
     
             # Source partitions of specific level
             source_partitions = sorted(set(df_source_partitions[df_source_partitions['partition_level']==level]['partition']))
@@ -715,12 +792,19 @@ class Vectorstore():
                 # Shard the contents of source_partition to higher-resolution existing partitions whenever possible.
                 gdf_source = self._shard(temporal_partition, source_partition, target_partitions)
 
-                # (2) Split contents of partition into new children partitions if enough records exist
+                # (2) Split contents of partition into new children partitions if enough records exist.
                 if len(gdf_source)>0:
-                    self._split(temporal_partition, source_partition, target_rows, gdf_source=gdf_source)
+                    gdf_source = self._split(temporal_partition, source_partition, target_rows, gdf_source=gdf_source)
 
-        # ToDo: Combine multiple tiny files at high resolution to lower-resolution combined files
-  
+                if len(gdf_source)>0:
+                    dict_n_rows[source_partition] = len(gdf_source)
+
+        # (3) Combine multiple tiny files at high resolution to lower-resolution combined files
+        df_rows = pandas.DataFrame({'partition': dict_n_rows.keys(), 'n_rows': dict_n_rows.values()})
+        df_rows['partition_level'] = df_rows['partition'].apply(lambda x: len(x)-2)
+        df_rows = df_rows.sort_values(by=['partition_level'], ascending=False)
+
+        self._combine(temporal_partition, target_rows, df_rows)
 
 
     def _filepath(self, temporal_partition, spatial_partition, create_path=True):
