@@ -38,9 +38,11 @@ class Vectorstore():
     Methods
 
         register_geodataframe   Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
-        register_geodataframe   Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
-        register_geodataframe   Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
-        register_geodataframe   Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
+        create_partitions       Create spatial partitions of roughly equal size.
+        to_parquet              Write entire GeoDataFrame (all partitions) to parquet.
+        partial_upload          Register GeoDataFrame, create partition, and save parquet to disk.
+        repartition             Repartrition parquet files to balance number of rows in each file.
+        index_vectorstore       Create a qtree spatial index for the entire dataset.
 
     """
 
@@ -448,14 +450,41 @@ class Vectorstore():
             stopwatch_start = time.time()
 
     
+    def index_vectorstore(self, temporal_partition):
+        """Create a qtree spatial index for the entire dataset."""
+        
+        if self.verbose:
+            stopwatch_start = time.time()
+
+        spatial_partitions = sorted(self._glob_partitions()['partition'])
+        for spatial_partition in spatial_partitions:
+            print('spatial_partition', spatial_partition)
+            self._index_partition(temporal_partition, spatial_partition)
+
+        if self.verbose:
+            print('Time to index entire vectorstore', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
+
+    
     def _index_partition(self, temporal_partition, spatial_partition):
         """Create a qtree spatial index for a specific partition."""
 
         filepath = self._filepath(temporal_partition, spatial_partition)
         gdf = geopandas.read_parquet(filepath, columns=[self.id_col, self.geom_col, self.key_col])
-        self._index_geodataframe(gdf)
         
-    
+        gdf_idx = self._index_geodataframe(gdf)
+
+        # ToDo: maybe we need to allow appending similar to _to_parquet method
+        filepath_idx = self._filepath_idx(temporal_partition, spatial_partition)
+        gdf_idx.to_parquet(
+            path=filepath_idx,
+            row_group_size=100000,
+            engine='pyarrow',
+            compression='snappy',
+            #partition_cols=self.partition_cols
+        )
+
+
     def _index_geodataframe(self, gdf):
         """Calculate the qtree index, and target keys at target_level for each geometry where possible.
 
@@ -476,7 +505,7 @@ class Vectorstore():
         # Drop duplicate geometries before calculating spatial index (e.g. when we have multiple timestamps for the same geometry) 
         gdf_unique = gdf[cols].drop_duplicates(subset=self.id_col).reset_index(drop=True)
         if self.verbose:
-            print('len(gdf_unique) ', len(gdf_unique))
+            print('gdf_unique', len(gdf_unique))
 
         if self.key_col not in gdf.columns:
             # Fast algorithm for smallest z-order squares that still contain the entire geometries.
@@ -506,15 +535,17 @@ class Vectorstore():
             if depth==self.max_depth:
                 final_iteration = True
             if len(gdf_tree)>0:
-                gdf_tree, self.df_children = self._recursive_bfs(gdf_tree, depth, initial_length, final_iteration)
-                self.gdf_tree = gdf_tree
+                gdf_tree, df_children = self._recursive_bfs(gdf_tree, depth, initial_length, final_iteration)
+                # debug
+                # self.gdf_tree = gdf_tree
+                # self.df_children = df_children
             else:
                 break
             if self.verbose:
                 print('depth:', depth, '   gdf_idx:', len(self.gdf_idx))
 
         if self.verbose:
-            print('Time for recursive BFS (B) in seconds', round(time.time()-stopwatch_start, 3))
+            print('Time for recursive BFS (A) in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
         # Finalize the quadtree index
@@ -538,7 +569,7 @@ class Vectorstore():
         self.gdf_idx.loc[df2.contains(self.gdf_idx), 'contained'] = True
 
         if self.verbose:
-            print('Time for finalizing gdf_idx (C) in seconds', round(time.time()-stopwatch_start, 3))
+            print('Time for finalizing gdf_idx (B) in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
         # debug: We may not need to expose gdf_target outside this function. 
@@ -551,21 +582,22 @@ class Vectorstore():
         self.gdf_target = self.gdf_target.sort_values(by=[self.key_col, 'level', self.id_col]).reset_index(drop=True)
 
         if self.verbose:
-            print('Time for finalizing gdf_target (D) in seconds', round(time.time()-stopwatch_start, 3))
+            print('Time for finalizing gdf_target (C) in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
         # # Create dictionaries containing entire bfs quadtrees (indexed by level) for every geometry id.
         # self._index_dict()
         
         # if self.verbose:
-        #     print('Time for creating df_idx (E) in seconds', round(time.time()-stopwatch_start, 3))
+        #     print('Time for creating df_idx (D) in seconds', round(time.time()-stopwatch_start, 3))
         #     stopwatch_start = time.time()
+
+        return self.gdf_idx
 
     
     def create_partitions(self, target_rows=100000):
-        """Partition the table.
+        """Create spatial partitions of roughly equal size.
 
-        Create spatial partitions of roughly equal size.
         :param target_rows:  Approximate number of rows per parquet file.
         """
         if self.verbose:
@@ -876,6 +908,21 @@ class Vectorstore():
             stopwatch_start = time.time()
 
     
+    def _filepath_idx(self, temporal_partition, spatial_partition, create_path=True):
+        """Composing the filepath from metadata."""
+        filepath = self.index_directory
+        for temporal_level in self.temporal_levels:
+            filepath = os.path.join(
+                filepath,
+                temporal_level+'='+str(temporal_partition[temporal_level])
+            ).replace('\\', '/')
+        # Note, currently not building any sub-directories associated with spatial levels
+        if create_path and not os.path.exists(filepath): os.makedirs(filepath)
+
+        filename = spatial_partition + '.parquet'
+        return os.path.join(filepath, filename).replace('\\', '/')
+
+
     def _filepath(self, temporal_partition, spatial_partition, create_path=True):
         """Composing the filepath from metadata."""
         filepath = self.geoparquet_directory
@@ -992,7 +1039,7 @@ class Vectorstore():
 
 
     def partial_upload(self, gdf, target_rows=100000):
-        """Ingest, partition, and save a GeoDataFrame into the Vectorstore and save to disk.
+        """Register GeoDataFrame, create partition, and save parquet to disk.
 
         :param gdf:    Geopandas GeoDataFrame to be indexed and written to disk.
         """
