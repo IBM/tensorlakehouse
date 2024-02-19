@@ -212,18 +212,30 @@ class Vectorstore():
         
         # Do the expensive operation on as few rows as possible
         df_unique = df[[self.key_col]].drop_duplicates()
+    
+        # zeroth level key needs special attention when vectorizing with numpy (TypeError).
+        df_zero = None
+        if '0q' in df_unique[self.key_col].values:
+            df_unique = df_unique[df_unique[self.key_col]!='0q']
+            df_zero = pandas.DataFrame({self.key_col: ['0q']})
+            df_zero['geometry'] = df_zero[self.key_col].apply(self.morton.base4_to_box)
+    
+        # Try vectorized (numpy) version of base4_to_box first
         try:
             df_unique['geometry'] = self.morton.base4_to_box(df_unique[self.key_col])
-        except (OverflowError, TypeError) as e:
+        except OverflowError as e:
             print(e)
             print('Failed to use numpy. Switching to pandas')
             df_unique['geometry'] = df_unique[self.key_col].apply(self.morton.base4_to_box)
+    
+        if df_zero is not None:
+            df_unique = pandas.concat ([df_zero, df_unique])
             
         df = pandas.merge(df, df_unique, on=self.key_col, how='left')
         
         return numpy.array(df['geometry'])
 
-    
+
     def _children(self, q_key):
         """Generate list of children keys."""
         q0 = q_key + "0"
@@ -241,24 +253,25 @@ class Vectorstore():
             return None
     
     
-    def _depth_to_level(self):
+    def _depth_to_level(self, levels=None):
         """Translate the key by depth columns to key by level columns."""
+
+        if levels is None:
+            #levels = numpy.arange(self.target_level, -1, -1)
+            # We only need the target level. Low-res can be generated using subscription [:level+2]
+            levels = [self.target_level]
+
         for depth in numpy.arange(self.max_depth, -1, -1):
             if 'depth_'+str(depth) in self.gdf_idx.columns:
-                for level in numpy.arange(self.target_level, -1, -1):
-                    if 'level_0' not in self.gdf_idx.columns:
-                        #print('debug A', depth, '  ', level)
-                        self.gdf_idx['level_'+str(level)] = self.gdf_idx['depth_'+str(depth)].apply(
+                for level in levels:
+                    if 'idx_'+str(level) not in self.gdf_idx.columns:
+                        self.gdf_idx['idx_'+str(level)] = self.gdf_idx['depth_'+str(depth)].apply(
                             lambda x: self._nan_subscribe(x, level)
                         )
                     else:
-                        #print('debug B', depth, '  ', level)
-                        self.gdf_idx['level_'+str(level)] = self.gdf_idx['level_'+str(level)].fillna(
+                        self.gdf_idx['idx_'+str(level)] = self.gdf_idx['idx_'+str(level)].fillna(
                             self.gdf_idx['depth_'+str(depth)].apply(lambda x: self._nan_subscribe(x, level))
                         )
-        
-        level_cols = ['level_' + str(l) for l in numpy.arange(0, self.target_level+1)]
-        self.gdf_idx[[self.id_col] + level_cols]
 
 
     def _recursive_bfs(self, gdf_tree, depth, initial_length=None, final_iteration=False):
@@ -309,34 +322,37 @@ class Vectorstore():
                 # Break even befor max_depth is reached
                 final_iteration = True
 
+        # Update the keys we need to work on in the next iteration
+        gdf_tree = pandas.merge(
+            gdf_tree[[self.id_col, 'geometry']].drop_duplicates(),
+            df_children[df_children[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True),
+            on=self.id_col,
+        )
+
+        # Assign fully contained nodes from further splitting considerations.
+        gdf1 = gdf_tree[gdf_tree.contains(
+            geopandas.GeoSeries(gdf_tree['idx_bounds']).set_crs(self.morton.grid.crs)
+        )].reset_index(drop=True)
+
+        gdf_tree = gdf_tree[~gdf_tree.contains(
+            geopandas.GeoSeries(gdf_tree['idx_bounds']).set_crs(self.morton.grid.crs)
+        )].reset_index(drop=True)
+
         if final_iteration:
             # Everything remaining needs to be assigned to gdf_target
             self.gdf_target = pandas.concat([
                 self.gdf_target,
                 df_children[df_children[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True),
             ]).reset_index(drop=True)[self.gdf_target.columns]
-            gdf_tree = geopandas.GeoDataFrame()
+            
         else:
-            # Update the keys we need to work on in the next iteration
-            gdf_tree = pandas.merge(
-                gdf_tree[[self.id_col, 'geometry']].drop_duplicates(),
-                df_children[df_children[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True),
-                on=self.id_col,
-            )
-    
-            # Assign fully contained nodes to self.gdf_target and remove them from further splitting considerations
+            # Assign fully contained nodes to gdf_target
             self.gdf_target = pandas.concat([
                 self.gdf_target,
-                gdf_tree[gdf_tree.contains(
-                    geopandas.GeoSeries(gdf_tree['idx_bounds']).set_crs(self.morton.grid.crs)
-                )].reset_index(drop=True)[self.gdf_target.columns]
+                gdf1[self.gdf_target.columns]
             ]).reset_index(drop=True)
-            
-            gdf_tree = gdf_tree[~gdf_tree.contains(
-                geopandas.GeoSeries(gdf_tree['idx_bounds']).set_crs(self.morton.grid.crs)
-            )].reset_index(drop=True)
-        
-        return gdf_tree
+
+        return gdf_tree, df_children
 
 
     # def _index_dict(self):
@@ -481,7 +497,7 @@ class Vectorstore():
         # Determine the geometries for which we have to build an entire quadtree, rather than just the root node.
         gdf_tree = gdf_unique[gdf_unique[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True)
         print('gdf_tree  ', len(gdf_tree))
-        
+
         depth = 0
         initial_length = len(gdf_unique)
         final_iteration = False
@@ -490,7 +506,8 @@ class Vectorstore():
             if depth==self.max_depth:
                 final_iteration = True
             if len(gdf_tree)>0:
-                gdf_tree = self._recursive_bfs(gdf_tree, depth, initial_length, final_iteration)
+                gdf_tree, self.df_children = self._recursive_bfs(gdf_tree, depth, initial_length, final_iteration)
+                self.gdf_tree = gdf_tree
             else:
                 break
             if self.verbose:
@@ -500,10 +517,25 @@ class Vectorstore():
             print('Time for recursive BFS (B) in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
-        # Finalize the column-wise quadtree index
-        self._depth_to_level()
-        level_cols = ['level_' + str(l) for l in numpy.arange(0, self.target_level+1)]
-        self.gdf_idx = self.gdf_idx[[self.id_col] + level_cols + [self.key_col]]
+        # Finalize the quadtree index
+        levels = [self.target_level]
+        idx_cols = sorted(['idx_' + str(l) for l in levels])
+        self._depth_to_level(levels = levels)
+        self.gdf_idx = self.gdf_idx[[self.id_col] + idx_cols + [self.key_col]]
+
+        # Add a geometry column for the index bounds
+        self.gdf_idx['idx_bounds'] = self._base4_to_box(self.gdf_idx['idx_'+str(self.target_level)])
+        self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry='idx_bounds').set_crs(self.morton.grid.crs)
+        
+        # Check for spatial containment
+        df2 = self.gdf_idx[[self.id_col]].merge(
+            gdf_unique[[self.id_col, self.geom_col]],
+            on=self.id_col,
+            how='left'
+        )
+        df2 = geopandas.GeoDataFrame(df2)
+        self.gdf_idx['contained'] = False
+        self.gdf_idx.loc[df2.contains(self.gdf_idx), 'contained'] = True
 
         if self.verbose:
             print('Time for finalizing gdf_idx (C) in seconds', round(time.time()-stopwatch_start, 3))
@@ -512,6 +544,7 @@ class Vectorstore():
         # debug: We may not need to expose gdf_target outside this function. 
         #        If so, del self.gdf_target
         # Finalize the target cells
+        self.gdf_target[self.key_col] = self.gdf_target[self.key_col].apply(lambda x: x[:self.target_level+2])
         self.gdf_target['level'] = self.gdf_target[self.key_col].apply(lambda x: len(x)-2)
         self.gdf_target['geometry'] = self._base4_to_box(self.gdf_target[self.key_col])
         self.gdf_target = geopandas.GeoDataFrame(self.gdf_target)
@@ -552,7 +585,6 @@ class Vectorstore():
         level = df_count['level'].max()
         n_rows = self.target_rows/2
         while level>=0 and len(df_count)>0:
-            # print('debug level', level)
 
             # Check if any of the counts at specific level have reached target_rows
             df_level = df_count[df_count['level']==level]
@@ -616,7 +648,7 @@ class Vectorstore():
             stopwatch_start = time.time()
 
 
-    def _existing_partitions(self):
+    def _glob_partitions(self):
         """Parse the geoparquet directory to find existing partitions."""
         
         partitions = glob(os.path.join(self.geoparquet_directory, '**/*.parquet'), recursive=True)
@@ -789,7 +821,7 @@ class Vectorstore():
             stopwatch_start = time.time()
                     
         # Potential source partitions for sharding and/or splitting
-        df_partitions = self._existing_partitions()
+        df_partitions = self._glob_partitions()
         
         # Exclude the highest partition level (self.target_level) from being sharded further
         df_source_partitions = df_partitions[df_partitions['partition_level']<self.target_level].sort_values(
@@ -802,7 +834,7 @@ class Vectorstore():
         for level in numpy.arange(min(df_source_partitions['partition_level']), self.max_level):
             if level>min(df_source_partitions['partition_level']):
                 # Update source partitions, since partitions may have changed
-                df_partitions = self._existing_partitions()
+                df_partitions = self._glob_partitions()
                 df_source_partitions = df_partitions[df_partitions['partition_level']<self.target_level].sort_values(
                     by='partition_level').reset_index(drop=True)
 
