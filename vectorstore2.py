@@ -42,7 +42,7 @@ class Vectorstore():
         to_parquet              Write entire GeoDataFrame (all partitions) to parquet.
         partial_upload          Register GeoDataFrame, create partition, and save parquet to disk.
         repartition             Repartrition parquet files to balance number of rows in each file.
-        index_vectorstore       Create a qtree spatial index for the entire dataset.
+        reindex                 (Re-)create a qtree spatial index for the entire dataset.
 
     """
 
@@ -357,71 +357,6 @@ class Vectorstore():
         return gdf_tree, df_children
 
 
-    # def _index_dict(self):
-    #     """Create dictionaries containing entire bfs quadtrees (indexed by level) for every geometry id."""
-
-    #     if self.max_depth>0:
-    #         # List of q_keys by level and geometry ID
-    #         self.df_idx = self.df_root[[self.id_col, self.key_col]]
-    #         self.df_idx['level'] = self.df_idx[self.key_col].apply(lambda x: len(x)-2)
-    #         self.df_idx['level'] = self.df_idx['level'].astype(str) #debug
-
-    #         # Group all the keys at the same level together in a list
-    #         self.df_idx = self.df_idx.groupby(
-    #             [self.id_col, 'level']
-    #         )[self.key_col].apply(list).reset_index(level=0)
-            
-    #         # Dictionaries containing entire bfs quadtrees (indexed by level) for every geometry id
-    #         self.df_idx = self.df_idx.groupby(
-    #             self.id_col
-    #         ).apply(lambda x: x[self.key_col].to_dict()).rename(self.qtree_col).reset_index()
-            
-    #         self.df_idx = pandas.merge(
-    #             self.df_root,
-    #             self.df_idx,
-    #             on=self.id_col,
-    #         )
-    #     else:
-    #         self.df_idx = self.df_root.copy()
-    #         self.df_idx[self.qtree_col] = None
-    #         # self.df_idx['level'] = self.df_idx[self.key_col].apply(lambda x: len(x)-2)
-    #         # self.df_idx[self.qtree_col] = self.df_idx[['level', self.key_col]].apply(lambda row: {row[0]: [row[1]]}, axis=1)
-
-
-    # def _dict_index_partition(self, temporal_partition, spatial_partition):
-    #     """Create a qtree spatial index for a specific partition."""
-
-    #     filepath = self._filepath(temporal_partition, spatial_partition)
-    #     gdf_index = geopandas.read_parquet(filepath, columns=[self.id_col, self.geom_col, self.key_col])
-    #     gdf_index['_rootlevel'] = gdf_index[self.key_col].apply(lambda x: len(x)-2)
-        
-    #     if self.max_depth>0:
-    #         # List of q_keys by level and geometry ID
-    #         self.df_idx = self.gdf_concat[[self.id_col, 'level', self.key_col]]
-    #         self.df_idx['level'] = self.df_idx['level'].astype(str) #debug
-
-    #         # Group all the keys at the same level together in a list
-    #         self.df_idx = self.df_idx.groupby(
-    #             [self.id_col, 'level']
-    #         )[self.key_col].apply(list).reset_index(level=0)
-            
-    #         # Dictionaries containing entire bfs quadtrees (indexed by level) for every geometry id
-    #         self.df_idx = self.df_idx.groupby(
-    #             self.id_col
-    #         ).apply(lambda x: x[self.key_col].to_dict()).rename(self.qtree_col).reset_index()
-            
-    #         self.df_idx = pandas.merge(
-    #             self.df_root,
-    #             self.df_idx,
-    #             on=self.id_col,
-    #         )
-    #     else:
-    #         self.df_idx = self.df_root.copy()
-    #         self.df_idx[self.qtree_col] = None
-    #         # self.df_idx['level'] = self.df_idx[self.key_col].apply(lambda x: len(x)-2)
-    #         # self.df_idx[self.qtree_col] = self.df_idx[['level', self.key_col]].apply(lambda row: {row[0]: [row[1]]}, axis=1)
-
-
     def register_geodataframe(self, gdf):
         """Calculate the root index for each unique geometry.
 
@@ -448,151 +383,6 @@ class Vectorstore():
             print('df_root', len(self.df_root))
             print('Time for indexing the root of each unique geometry in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
-
-    
-    def index_vectorstore(self, temporal_partition):
-        """Create a qtree spatial index for the entire dataset."""
-        
-        if self.verbose:
-            stopwatch_start = time.time()
-
-        spatial_partitions = sorted(self._glob_partitions()['partition'])
-        for spatial_partition in spatial_partitions:
-            print('spatial_partition', spatial_partition)
-            self._index_partition(temporal_partition, spatial_partition)
-
-        if self.verbose:
-            print('Time to index entire vectorstore', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-
-    
-    def _index_partition(self, temporal_partition, spatial_partition):
-        """Create a qtree spatial index for a specific partition."""
-
-        filepath = self._filepath(temporal_partition, spatial_partition)
-        gdf = geopandas.read_parquet(filepath, columns=[self.id_col, self.geom_col, self.key_col])
-        
-        gdf_idx = self._index_geodataframe(gdf)
-
-        # ToDo: maybe we need to allow appending similar to _to_parquet method
-        filepath_idx = self._filepath_idx(temporal_partition, spatial_partition)
-        gdf_idx.to_parquet(
-            path=filepath_idx,
-            row_group_size=100000,
-            engine='pyarrow',
-            compression='snappy',
-            #partition_cols=self.partition_cols
-        )
-
-
-    def _index_geodataframe(self, gdf):
-        """Calculate the qtree index, and target keys at target_level for each geometry where possible.
-
-        Create spatial index, aligned with GeoDN raster data.
-        This method is typically run on each vectorstore partition separately.
-        :param gdf:  Geopandas GeoDataFrame to be indexed.
-        """
-        if self.verbose:
-            stopwatch_start = time.time()
-
-        assert(self.geom_col in gdf.columns)
-        assert(self.id_col in gdf.columns)
-
-        cols = [self.id_col, self.geom_col]
-        if self.key_col in gdf.columns:
-            cols += [self.key_col]
-            
-        # Drop duplicate geometries before calculating spatial index (e.g. when we have multiple timestamps for the same geometry) 
-        gdf_unique = gdf[cols].drop_duplicates(subset=self.id_col).reset_index(drop=True)
-        if self.verbose:
-            print('gdf_unique', len(gdf_unique))
-
-        if self.key_col not in gdf.columns:
-            # Fast algorithm for smallest z-order squares that still contain the entire geometries.
-            gdf_unique = self._index_root(gdf_unique)
-            if self.verbose:
-                print('Time for _index_root (A1) in seconds', round(time.time()-stopwatch_start, 3))
-                stopwatch_start = time.time()
-
-        # gdf_idx builds upon the root geometries
-        self.gdf_idx = gdf_unique.copy()
-        self.gdf_idx['depth_0'] = self.gdf_idx[self.key_col]
-        
-        # Remember the geometries that have already reached the target level
-        self.gdf_target = gdf_unique[gdf_unique[self.key_col].apply(len)>=self.target_level+2].reset_index(
-            drop=True)[[self.id_col, self.key_col]]
-        print('gdf_target', len(self.gdf_target))
-        
-        # Determine the geometries for which we have to build an entire quadtree, rather than just the root node.
-        gdf_tree = gdf_unique[gdf_unique[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True)
-        print('gdf_tree  ', len(gdf_tree))
-
-        depth = 0
-        initial_length = len(gdf_unique)
-        final_iteration = False
-        while depth < self.max_depth:
-            depth+=1
-            if depth==self.max_depth:
-                final_iteration = True
-            if len(gdf_tree)>0:
-                gdf_tree, df_children = self._recursive_bfs(gdf_tree, depth, initial_length, final_iteration)
-                # debug
-                # self.gdf_tree = gdf_tree
-                # self.df_children = df_children
-            else:
-                break
-            if self.verbose:
-                print('depth:', depth, '   gdf_idx:', len(self.gdf_idx))
-
-        if self.verbose:
-            print('Time for recursive BFS (A) in seconds', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-
-        # Finalize the quadtree index
-        levels = [self.target_level]
-        idx_cols = sorted(['idx_' + str(l) for l in levels])
-        self._depth_to_level(levels = levels)
-        self.gdf_idx = self.gdf_idx[[self.id_col] + idx_cols + [self.key_col]]
-
-        # Add a geometry column for the index bounds
-        self.gdf_idx['idx_bounds'] = self._base4_to_box(self.gdf_idx['idx_'+str(self.target_level)])
-        self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry='idx_bounds').set_crs(self.morton.grid.crs)
-        
-        # Check for spatial containment
-        df2 = self.gdf_idx[[self.id_col]].merge(
-            gdf_unique[[self.id_col, self.geom_col]],
-            on=self.id_col,
-            how='left'
-        )
-        df2 = geopandas.GeoDataFrame(df2)
-        self.gdf_idx['contained'] = False
-        self.gdf_idx.loc[df2.contains(self.gdf_idx), 'contained'] = True
-
-        if self.verbose:
-            print('Time for finalizing gdf_idx (B) in seconds', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-
-        # debug: We may not need to expose gdf_target outside this function. 
-        #        If so, del self.gdf_target
-        # Finalize the target cells
-        self.gdf_target[self.key_col] = self.gdf_target[self.key_col].apply(lambda x: x[:self.target_level+2])
-        self.gdf_target['level'] = self.gdf_target[self.key_col].apply(lambda x: len(x)-2)
-        self.gdf_target['geometry'] = self._base4_to_box(self.gdf_target[self.key_col])
-        self.gdf_target = geopandas.GeoDataFrame(self.gdf_target)
-        self.gdf_target = self.gdf_target.sort_values(by=[self.key_col, 'level', self.id_col]).reset_index(drop=True)
-
-        if self.verbose:
-            print('Time for finalizing gdf_target (C) in seconds', round(time.time()-stopwatch_start, 3))
-            stopwatch_start = time.time()
-
-        # # Create dictionaries containing entire bfs quadtrees (indexed by level) for every geometry id.
-        # self._index_dict()
-        
-        # if self.verbose:
-        #     print('Time for creating df_idx (D) in seconds', round(time.time()-stopwatch_start, 3))
-        #     stopwatch_start = time.time()
-
-        return self.gdf_idx
 
     
     def create_partitions(self, target_rows=100000):
@@ -692,6 +482,18 @@ class Vectorstore():
         return df_partitions
 
 
+    def _glob_indexfiles(self):
+        """Parse the index directory to find existing indices."""
+        
+        indices = glob(os.path.join(self.index_directory, '**/*.parquet'), recursive=True)
+        indices = [os.path.splitext(os.path.basename(f))[0] for f in indices]
+        df_indices = pandas.DataFrame({
+            'indices': indices,
+            'index_level': [len(p)-2 for p in indices],
+        }).sort_values(by=['index_level', 'indices']).reset_index(drop=True)
+        return df_indices
+
+    
     def _shard(self, temporal_partition, source_partition, target_partitions):
         """Shard the contents of source_partition to higher-resolution existing partitions whenever possible."""
 
@@ -975,12 +777,180 @@ class Vectorstore():
         )
         return gdf_part
 
+
+    def reindex(self, temporal_partition):
+        """(Re-)create a qtree spatial index for the entire dataset."""
+
+        if self.verbose:
+            stopwatch_start = time.time()
+
+        # Start from a clean slate
+        indices = sorted(self._glob_indexfiles()['indices'])
+        for index in indices:
+            filepath = self._filepath_idx({}, index)
+            os.remove(filepath)
+
+        # Reindex each partition
+        spatial_partitions = sorted(self._glob_partitions()['partition'])
+        for spatial_partition in spatial_partitions:
+            
+            print('spatial_partition', spatial_partition)
+            filepath = self._filepath(temporal_partition, spatial_partition)
+            gdf_part = geopandas.read_parquet(filepath, columns=[self.id_col, self.geom_col, self.key_col])
+            self._index_to_parquet(temporal_partition, spatial_partition, gdf_part=gdf_part)
+
+        if self.verbose:
+            print('Time to index entire dataset', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
+
+    
+    def _index_geodataframe(self, gdf):
+        """Calculate the qtree index, and target keys at target_level for each geometry where possible.
+
+        Create spatial index, aligned with GeoDN raster data.
+        This method is typically run on each vectorstore partition separately.
+        :param gdf:  Geopandas GeoDataFrame to be indexed.
+        """
+        if self.verbose:
+            stopwatch_start = time.time()
+
+        assert(self.geom_col in gdf.columns)
+        assert(self.id_col in gdf.columns)
+
+        cols = [self.id_col, self.geom_col]
+        if self.key_col in gdf.columns:
+            cols += [self.key_col]
+            
+        # Drop duplicate geometries before calculating spatial index (e.g. when we have multiple timestamps for the same geometry) 
+        gdf_unique = gdf[cols].drop_duplicates(subset=self.id_col).reset_index(drop=True)
+        if self.verbose:
+            print('gdf_unique', len(gdf_unique))
+
+        if self.key_col not in gdf.columns:
+            # Fast algorithm for smallest z-order squares that still contain the entire geometries.
+            gdf_unique = self._index_root(gdf_unique)
+            if self.verbose:
+                print('Time for _index_root (A1) in seconds', round(time.time()-stopwatch_start, 3))
+                stopwatch_start = time.time()
+
+        # gdf_idx builds upon the root geometries
+        self.gdf_idx = gdf_unique.copy()
+        self.gdf_idx['depth_0'] = self.gdf_idx[self.key_col]
+        
+        # Remember the geometries that have already reached the target level
+        self.gdf_target = gdf_unique[gdf_unique[self.key_col].apply(len)>=self.target_level+2].reset_index(
+            drop=True)[[self.id_col, self.key_col]]
+        
+        # Determine the geometries for which we have to build an entire quadtree, rather than just the root node.
+        gdf_tree = gdf_unique[gdf_unique[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True)
+
+        depth = 0
+        initial_length = len(gdf_unique)
+        final_iteration = False
+        while depth < self.max_depth:
+            depth+=1
+            if depth==self.max_depth:
+                final_iteration = True
+            if len(gdf_tree)>0:
+                gdf_tree, df_children = self._recursive_bfs(gdf_tree, depth, initial_length, final_iteration)
+                # debug
+                # self.gdf_tree = gdf_tree
+                # self.df_children = df_children
+            else:
+                break
+            if self.verbose:
+                print('depth:', depth, '   gdf_idx:', len(self.gdf_idx))
+
+        if self.verbose:
+            print('Time for recursive BFS (A) in seconds', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
+
+        # Finalize the quadtree index
+        levels = [self.target_level]
+        idx_cols = sorted(['idx_' + str(l) for l in levels])
+        self._depth_to_level(levels = levels)
+        self.gdf_idx = self.gdf_idx[[self.id_col] + idx_cols + [self.key_col]]
+
+        # Add a geometry column for the index bounds
+        self.gdf_idx['idx_bounds'] = self._base4_to_box(self.gdf_idx['idx_'+str(self.target_level)])
+        self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry='idx_bounds').set_crs(self.morton.grid.crs)
+        
+        # Check for spatial containment
+        df2 = self.gdf_idx[[self.id_col]].merge(
+            gdf_unique[[self.id_col, self.geom_col]],
+            on=self.id_col,
+            how='left'
+        )
+        df2 = geopandas.GeoDataFrame(df2)
+        self.gdf_idx['contained'] = False
+        self.gdf_idx.loc[df2.contains(self.gdf_idx), 'contained'] = True
+
+        if self.verbose:
+            print('Time for finalizing gdf_idx (B) in seconds', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
+
+        # debug: We may not need to expose gdf_target outside this function. 
+        #        If so, del self.gdf_target
+        # Finalize the target cells
+        self.gdf_target[self.key_col] = self.gdf_target[self.key_col].apply(lambda x: x[:self.target_level+2])
+        self.gdf_target['level'] = self.gdf_target[self.key_col].apply(lambda x: len(x)-2)
+        self.gdf_target['geometry'] = self._base4_to_box(self.gdf_target[self.key_col])
+        self.gdf_target = geopandas.GeoDataFrame(self.gdf_target)
+        self.gdf_target = self.gdf_target.sort_values(by=[self.key_col, 'level', self.id_col]).reset_index(drop=True)
+
+        if self.verbose:
+            print('Time for finalizing gdf_target (C) in seconds', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
+
+        return self.gdf_idx
+
+    
+    def _index_to_parquet(self, temporal_partition, spatial_partition, gdf_part=None, append=False):
+        """Create a qtree spatial index for a specific partition."""
+
+        if gdf_part is None:
+            # Creating gdf_part from latest self.gdf_ingest
+            gdf_part = self._filter_partition(temporal_partition, spatial_partition)
+
+        # Only a few columns are needed for the index
+        gdf_part = gdf_part[[self.id_col, self.geom_col, self.key_col]]
+
+        # Create the index
+        gdf_idx = self._index_geodataframe(gdf_part)
+        
+        filepath_idx = self._filepath_idx(temporal_partition, spatial_partition)
+        if append:
+            try:
+                # See if there is something already present
+                gdf_idx_existing = geopandas.read_parquet(filepath_idx)
+            except IOError:
+                pass
+            else:
+                # Merge by concatenating and dropping duplicates (keeping the newer version)
+                idx_cols = [c for c in gdf_idx.columns if c.startswith('idx_')]
+                gdf_idx = pandas.concat([gdf_idx_existing, gdf_idx]).drop_duplicates(
+                    subset=[self.id_col]+idx_cols,
+                    keep='last',
+                )
+
+        # ToDo: maybe we need to allow appending similar to _to_parquet method
+        gdf_idx.to_parquet(
+            path=filepath_idx,
+            row_group_size=100000,
+            engine='pyarrow',
+            compression='snappy',
+            #partition_cols=self.partition_cols
+        )
+
     
     def _to_parquet(self, temporal_partition, spatial_partition, gdf_part=None, append=False):
         """Write GeoDataFrame partition to parquet."""
+        
         if gdf_part is None:
+            # Creating gdf_part from latest self.gdf_ingest
             gdf_part = self._filter_partition(temporal_partition, spatial_partition)
         debug_len_part = len(gdf_part)
+
         filepath = self._filepath(temporal_partition, spatial_partition)
         if append:
             try:
@@ -992,9 +962,6 @@ class Vectorstore():
                 pass
             else:
                 # Merge by concatenating and dropping duplicates (keeping the newer version)
-                # print('debug gdf_part', len(gdf_part))
-                # print('gdf_existing', gdf_existing)
-                # print('gdf_part', gdf_part)
                 gdf_part = pandas.concat([gdf_existing, gdf_part]).drop_duplicates(
                     subset=[self.dt_col, self.id_col]+['dimension_' + d for d in self.dimension_values],
                     keep='last',
@@ -1009,11 +976,6 @@ class Vectorstore():
                 by=[self.dt_col]+['dimension_' + d for d in self.dimension_values]+[self.key_col]
             ).reset_index(drop=True)
 
-            # # debug 
-            # if self.qtree_col in gdf_part.columns:
-            #     #gdf_part[self.qtree_col] = gdf_part[self.qtree_col].apply(lambda x: json.dumps(x, indent=0))
-            #     gdf_part[self.qtree_col] = gdf_part[self.qtree_col].astype(str)
-
             gdf_part.to_parquet(
                 path=filepath,
                 row_group_size=100000,
@@ -1023,7 +985,7 @@ class Vectorstore():
             )
 
 
-    def to_parquet(self, append=False):
+    def to_parquet(self, append=False, index=False):
         """Write entire GeoDataFrame (all partitions) to parquet."""
         if self.verbose:
             stopwatch_start = time.time()
@@ -1031,17 +993,25 @@ class Vectorstore():
         for spatial_partition in sorted(self.gdf_partition['partition'].drop_duplicates()):
             # To do: loop through temporal partitions (and other dimensions that we choose to make into partitions.
             temporal_partition = {}
+
+            # Write the data to parquet partitions
             self._to_parquet(temporal_partition, spatial_partition, append=append)
+            
+            if index:
+                # Write the index to parquet
+                self._index_to_parquet(temporal_partition, spatial_partition, append=append)
 
         if self.verbose:
             print('Time for writing GeoDataFrame to GeoParquet partitions', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
 
-    def partial_upload(self, gdf, target_rows=100000):
+    def partial_upload(self, gdf, target_rows=100000, index=False):
         """Register GeoDataFrame, create partition, and save parquet to disk.
 
-        :param gdf:    Geopandas GeoDataFrame to be indexed and written to disk.
+        :param gdf:         Geopandas GeoDataFrame to be indexed and written to disk.
+        :param target_rows: Number of rows of typical partition.
+        :param index:       Flag whether to create spatial index.
         """
         # We will be appending to existing partitions
         APPEND = True
@@ -1052,8 +1022,8 @@ class Vectorstore():
         # Create suggestions for parquet file partitions
         self.create_partitions(target_rows)
 
-        # Write the vectorstore to parquet
-        self.to_parquet(append=APPEND)
+        # Write the dataset to parquet
+        self.to_parquet(append=APPEND, index=index)
 
 
     def _read_parquet(
@@ -1104,56 +1074,6 @@ class Vectorstore():
 
 
 
-    # def _spatialPartitionLevel(self, sp):
-    #     return int(sp.split(self.spatial_partition_identifier)[-1])
-    
-    # def _create_spatial_partition_columns(self, gdf):
-    #     for sp in self.spatial_partitions:
-    #         levels_up = self.spatial_level - self._spatialPartitionLevel(sp)
-    #         gdf[sp] = self.morton.parent_key(numpy.array(gdf[self.spatial_key_col]), levels_up)
-    
-    # def _get_partitions(self):
-    #     if self.partition_order=='spatial_before_temporal':
-    #         self.partitions = self.spatial_partitions + self.temporal_partitions
-    #     elif self.partition_order=='temporal_before_spatial':
-    #         self.partitions = self.temporal_partitions + self.spatial_partitions
-    #     else:
-    #         raise ValueError("Invalid partition_order %s" % repr(self.partition_order))
-            
-    # def _create_filter_key_column(self, gdf, level): 
-    #     # Bottom left keys
-    #     gdf[f'filter_key_level{level}'] = self.morton.get_key(numpy.array(gdf['bb_miny']), numpy.array(gdf['bb_minx']), level)
-    #     # Top_right_keys
-    #     top_right_keys = self.morton.get_key(numpy.array(gdf['bb_maxy']), numpy.array(gdf['bb_maxx']), level)
-        
-    #     # Overwrite in cases where there would be more than one cell
-    #     gdf.loc[gdf[f'filter_key_level{level}']!=top_right_keys, f'filter_key_level{level}'] = numpy.nan
-
-    # def _create_filter_key_columns(self, gdf, epsilon=None):
-    #     gdf_unique = gdf[[self.id_col, self.geom_col]].drop_duplicates(subset=self.id_col).reset_index(drop=True)
-    #     del gdf_unique[self.id_col]
-    #     gdf_unique[['bb_minx', 'bb_miny', 'bb_maxx', 'bb_maxy']] = gdf_unique[self.geom_col].apply(lambda x: x.bounds).to_list()
-        
-    #     # Rounding errors can lead to duplication of geometries with edges along cell boundaries
-    #     if epsilon is not None:
-    #         # Negative buffer by something like epsilon=1e-13
-    #         gdf_unique['bb_minx'] += epsilon
-    #         gdf_unique['bb_miny'] += epsilon
-    #         gdf_unique['bb_maxx'] -= epsilon
-    #         gdf_unique['bb_maxy'] -= epsilon
-        
-    #     # Efficient way of getting the bounding-box keys 
-    #     for level in self.filter_key_levels:
-    #         self._create_filter_key_column(gdf_unique, level)
-            
-    #     # Decide here if we want to keep the geometry bounds or delete them
-    #     del gdf_unique['bb_minx']
-    #     del gdf_unique['bb_miny']
-    #     del gdf_unique['bb_maxx']
-    #     del gdf_unique['bb_maxy']
-        
-    #     return pandas.merge(gdf, gdf_unique, on=self.geom_col)
-
     # def _generate_composite_keys(self, df):
     #     """
     #     Combine the temporal, spatial and dimension keys into one "composite_key"
@@ -1179,18 +1099,6 @@ class Vectorstore():
     #         df[k] = df[self.composite_key_col].apply(lambda x: x.split(k+'_')[1].split('_')[0]) # Dimension keys are of type str
     #     return df[cols]
 
-    # def _select_parquet_file(self, gdf, composite_key):
-    #     gdf_part = gdf[gdf[self.composite_key_col]==composite_key].reset_index(drop=True)
-    #     filepath = self.dataset_directory
-    #     for partition_name in self.partitions:
-    #         partition_value = gdf_part.loc[0, partition_name]
-    #         filepath = os.path.join(filepath, partition_name + '_' + str(partition_value))
-    #     if not os.path.exists(filepath):
-    #         os.makedirs(filepath)
-    #     filename = '_'.join([self.dataset, composite_key]) + '.parquet'
-    #     filepath = os.path.join(filepath, filename)
-    #     return gdf_part, filepath
-    
     # def _all_the_same(self, s):
     #     # Quick test if column values (pandas series s) are all the same
     #     a = s.to_numpy()
