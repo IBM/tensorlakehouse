@@ -57,7 +57,7 @@ class Vectorstore():
     ID_COL                     = 'geom_id'
     KEY_COL                    = '_root' #'q_key'
     QTREE_COL                  = '_qtree'
-    IDX_GEOM_COL               = 'idx_bounds'
+    IDX_BOX_COL                = 'idx_bounds'
     GEOM_AREA_COL              = 'geom_area'
     GEOM_LENGTH_COL            = 'geom_length'
 
@@ -94,7 +94,7 @@ class Vectorstore():
         id_col = None,
         key_col = None,
         qtree_col = None,
-        idx_geom_col = None,
+        idx_box_col = None,
         geom_area_col = None, 
         geom_length_col = None, 
         max_level = None,
@@ -147,7 +147,7 @@ class Vectorstore():
             raise ValueError("Geopandas dependencies require geom_col to be named geometry." )
         self.geom_col = self.GEOM_COL
         self.id_col = self.ID_COL if id_col is None else id_col
-        self.idx_geom_col = self.IDX_GEOM_COL if idx_geom_col is None else idx_geom_col
+        self.idx_box_col = self.IDX_BOX_COL if idx_box_col is None else idx_box_col
 
         self.max_level = self.morton.grid.max_levels if max_level is None else max_level
         self.target_level = self.TARGET_LEVEL if target_level is None else target_level
@@ -874,16 +874,27 @@ class Vectorstore():
         # Add a geometry column for the index bounds
         self.gdf_idx['idx_bounds'] = self._base4_to_box(self.gdf_idx['idx_'+str(self.target_level)])
         self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry='idx_bounds').set_crs(self.morton.grid.crs)
-        
-        # Check for spatial containment
-        df2 = self.gdf_idx[[self.id_col]].merge(
-            gdf_unique[[self.id_col, self.geom_col]],
+
+        # Add the original geometry column (we will cut the polygons below)
+        self.gdf_idx = gdf_unique[[self.id_col, self.geom_col]].merge(
+            self.gdf_idx,
             on=self.id_col,
-            how='left'
+            how='right',            
         )
-        df2 = geopandas.GeoDataFrame(df2)
-        self.gdf_idx['contained'] = False
-        self.gdf_idx.loc[df2.contains(self.gdf_idx), 'contained'] = True
+
+        # Negative buffer by something like epsilon=1e-13
+        # Removing the annoying buffer warning
+        s_bounds = self.gdf_idx['idx_bounds']
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            s_bounds = s_bounds.buffer(-self.morton.epsilon)
+        # debug: maybe this needs to be made permanent in column 'idx_bounds' ?
+
+        # Check for spatial containment of quadtree boxes within the original geometries
+        self.gdf_idx['contained'] = self.gdf_idx.contains(s_bounds)
+        
+        # Add a geometry column containing the intersection of index bounds and original geometry
+        self.gdf_idx[self.geom_col] = self.gdf_idx.intersection(s_bounds)
 
         if self.verbose:
             print('Time for finalizing gdf_idx (B) in seconds', round(time.time()-stopwatch_start, 3))
