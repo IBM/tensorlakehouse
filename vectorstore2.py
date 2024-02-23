@@ -56,6 +56,7 @@ class Vectorstore():
     GEOM_COL                   = 'geometry'
     ID_COL                     = 'geom_id'
     KEY_COL                    = '_root' #'q_key'
+    IDX_COL                    = '_idx'
     QTREE_COL                  = '_qtree'
     IDX_BOX_COL                = 'idx_bounds'
     GEOM_AREA_COL              = 'geom_area'
@@ -93,6 +94,7 @@ class Vectorstore():
         geom_col = None, 
         id_col = None,
         key_col = None,
+        idx_col = None,
         qtree_col = None,
         idx_box_col = None,
         geom_area_col = None, 
@@ -142,6 +144,7 @@ class Vectorstore():
         # Table specific column information
         self.dt_col = self.DT_COL if dt_col is None else dt_col
         self.key_col = self.KEY_COL if key_col is None else key_col
+        self.idx_col = self.IDX_COL if idx_col is None else idx_col
         self.qtree_col = self.QTREE_COL if qtree_col is None else qtree_col
         if (geom_col is not None) and (geom_col!=self.GEOM_COL):
             raise ValueError("Geopandas dependencies require geom_col to be named geometry." )
@@ -225,7 +228,7 @@ class Vectorstore():
         # Try vectorized (numpy) version of base4_to_box first
         try:
             df_unique['geometry'] = self.morton.base4_to_box(df_unique[self.key_col])
-        except OverflowError as e:
+        except (OverflowError, ValueError) as e:
             print(e)
             print('Failed to use numpy. Switching to pandas')
             df_unique['geometry'] = df_unique[self.key_col].apply(self.morton.base4_to_box)
@@ -255,106 +258,42 @@ class Vectorstore():
             return None
     
     
-    def _depth_to_level(self, levels=None):
+    def _depth_to_level(self, level=None):
         """Translate the key by depth columns to key by level columns."""
 
-        if levels is None:
-            #levels = numpy.arange(self.target_level, -1, -1)
+        if level is None:
             # We only need the target level. Low-res can be generated using subscription [:level+2]
-            levels = [self.target_level]
+            level = self.target_level
 
         for depth in numpy.arange(self.max_depth, -1, -1):
             if 'depth_'+str(depth) in self.gdf_idx.columns:
-                for level in levels:
-                    if 'idx_'+str(level) not in self.gdf_idx.columns:
-                        self.gdf_idx['idx_'+str(level)] = self.gdf_idx['depth_'+str(depth)].apply(
-                            lambda x: self._nan_subscribe(x, level)
-                        )
-                    else:
-                        self.gdf_idx['idx_'+str(level)] = self.gdf_idx['idx_'+str(level)].fillna(
-                            self.gdf_idx['depth_'+str(depth)].apply(lambda x: self._nan_subscribe(x, level))
-                        )
+                if self.idx_col not in self.gdf_idx.columns:
+                    self.gdf_idx[self.idx_col] = self.gdf_idx['depth_'+str(depth)].apply(
+                        lambda x: self._nan_subscribe(x, level)
+                    )
+                else:
+                    self.gdf_idx[self.idx_col] = self.gdf_idx[self.idx_col].fillna(
+                        self.gdf_idx['depth_'+str(depth)].apply(lambda x: self._nan_subscribe(x, level))
+                    )
 
-
-    def _recursive_bfs(self, gdf_tree, depth, initial_length=None, final_iteration=False):
-        """Calculate the next level of children keys."""
     
-        # Generate 4 child columns representing the 4 quadrants we need to check for intersections
-        df_children = pandas.DataFrame(
-            gdf_tree[self.key_col].apply(lambda x: self._children(x)).to_list(),
-            columns=self.CHILDREN
-        )
-        
-        # Create the children bounding boxes
-        for child in self.CHILDREN:
-            df_children[child + '_bounds'] = self._base4_to_box(df_children[child])
+    # def _depth_to_levels(self, levels=None):
+    #     """Translate the key by depth columns to key by level columns."""
 
-        # Check for intersection of original geometry with children
-        for child in self.CHILDREN:
-            mask = gdf_tree.intersects(
-                geopandas.GeoSeries(df_children[child + '_bounds']).set_crs(self.morton.grid.crs)
-            )
-            df_children[child] = df_children[child].where(mask)
-        
-        # Stack the child spatial keys and bounding geometries
-        df1 = pandas.concat([gdf_tree[self.id_col], df_children], axis=1)
-        df_children = pandas.DataFrame()
-        for child in self.CHILDREN:
-            df2 = df1[[self.id_col, child, child+'_bounds']].dropna().rename(columns={
-                child: self.key_col,
-                child+'_bounds': 'idx_bounds',
-            })
-            df_children = pandas.concat([df_children, df2])
-        df_children = df_children.reset_index(drop=True)
+    #     if levels is None:
+    #         levels = numpy.arange(self.target_level, -1, -1)
 
-        # spatial index as broad DataFrame
-        df = df_children[[self.id_col, self.key_col]].rename(columns={self.key_col: 'depth_'+str(depth)})
-        df['depth_'+str(depth-1)] = df['depth_'+str(depth)].apply(lambda x: x[:-1])
-        self.gdf_idx = pandas.merge(self.gdf_idx, df, on=[self.id_col, 'depth_'+str(depth-1)], how='outer')
-
-        # Remember the keys that have reached the target level
-        self.gdf_target = pandas.concat([
-            self.gdf_target,
-            df_children[df_children[self.key_col].apply(len)>=self.target_level+2].reset_index(
-                drop=True)[self.gdf_target.columns],
-        ]).reset_index(drop=True)
-
-        if (self.max_inflation is not None) and (initial_length is not None):
-            if len(self.gdf_idx) > initial_length * self.max_inflation:
-                # Break even befor max_depth is reached
-                final_iteration = True
-
-        # Update the keys we need to work on in the next iteration
-        gdf_tree = pandas.merge(
-            gdf_tree[[self.id_col, 'geometry']].drop_duplicates(),
-            df_children[df_children[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True),
-            on=self.id_col,
-        )
-
-        # Assign fully contained nodes from further splitting considerations.
-        gdf1 = gdf_tree[gdf_tree.contains(
-            geopandas.GeoSeries(gdf_tree['idx_bounds']).set_crs(self.morton.grid.crs)
-        )].reset_index(drop=True)
-
-        gdf_tree = gdf_tree[~gdf_tree.contains(
-            geopandas.GeoSeries(gdf_tree['idx_bounds']).set_crs(self.morton.grid.crs)
-        )].reset_index(drop=True)
-
-        if final_iteration:
-            # Everything remaining needs to be assigned to gdf_target
-            self.gdf_target = pandas.concat([
-                self.gdf_target,
-                df_children[df_children[self.key_col].apply(len)<self.target_level+2].reset_index(drop=True),
-            ]).reset_index(drop=True)[self.gdf_target.columns]
-            
-        else:
-            # Assign fully contained nodes to gdf_target
-            self.gdf_target = pandas.concat([
-                self.gdf_target,
-                gdf1[self.gdf_target.columns]
-            ]).reset_index(drop=True)
-
-        return gdf_tree, df_children
+    #     for depth in numpy.arange(self.max_depth, -1, -1):
+    #         if 'depth_'+str(depth) in self.gdf_idx.columns:
+    #             for level in levels:
+    #                 if 'idx_'+str(level) not in self.gdf_idx.columns:
+    #                     self.gdf_idx['idx_'+str(level)] = self.gdf_idx['depth_'+str(depth)].apply(
+    #                         lambda x: self._nan_subscribe(x, level)
+    #                     )
+    #                 else:
+    #                     self.gdf_idx['idx_'+str(level)] = self.gdf_idx['idx_'+str(level)].fillna(
+    #                         self.gdf_idx['depth_'+str(depth)].apply(lambda x: self._nan_subscribe(x, level))
+    #                     )
 
 
     def register_geodataframe(self, gdf):
@@ -431,7 +370,7 @@ class Vectorstore():
                             l-=1
                             break
 
-                    df_level['partition'] = df_level.loc[0, self.key_col][:l+2]
+                    df_level['partition'] = df_level[self.key_col].iloc[0][:l+2]
 
                 # Separate the keys with number of rows above target_rows
                 self.gdf_partition = pandas.concat([
@@ -803,8 +742,279 @@ class Vectorstore():
             print('Time to index entire dataset', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
+
+    def _step_recursive_bfs(self, gdf_tree, depth, initial_length=None, final_iteration=False, key_col=None, id_col=None):
+        """Calculate the next level of children keys."""
+        if key_col is None:
+            key_col = self.key_col
+        if id_col is None:
+            id_col = self.id_col
     
-    def _index_geodataframe(self, gdf):
+        # Generate 4 child columns representing the 4 quadrants we need to check for intersections
+        df_children = pandas.DataFrame(
+            gdf_tree[key_col].apply(lambda x: self._children(x)).to_list(),
+            columns=self.CHILDREN
+        )
+        
+        # Create the children bounding boxes
+        for child in self.CHILDREN:
+            df_children[child + '_bounds'] = self._base4_to_box(df_children[child])
+
+        # Check for intersection of original geometry with children
+        for child in self.CHILDREN:
+            mask1 = gdf_tree.intersects(
+                geopandas.GeoSeries(df_children[child + '_bounds']).set_crs(self.morton.grid.crs)
+            )
+            df_children[child] = df_children[child].where(mask1)
+        
+        # Stack the child spatial keys and bounding geometries
+        df1 = pandas.concat([gdf_tree[id_col], df_children], axis=1)
+        df_children = pandas.DataFrame()
+        for child in self.CHILDREN:
+            df2 = df1[[id_col, child, child+'_bounds']].dropna().rename(columns={
+                child: key_col,
+                child+'_bounds': 'idx_bounds',
+            })
+            df_children = pandas.concat([df_children, df2])
+        df_children = df_children.reset_index(drop=True)
+
+        # spatial index as broad DataFrame
+        df = df_children[[id_col, key_col]].rename(columns={key_col: 'depth_'+str(depth)})
+        df['depth_'+str(depth-1)] = df['depth_'+str(depth)].apply(lambda x: x[:-1])
+        self.gdf_idx = pandas.merge(self.gdf_idx, df, on=[id_col, 'depth_'+str(depth-1)], how='outer')
+
+        # Update the keys we need to work on in the next iteration
+        mask2 = df_children[key_col].apply(len)>=self.target_level+2
+        gdf_tree = pandas.merge(
+            gdf_tree[[id_col, 'geometry']].drop_duplicates(),
+            df_children[~mask2].reset_index(drop=True),
+            on=id_col,
+        )
+
+        # Assign fully contained nodes from further splitting considerations.
+        mask3 = gdf_tree.contains(geopandas.GeoSeries(gdf_tree['idx_bounds']).set_crs(self.morton.grid.crs))
+        
+        gdf1 = gdf_tree[mask3].reset_index(drop=True)
+        gdf_tree = gdf_tree[~mask3].reset_index(drop=True)
+
+        return gdf_tree, df_children, final_iteration
+        
+
+    def _step_index_geodataframe(self, gdf, depth, key_col=None, id_col=None):
+        """Calculate the next level of qtree index where possible.
+
+        :param gdf:  Geopandas GeoDataFrame to be indexed.
+        """
+        if key_col is None:
+            key_col = self.key_col
+        if id_col is None:
+            id_col = self.id_col
+            
+        cols = [id_col, self.geom_col]
+        if key_col in gdf.columns:
+            cols += [key_col]
+            
+        # Drop duplicate geometries before calculating spatial index (e.g. when we have multiple timestamps for the same geometry) 
+        gdf_unique = gdf[cols].drop_duplicates(subset=id_col).reset_index(drop=True)
+
+        if key_col not in gdf.columns:
+            # Fast algorithm for smallest z-order squares that still contain the entire geometries.
+            gdf_unique = self._index_root(gdf_unique)
+
+        # gdf_idx builds upon the root geometries
+        self.gdf_idx = gdf_unique.copy()
+        self.gdf_idx['depth_'+str(depth-1)] = self.gdf_idx[key_col]
+        
+        # Determine the geometries for which we have to build an entire quadtree, rather than just the root node.
+        gdf_tree = gdf_unique[gdf_unique[key_col].apply(len)<self.target_level+2].reset_index(drop=True)
+
+        initial_length = len(gdf_unique)
+        final_iteration = False
+        if (depth < self.max_depth):
+            if depth==self.max_depth:
+                final_iteration = True
+            if len(gdf_tree)>0:
+                gdf_tree, df_children, final_iteration = self._step_recursive_bfs(
+                    gdf_tree, depth, initial_length, final_iteration, key_col=key_col, id_col=id_col)
+                #debug
+                self.gdf_tree = gdf_tree
+                self.df_children = df_children
+            if self.verbose:
+                print('depth:', depth, '   gdf_idx:', len(self.gdf_idx))
+
+        # Finalize the quadtree index
+        self._depth_to_level(level = self.target_level)
+        self.gdf_idx = self.gdf_idx[[id_col, self.idx_col, key_col]]
+
+        # Add a geometry column for the index bounds
+        self.gdf_idx['idx_bounds'] = self._base4_to_box(self.gdf_idx[self.idx_col])
+        self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry='idx_bounds').set_crs(self.morton.grid.crs)
+
+        # Add the original geometry column (we will cut the polygons below)
+        self.gdf_idx = gdf_unique[[id_col, self.geom_col]].merge(
+            self.gdf_idx,
+            on=id_col,
+            how='right',            
+        )
+
+        # Negative buffer by something like epsilon=1e-13
+        # Removing the annoying buffer warning
+        s_bounds = self.gdf_idx['idx_bounds']
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            s_bounds_buffer = s_bounds.buffer(-self.morton.epsilon)
+        # debug: maybe this needs to be made permanent in column 'idx_bounds' ?
+
+        # Check for spatial containment of quadtree boxes within the original geometries
+        self.gdf_idx['contained'] = self.gdf_idx.contains(s_bounds_buffer)
+        
+        # Add a geometry column containing the intersection of index bounds and original geometry
+        self.gdf_idx[self.geom_col] = self.gdf_idx.intersection(s_bounds)
+
+        return self.gdf_idx
+
+
+    def _index_geodataframe_aerial(self, gdf):
+        """Calculate the qtree index, and target keys at target_level for each geometry where possible.
+
+        Create spatial index, aligned with GeoDN raster data.
+        This method is typically run on each vectorstore partition separately.
+        :param gdf:  Geopandas GeoDataFrame to be indexed.
+        """
+        initial_length = len(gdf)
+        depth = 1
+        # First iteration returns a dataframe at depth 1
+        gdf2 = self._step_index_geodataframe(gdf, depth=depth) 
+        
+        gdf_finished = pandas.DataFrame()
+        while depth<self.max_depth:
+            depth+=1
+            # Create the id_col for the next iteration
+            gdf2 = gdf2.reset_index().rename(columns={'index': 'tmp_id'})
+            
+            # Use the generated index column as the key (root) for the next iteration
+            gdf2 = gdf2[[c for c in gdf2.columns if c!=self.key_col]]
+            gdf2 = gdf2.rename(columns={self.idx_col: self.key_col})
+            
+            # We can stop iterating when 
+            # (1) the geometry fully contains the cell associated with the key
+            mask1 = gdf2['contained']
+            # or (2) we ave reached the target level
+            mask2 = gdf2['_root'].apply(len)-2>=self.target_level
+            
+            gdf_finished = pandas.concat([gdf_finished, gdf2[mask1 | mask2]])
+            gdf2 = gdf2[(~mask1) & (~mask2)]
+        
+            if len(gdf2)==0:
+                # Done iterating
+                break
+        
+            if (
+                depth==self.max_depth
+            ) or (
+                (self.max_inflation is not None) and (len(gdf_finished)+len(gdf2) > initial_length * self.max_inflation)
+            ):
+                gdf_finished = pandas.concat([gdf_finished, gdf2])
+                break
+            else:
+                # Iterate
+                gdf_part3 = self._step_index_geodataframe(gdf2, depth=depth, id_col='tmp_id')
+                
+                # Keep track of the original geometry id
+                gdf2 = pandas.merge(gdf_part3, gdf2[['tmp_id', self.id_col]], on='tmp_id')
+                del gdf2['tmp_id']
+        
+        del gdf_finished['tmp_id']
+        gdf_finished = gdf_finished.rename(columns={self.key_col: self.idx_col})
+        self.gdf_idx = gdf_finished.reset_index(drop=True)
+
+        return self.gdf_idx
+
+
+    def _recursive_bfs(self, gdf_tree, depth, initial_length=None, final_iteration=False, key_col=None, id_col=None):
+        """Calculate the next level of children keys."""
+        if key_col is None:
+            key_col = self.key_col
+        if id_col is None:
+            id_col = self.id_col
+    
+        # Generate 4 child columns representing the 4 quadrants we need to check for intersections
+        df_children = pandas.DataFrame(
+            gdf_tree[key_col].apply(lambda x: self._children(x)).to_list(),
+            columns=self.CHILDREN
+        )
+        
+        # Create the children bounding boxes
+        for child in self.CHILDREN:
+            df_children[child + '_bounds'] = self._base4_to_box(df_children[child])
+
+        # Check for intersection of original geometry with children
+        for child in self.CHILDREN:
+            mask1 = gdf_tree.intersects(
+                geopandas.GeoSeries(df_children[child + '_bounds']).set_crs(self.morton.grid.crs)
+            )
+            df_children[child] = df_children[child].where(mask1)
+        
+        # Stack the child spatial keys and bounding geometries
+        df1 = pandas.concat([gdf_tree[id_col], df_children], axis=1)
+        df_children = pandas.DataFrame()
+        for child in self.CHILDREN:
+            df2 = df1[[id_col, child, child+'_bounds']].dropna().rename(columns={
+                child: key_col,
+                child+'_bounds': 'idx_bounds',
+            })
+            df_children = pandas.concat([df_children, df2])
+        df_children = df_children.reset_index(drop=True)
+
+        # spatial index as broad DataFrame
+        df = df_children[[id_col, key_col]].rename(columns={key_col: 'depth_'+str(depth)})
+        df['depth_'+str(depth-1)] = df['depth_'+str(depth)].apply(lambda x: x[:-1])
+        self.gdf_idx = pandas.merge(self.gdf_idx, df, on=[id_col, 'depth_'+str(depth-1)], how='outer')
+
+        # Remember the keys that have reached the target level
+        mask2 = df_children[key_col].apply(len)>=self.target_level+2
+        self.gdf_target = pandas.concat([
+            self.gdf_target,
+            df_children[mask2].reset_index(
+                drop=True)[self.gdf_target.columns],
+        ]).reset_index(drop=True)
+
+        if (self.max_inflation is not None) and (initial_length is not None):
+            if len(self.gdf_idx) > initial_length * self.max_inflation:
+                # Break even befor max_depth is reached
+                final_iteration = True
+
+        # Update the keys we need to work on in the next iteration
+        gdf_tree = pandas.merge(
+            gdf_tree[[id_col, 'geometry']].drop_duplicates(),
+            df_children[~mask2].reset_index(drop=True),
+            on=id_col,
+        )
+
+        # Assign fully contained nodes from further splitting considerations.
+        mask3 = gdf_tree.contains(geopandas.GeoSeries(gdf_tree['idx_bounds']).set_crs(self.morton.grid.crs))
+        
+        gdf1 = gdf_tree[mask3].reset_index(drop=True)
+        gdf_tree = gdf_tree[~mask3].reset_index(drop=True)
+
+        if final_iteration:
+            # Everything remaining needs to be assigned to gdf_target
+            self.gdf_target = pandas.concat([
+                self.gdf_target,
+                df_children[~mask2].reset_index(drop=True),
+            ]).reset_index(drop=True)[self.gdf_target.columns]
+            
+        else:
+            # Assign fully contained nodes to gdf_target
+            self.gdf_target = pandas.concat([
+                self.gdf_target,
+                gdf1[self.gdf_target.columns]
+            ]).reset_index(drop=True)
+
+        return gdf_tree, df_children, final_iteration
+
+
+    def _index_geodataframe_point_or_line(self, gdf):
         """Calculate the qtree index, and target keys at target_level for each geometry where possible.
 
         Create spatial index, aligned with GeoDN raster data.
@@ -847,15 +1057,15 @@ class Vectorstore():
         depth = 0
         initial_length = len(gdf_unique)
         final_iteration = False
-        while depth < self.max_depth:
+        while (depth < self.max_depth) and (not final_iteration):
             depth+=1
             if depth==self.max_depth:
                 final_iteration = True
             if len(gdf_tree)>0:
-                gdf_tree, df_children = self._recursive_bfs(gdf_tree, depth, initial_length, final_iteration)
-                # debug
-                # self.gdf_tree = gdf_tree
-                # self.df_children = df_children
+                gdf_tree, df_children, final_iteration = self._recursive_bfs(gdf_tree, depth, initial_length, final_iteration)
+                #debug
+                self.gdf_tree = gdf_tree
+                self.df_children = df_children
             else:
                 break
             if self.verbose:
@@ -866,13 +1076,11 @@ class Vectorstore():
             stopwatch_start = time.time()
 
         # Finalize the quadtree index
-        levels = [self.target_level]
-        idx_cols = sorted(['idx_' + str(l) for l in levels])
-        self._depth_to_level(levels = levels)
-        self.gdf_idx = self.gdf_idx[[self.id_col] + idx_cols + [self.key_col]]
+        self._depth_to_level(level = self.target_level)
+        self.gdf_idx = self.gdf_idx[[self.id_col, self.idx_col, self.key_col]]
 
         # Add a geometry column for the index bounds
-        self.gdf_idx['idx_bounds'] = self._base4_to_box(self.gdf_idx['idx_'+str(self.target_level)])
+        self.gdf_idx['idx_bounds'] = self._base4_to_box(self.gdf_idx[self.idx_col])
         self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry='idx_bounds').set_crs(self.morton.grid.crs)
 
         # Add the original geometry column (we will cut the polygons below)
@@ -887,11 +1095,11 @@ class Vectorstore():
         s_bounds = self.gdf_idx['idx_bounds']
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            s_bounds = s_bounds.buffer(-self.morton.epsilon)
+            s_bounds_buffer = s_bounds.buffer(-self.morton.epsilon)
         # debug: maybe this needs to be made permanent in column 'idx_bounds' ?
 
         # Check for spatial containment of quadtree boxes within the original geometries
-        self.gdf_idx['contained'] = self.gdf_idx.contains(s_bounds)
+        self.gdf_idx['contained'] = self.gdf_idx.contains(s_bounds_buffer)
         
         # Add a geometry column containing the intersection of index bounds and original geometry
         self.gdf_idx[self.geom_col] = self.gdf_idx.intersection(s_bounds)
@@ -926,9 +1134,20 @@ class Vectorstore():
         # Only a few columns are needed for the index
         gdf_part = gdf_part[[self.id_col, self.geom_col, self.key_col]]
 
-        # Create the index
-        gdf_idx = self._index_geodataframe(gdf_part)
-        
+        # Removing the annoying buffer warning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if gdf_part.loc[::100, 'geometry'].area.mean()>self.morton.resolution(max(0, self.max_level-4))[0]:
+                if self.verbose:
+                    print('Using algorithm optimized for Polygon geometries')
+                # Create the index
+                gdf_idx = self._index_geodataframe_aerial(gdf_part)
+            else:
+                if self.verbose:
+                    print('Using algorithm optimized for Point or LineString geometries')
+                # Create the index
+                gdf_idx = self._index_geodataframe_point_or_line(gdf_part)
+
         filepath_idx = self._filepath_idx(temporal_partition, spatial_partition)
         if append:
             try:
@@ -938,9 +1157,8 @@ class Vectorstore():
                 pass
             else:
                 # Merge by concatenating and dropping duplicates (keeping the newer version)
-                idx_cols = [c for c in gdf_idx.columns if c.startswith('idx_')]
                 gdf_idx = pandas.concat([gdf_idx_existing, gdf_idx]).drop_duplicates(
-                    subset=[self.id_col]+idx_cols,
+                    subset=[self.id_col, self.idx_col],
                     keep='last',
                 )
 
