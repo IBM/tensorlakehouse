@@ -1,3 +1,9 @@
+"""Generate vectorstore.
+
+    Classes
+
+        Vectorstore    Generating vector store.
+"""
 import os
 import warnings
 from glob import glob
@@ -14,15 +20,33 @@ import json
 from multiprocessing import Pool
 from pathos.pools import ProcessPool
 
-import pairs_quadtree
+import nestedgrid
+import mortoncurve
+import qtree
 
+os.environ['USE_PYGEOS'] = '0'
 
 class Vectorstore():
-    """
-    Vectorstore Class for handling indexed (e.g. fused to the PAIRS grid) vector data in parquet files
-    """
+    """Generates quadtree-based indices for Vector data and persist them in parquet files.
     
-    # Default values for variables
+    Enables fused (e.g. fused to the PAIRS grid) vector data and fast raster-vector queries.
+
+    Attributes:
+
+        vectorstore_directory   Base directory where the vectorstore is persisted.
+        vectorstore_directory   Base directory where the vectorstore is persisted.
+        vectorstore_directory   Base directory where the vectorstore is persisted.
+        vectorstore_directory   Base directory where the vectorstore is persisted.
+        
+    Methods
+
+        ingest_geodataframe     Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
+        ingest_geodataframe     Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
+        ingest_geodataframe     Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
+        ingest_geodataframe     Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
+
+    """
+    # Default values for class attributes
     VECTORSTORE_DIRECTORY      = '/data/vector/vectorstore/'
 
     TEMPORAL_KEYS              = []  #['year']
@@ -86,8 +110,15 @@ class Vectorstore():
         composite_key_col = None,
         geom_area_col = None, 
         geom_length_col = None, 
+        grid = None,
     ):
         
+        # Nested grid to overwrite the default PAIRS grid
+        self.grid = grid
+
+        # Definition of the morton curve on top of the nested grid
+        self.morton = mortoncurve.Morton(self.grid)
+
         # Dataset name
         self.dataset                      = dataset
         
@@ -162,16 +193,15 @@ class Vectorstore():
     def polygons2geodataframe(lst_polygons, geom_col, crs=4326):
         gdf_poly = pandas.DataFrame(lst_polygons)
         gdf_poly.columns=[geom_col]
-        gdf_poly = geopandas.geodataframe.GeoDataFrame(gdf_poly, geometry=geom_col)
+        gdf_poly = geopandas.GeoDataFrame(gdf_poly, geometry=geom_col)
         gdf_poly = gdf_poly.set_crs(epsg=crs)
         return gdf_poly
     
     @staticmethod
     def quadtree(poly, level):
-        # Get the quadtree cells only
-        polyQuadTree, _ = pairs_quadtree.quadTreePAIRS_dfs(poly, max_level=level)
-        # Get all the keys on the same resolution level
-        polyCells = pairs_quadtree.quadTreeCellsPAIRS_dfs(polyQuadTree, level)
+         # Get the quadtree cells
+        qt = qtree.QTree(poly, level) # initialize
+        polyCells = qt.gridded() # build the quadtree (depth first search)
         return polyCells
     
     def quadtree2(self, poly):
@@ -212,10 +242,10 @@ class Vectorstore():
     def _quadtree2geodataframe(self, quadtree):
         poly_squares=[]
         for square in quadtree:
-            south, west = pairs_quadtree.getLatLon(square[1], square[0])
-            res = pairs_quadtree.getResolution(square[0])
-            north = south + res
-            east = west + res
+            west, south = self.morton.coordinates(square[1], square[0])
+            res_x, res_y = self.morton.resolution(square[0])
+            north = south + res_y
+            east = west + res_x
             poly_squares.append(shapely.geometry.box(west, south, east, north))
 
         df_squares = pandas.DataFrame(poly_squares)
@@ -224,22 +254,22 @@ class Vectorstore():
             pandas.DataFrame(quadtree).rename(columns={0: self.spatial_level_col, 1:self.spatial_key_col}), 
             df_squares
         ], axis=1)
-        gdf_squares = geopandas.geodataframe.GeoDataFrame(df_squares, geometry=self.geom_col).set_crs(epsg=4326)
+        gdf_squares = geopandas.GeoDataFrame(df_squares, geometry=self.geom_col).set_crs(epsg=4326)
         return gdf_squares
     
     def _polyCells2geodataframe(self, cells):
         poly_cells=[]
-        res = pairs_quadtree.getResolution(self.spatial_level)
+        res_x, res_y = self.morton.resolution(self.spatial_level)
         for cell in cells:
-            south, west = pairs_quadtree.getLatLon(cell, self.spatial_level)
-            north = south + res
-            east = west + res
+            west, south = self.morton.coordinates(cell, self.spatial_level)
+            north = south + res_y
+            east = west + res_x
             poly_cells.append(shapely.geometry.box(west, south, east, north))
 
         gdf_cells = pandas.DataFrame(cells).rename(columns={0: self.spatial_key_col})
         gdf_cells[self.spatial_level_col] = self.spatial_level
         gdf_cells[self.geom_col] = poly_cells
-        gdf_cells = geopandas.geodataframe.GeoDataFrame(gdf_cells, geometry=self.geom_col).set_crs(epsg=4326)
+        gdf_cells = geopandas.GeoDataFrame(gdf_cells, geometry=self.geom_col).set_crs(epsg=4326)
         return gdf_cells
     
     def _spatialPartitionLevel(self, sp):
@@ -247,9 +277,8 @@ class Vectorstore():
     
     def _create_spatial_partition_columns(self, gdf):
         for sp in self.spatial_partitions:
-            levelsUp = self.spatial_level - self._spatialPartitionLevel(sp)
-            getParentKey_part = partial(pairs_quadtree.getParentKey, levelsUp=levelsUp)
-            gdf[sp] = gdf[self.spatial_key_col].apply(getParentKey_part)
+            levels_up = self.spatial_level - self._spatialPartitionLevel(sp)
+            gdf[sp] = self.morton.parent_key(numpy.array(gdf[self.spatial_key_col]), levels_up)
     
     def _get_partitions(self):
         if self.partition_order=='spatial_before_temporal':
@@ -261,10 +290,10 @@ class Vectorstore():
             
     def _create_filter_key_column(self, gdf, level): 
         # Bottom left keys
-        gdf[f'filter_key_level{level}'] = pairs_quadtree.getKey(gdf['bb_miny'], gdf['bb_minx'], level)
-
+        gdf[f'filter_key_level{level}'] = self.morton.get_key(numpy.array(gdf['bb_miny']), numpy.array(gdf['bb_minx']), level)
         # Top_right_keys
-        top_right_keys = pairs_quadtree.getKey(gdf['bb_maxy'], gdf['bb_maxx'], level)
+        top_right_keys = self.morton.get_key(numpy.array(gdf['bb_maxy']), numpy.array(gdf['bb_maxx']), level)
+        
         # Overwrite in cases where there would be more than one cell
         gdf.loc[gdf[f'filter_key_level{level}']!=top_right_keys, f'filter_key_level{level}'] = numpy.nan
 
@@ -344,7 +373,7 @@ class Vectorstore():
         # Get the center lat/lon of the spatial cell
         key = gdf.loc[0, self.spatial_key_col]
         level = gdf.loc[0, self.spatial_level_col]
-        lat, lon = pairs_quadtree.getCenterLatLon(key, level)
+        lat, lon = self.morton.center_coordinates(key, level)
 
         # local_azimuthal_projection preserves angle (e.g. circles stay circles)
         #local_azimuthal_projection = f"+proj=aeqd +R=6371000 +units=m +lat_0={lat} +lon_0={lon}"
@@ -381,7 +410,7 @@ class Vectorstore():
             if verbose:
                 print(e)
                 print('Problem loading file', filepath)
-            gdf = geopandas.geodataframe.GeoDataFrame()
+            gdf = geopandas.GeoDataFrame()
             
         # Add area and/or length columns if requested
         if geometry_area or geometry_length:
@@ -415,7 +444,7 @@ class Vectorstore():
     
     def ingest_geodataframe(self, gdf, gdf_dissolved=None, epsilon=None, verbose=False):
         """
-        Load a geopandas geoDataFrame and transform it into a DataFrame with spatio-temporal keys, aligned with other geolab data
+        Load and transform GeoDataFrame into a spatially indexed GeoDataFrame, aligned with GeoDN raster data.
         """
         if verbose:
             stopwatch_start = time.time()
@@ -683,14 +712,13 @@ class Vectorstore():
         for k in self.temporal_keys:
             self.query_df_meta[k] = getattr(query_dt, k)
         self.query_df_meta[self.spatial_level_col] = self.spatial_level
-        self.query_df_meta[self.spatial_key_col] = pairs_quadtree.getKey(query_latitude, query_longitude, self.spatial_level)
+        self.query_df_meta[self.spatial_key_col] = self.morton.get_key(query_latitude, query_longitude, self.spatial_level)
         self.query_df_meta = pandas.DataFrame([self.query_df_meta])
 
         # Spatial key for the partition
         for sp in self.spatial_partitions:
-            levelsUp = self.spatial_level-self._spatialPartitionLevel(sp)
-            getParentKey_part = partial(pairs_quadtree.getParentKey, levelsUp=levelsUp)
-            self.query_df_meta[sp] = self.query_df_meta[self.spatial_key_col].astype(int).apply(getParentKey_part)
+            levels_up = self.spatial_level-self._spatialPartitionLevel(sp)
+            self.query_df_meta[sp] = self.morton.parent_key(numpy.array(self.query_df_meta[self.spatial_key_col].astype(int)), levels_up)
 
         self.query_df_meta[self.composite_key_col] = self._generate_composite_keys(self.query_df_meta)
         composite_key = self.query_df_meta[self.composite_key_col].values[0]
@@ -700,7 +728,7 @@ class Vectorstore():
         try:
             gdf_query = self._read_parquet(filepath, columns=columns, geometry_area=geometry_area, geometry_length=geometry_length)
         except FileNotFoundError as e:
-            gdf_query = geopandas.geodataframe.GeoDataFrame()
+            gdf_query = geopandas.GeoDataFrame()
 
         # Filter the query if requested
         if temporal_filter:
@@ -923,7 +951,7 @@ class Vectorstore():
             stopwatch_start = time.time()
         
         if len(lst_gdf)==0:
-            gdf_query = geopandas.geodataframe.GeoDataFrame()
+            gdf_query = geopandas.GeoDataFrame()
             print('WARNING: no data found in query area')
         else:
             gdf_query = pandas.concat(lst_gdf).reset_index(drop=True)
