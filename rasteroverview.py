@@ -1,4 +1,4 @@
-"""Generate raster overviews.
+"""Generate raster overviews (Hierarchical Spatial Index)
 
     Classes
 
@@ -28,7 +28,7 @@ os.environ['USE_PYGEOS'] = '0'
 class Rasteroverview():
     """Generating raster overviews.
 
-    Writing overviews to spatially and/or temporally partitioned parquet files.
+    Generates overviews and persist them in spatially and/or temporally partitioned parquet files.
 
     Attributes:
 
