@@ -1,10 +1,11 @@
-"""Partitioning overview tables so they can be accessed rapidly and appended to easily.
+"""Partitioning tables so they can be accessed rapidly and appended to easily.
 
 Classes:
 
     TemporalPartition:  Temporal partitions based on attributes such as year, month, day, hour
-    SpatialPartition:   Spatial partitions identified by the quaternary key in the filename.
-
+    SpatialPartition:   Spatial partition are split on demand, when the data becomes too big.
+    UniformSpatialPartition: Spatial partitions at uniform partition level throughout.
+    
 """
 
 import numpy
@@ -16,7 +17,7 @@ import qtree
 
 
 class TemporalPartition():
-    """Partitioning overview tables into separate files.
+    """Partitioning tables into separate files.
 
     Distribute data (rows) into separate files for each partition.
     Temporal partitions based on attributes such as year, month, day, hour
@@ -147,10 +148,11 @@ class TemporalPartition():
 
 
 class SpatialPartition():
-    """Partitioning overview tables into separate files.
+    """Partitioning tables into separate files.
 
     Distribute data (rows) into separate files for each partition.
     Spatial partitions identified by the quaternary key in the filename.
+    Partition are split on demand, when the data becomes too big.
 
     Attributes:
 
@@ -400,10 +402,11 @@ class SpatialPartition():
         return df_partition_count
 
 class UniformSpatialPartition():
-    """Partitioning overview tables into separate files.
+    """Partitioning tables into separate files.
 
     Distribute data (rows) into separate files for each partition.
     Spatial partitions identified by the quaternary key in the filename.
+    Spatial partitions at uniform partition level throughout.
 
     Attributes:
 
