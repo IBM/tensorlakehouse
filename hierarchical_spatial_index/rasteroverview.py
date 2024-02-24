@@ -5,6 +5,7 @@
         Rasteroverview    Generating raster overviews.
 """
 import os
+os.environ['USE_PYGEOS'] = '0'
 import sys
 from glob import glob
 import json
@@ -20,10 +21,10 @@ import dask
 import itertools
 
 import dataservice.query
-import mortoncurve
-import qtree
 
-os.environ['USE_PYGEOS'] = '0'
+sys.path.insert(1, os.path.abspath(".."))
+from qtree_index import mortoncurve, qtree
+
 
 class Rasteroverview():
     """Generating raster overviews.

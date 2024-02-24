@@ -4,7 +4,7 @@ import math
 import numpy
 import shapely
 
-import nestedgrid
+from . import nestedgrid
 
 # The PyGEOS package was merged with Shapely in 2021 and will be released as part of Shapely 2.0
 # No further development will take place for the PyGEOS package.

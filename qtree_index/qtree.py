@@ -17,7 +17,7 @@ import shapely
 import pandas
 import geopandas
 
-import mortoncurve
+from . import mortoncurve
 
 
 class Node():

@@ -6,6 +6,7 @@
 """
 import os
 os.environ['USE_PYGEOS'] = '0'
+import sys
 import warnings
 from glob import glob
 import time
@@ -21,9 +22,9 @@ import json
 from multiprocessing import Pool
 #from pathos.pools import ProcessPool
 
-import nestedgrid
-import mortoncurve
-import qtree
+sys.path.insert(1, os.path.abspath(".."))
+from qtree_index import nestedgrid, mortoncurve, qtree
+
 
 class Vectorstore():
     """Generates quadtree-based indices for Vector data and persist them in parquet files.

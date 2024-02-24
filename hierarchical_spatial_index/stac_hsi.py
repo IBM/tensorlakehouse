@@ -1,13 +1,12 @@
 import os
 os.environ['USE_PYGEOS'] = '0'
+import sys
 from glob import glob
 import shutil
 
-# import nestedgrid
-# import mortoncurve
-import qtree
-import partition
-import rasteroverview
+sys.path.insert(1, os.path.abspath(".."))
+from qtree_index import qtree, partition
+from . import rasteroverview
 
 import pandas
 from datetime import datetime, timedelta
