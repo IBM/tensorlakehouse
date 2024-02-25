@@ -384,7 +384,7 @@ class Vectorstore():
     def _glob_partitions(self):
         """Parse the geoparquet directory to find existing partitions."""
         
-        partitions = glob(os.path.join(self.geoparquet_directory, '**/*.parquet'), recursive=True)
+        partitions = glob(os.path.join(self.geoparquet_directory, '**/*.parquet').replace('\\', '/'), recursive=True)
         partitions = [os.path.splitext(os.path.basename(f))[0] for f in partitions]
         df_partitions = pandas.DataFrame({
             'partition': partitions,
@@ -396,7 +396,7 @@ class Vectorstore():
     def _glob_indexfiles(self):
         """Parse the index directory to find existing indices."""
         
-        indices = glob(os.path.join(self.index_directory, '**/*.parquet'), recursive=True)
+        indices = glob(os.path.join(self.index_directory, '**/*.parquet').replace('\\', '/'), recursive=True)
         indices = [os.path.splitext(os.path.basename(f))[0] for f in indices]
         df_indices = pandas.DataFrame({
             'indices': indices,
@@ -1209,13 +1209,13 @@ class Vectorstore():
         #vs_settings['grid'] = self.grid.__repr__()  # Need a way to create a grid object from __repr__()
         vs_settings['valid_range'] = shapely.to_geojson(self.valid_range)
 
-        json_path = os.path.join(self.dataset_directory, 'metadata.json')
+        json_path = os.path.join(self.dataset_directory, 'metadata.json').replace('\\', '/')
         with open(json_path, 'w') as f:
             json.dump(vs_settings, f)
 
     
     def read_metadata(self):
-        json_path = os.path.join(self.dataset_directory, 'metadata.json')
+        json_path = os.path.join(self.dataset_directory, 'metadata.json').replace('\\', '/')
         with open(json_path) as f:
             vs_settings = json.load(f)
         for k in vs_settings:
@@ -1383,8 +1383,8 @@ class Vectorstore():
         glob_wildcard_path = self.dataset_directory
         for partition_name in self.partitions:
             #partition_value = df_part.loc[0, partition_name]
-            glob_wildcard_path = os.path.join(glob_wildcard_path, partition_name + '*')
-        glob_wildcard_path = os.path.join(glob_wildcard_path, self.dataset+'*.parquet')
+            glob_wildcard_path = os.path.join(glob_wildcard_path, partition_name + '*').replace('\\', '/')
+        glob_wildcard_path = os.path.join(glob_wildcard_path, self.dataset+'*.parquet').replace('\\', '/')
         if verbose:
             print('glob_wildcard_path', glob_wildcard_path)
         globbed_filepaths = sorted(glob(glob_wildcard_path))
