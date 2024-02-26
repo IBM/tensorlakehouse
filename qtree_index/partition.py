@@ -12,8 +12,7 @@ import numpy
 import pandas
 import geopandas
 
-import mortoncurve
-import qtree
+from qtree_index import mortoncurve, qtree
 
 
 class TemporalPartition():

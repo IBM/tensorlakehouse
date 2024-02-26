@@ -166,28 +166,28 @@ def _bounds_from_file(filepath):
         arr.y.max().item()+dy/2,
     )
 
-def _crs_from_file(filepath):
+def _epsg_from_file(filepath):
     arr = xarray.open_dataarray(
         filepath,
         masked=True, 
     )
-    crs = arr.rio.crs.to_epsg()
-    if crs is None:
+    epsg = arr.rio.crs.to_epsg()
+    
+    if epsg is None:
         # Parse the wkt string instead
         crs = arr.rio.crs
         assert crs.data['proj']=='utm'
         zone_number = crs.data['zone']
-
-    if 'Northern Hemisphere' in pyproj.Proj(crs).crs.name:
-        north_or_south = 'north'
-        crs = int(f'326{zone_number:02}')
-    elif 'Southern Hemisphere' in pyproj.Proj(crs).crs.name:
-        north_or_south = 'south'
-        crs = int(f'327{zone_number:02}')
-    else:
-        raise ValueError('projection not understood')
+        if 'Northern Hemisphere' in pyproj.Proj(crs).crs.name:
+            north_or_south = 'north'
+            epsg = int(f'326{zone_number:02}')
+        elif 'Southern Hemisphere' in pyproj.Proj(crs).crs.name:
+            north_or_south = 'south'
+            epsg = int(f'327{zone_number:02}')
+        else:
+            raise ValueError('projection not understood')
         
-    return crs
+    return epsg
 
 def stac_search_items_to_raster_local_metadata(
     search_items,
@@ -227,7 +227,7 @@ def stac_search_items_to_raster_local_metadata(
     # gdf_local_meta['band'] = gdf_local_meta['filepath'].apply(_band_from_filepath)
     gdf_local_meta['product'] = gdf_local_meta['filepath'].apply(_product_from_filepath)
     #gdf_local_meta['geometry_utm'] = gdf_local_meta['filepath'].apply(_bounds_from_filepath)
-    #gdf_local_meta['crs'] = gdf_local_meta['filepath'].apply(_crs_from_file)
+    #gdf_local_meta['epsg'] = gdf_local_meta['filepath'].apply(_epsg_from_file)
 
     # Instead of relying on the crs directly, we can use the tile information to deduce the UTM zone
     gdf_local_meta['zone_number'] = gdf_local_meta['tile'].str[1:3].astype(int)
@@ -260,7 +260,8 @@ def setup_hsi(
     SPATIAL_PARTITION_LEVEL = 7
 
     # Projection from grid
-    crs = int(grid.crs.split('EPSG:')[-1])
+    #epsg = grid.crs.to_epsg()
+    epsg = grid.epsg
 
     dimension_values = {
         'product':[
@@ -287,7 +288,7 @@ def setup_hsi(
     total_bounds = shapely.ops.unary_union(gdf_local_meta['geometry'])
 
     if verbose:
-        print('crs                     ', crs)
+        print('epsg                    ', epsg)
         print('overviewstore_directory ', overviewstore_directory)
         print('tmp_directory           ', tmp_directory)
         print('dataservice_type        ', dataservice_type)
@@ -558,7 +559,8 @@ def register_hsi_items_stac(
             os.makedirs(json_folder)
         json_filepath = f'{json_folder}/item{i}.json'
 
-        crs = int(grid.crs.split('EPSG:')[-1])
+        #epsg = grid.crs.to_epsg()
+        epsg = grid.epsg
         if dataservice_type=='local_filesystem':
             href = os.path.join(
                 's3://' + cos_bucket,
@@ -570,13 +572,13 @@ def register_hsi_items_stac(
                 gdf1 = dask_geopandas.read_parquet(storage_url_part)
                 # Spatial extent in native coordinates based on partition (fast):
                 poly_native = gdf1.spatial_partitions.unary_union
-                gdf1 = gdf1.set_crs(crs).compute()
+                gdf1 = gdf1.set_crs(grid.crs).compute()
             except:
                 # Read with geopandas
                 gdf1 = geopandas.read_parquet(storage_url_part)
                 # Spatial extent in native coordinates based on overview cells (slow)
                 poly_native = gdf1.buffer(grid.epsilon).unary_union
-                gdf1 = gdf1.set_crs(crs)
+                gdf1 = gdf1.set_crs(grid.crs)
                 
         elif dataservice_type=='remote_filesystem':
             href = 's3://' + storage_url_part
@@ -592,7 +594,7 @@ def register_hsi_items_stac(
                 )
                 # Spatial extent in native coordinates based on partition (fast):
                 poly_native = gdf1.spatial_partitions.unary_union
-                gdf1 = gdf1.set_crs(crs).compute()
+                gdf1 = gdf1.set_crs(grid.crs).compute()
             except:
                 # Read with geopandas
                 gdf1 = geopandas.read_parquet(
@@ -605,11 +607,11 @@ def register_hsi_items_stac(
                 )
                 # Spatial extent in native coordinates based on overview cells (slow)
                 poly_native = gdf1.buffer(grid.epsilon).unary_union
-                gdf1 = gdf1.set_crs(crs)
+                gdf1 = gdf1.set_crs(grid.crs)
         
         poly_wgs84 = geopandas.GeoDataFrame([
             {'geometry': poly_native}
-        ]).set_crs(crs).to_crs(4326).loc[0, 'geometry']
+        ]).set_crs(grid.crs).to_crs(4326).loc[0, 'geometry']
         geometry_native = json.loads(shapely.to_geojson(poly_native))
         geometry_wgs84 = json.loads(shapely.to_geojson(poly_wgs84))
         total_bounds_native = list(poly_native.bounds)
@@ -736,7 +738,7 @@ def register_hsi_items_stac(
 
                 # Projection Extension (https://github.com/stac-extensions/projection)
                 #debug: need to set the projection in the geoparquet so that we can import here
-                "proj:epsg": crs,
+                "proj:epsg": epsg,
                 "proj:bbox": total_bounds_native,
                 "proj:geometry": geometry_native,
 
@@ -888,9 +890,9 @@ def search_hsi(
     gdf_concat = []
     for search_item in search_items:
         storage_url = search_item.assets['data'].href
-        crs = search_item.properties['proj:epsg']
+        epsg = search_item.properties['proj:epsg']
         
-        # if (required_crs is not None) and (crs!=required_crs):
+        # if (required_crs is not None) and (epsg!=required_crs):
         #     continue
 
         # if verbose:
@@ -906,7 +908,7 @@ def search_hsi(
                 },
                 columns=columns,
                 filters=filters,
-            ).set_crs(crs)
+            ).set_crs(epsg)
         except ValueError as e:
             pass
         else:
