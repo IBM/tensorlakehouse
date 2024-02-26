@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import pytz
 import geopandas
 import shapely
+from rasterio import CRS
 from functools import partial
 import json
 from multiprocessing import Pool
@@ -64,7 +65,7 @@ class Vectorstore():
 
     # Target level for qtree (only reached when max_depth allows it).
     TARGET_LEVEL               = 8
-    
+
     # Maximum depth of qtree index, measured from the root (head) level.
     # Set to target_level to ensure the generation of a "complete" qtree index for every geometry.
     # Set to 0 in order to skip generation of q_tree index (we will be relying on root node only).
@@ -76,6 +77,9 @@ class Vectorstore():
     # Once gdf_merge is larger than max_inflation*len(df_root) we stop going deeper into the tree.
     MAX_INFLATION              = None  # 10 , 2, 1.1
 
+    # Partition target rows
+    TARGET_ROWS                = 1e6
+    
     CHILDREN                   = ['child_0', 'child_1', 'child_2', 'child_3']
     
     # Default grid
@@ -99,6 +103,7 @@ class Vectorstore():
         target_level = None,
         max_depth = None,
         max_inflation = None,
+        target_rows = None,
         grid = None,
         valid_range = None,
         verbose = False,
@@ -123,18 +128,25 @@ class Vectorstore():
         self.dimension_values = dimension_values
         
         # Vectorstore base directory
-        self.vectorstore_directory        = self.VECTORSTORE_DIRECTORY if vectorstore_directory is None else vectorstore_directory
+        self.vectorstore_directory = self.VECTORSTORE_DIRECTORY if vectorstore_directory is None else vectorstore_directory
         
-        # Dataset directory is subfolder in vectorstore_directory 
-        self.dataset_directory            = os.path.join(self.vectorstore_directory, self.dataset).replace('\\', '/')
+        # Dataset directory is subfolder in vectorstore_directory
+        self.dataset_directory = os.path.join(self.vectorstore_directory, self.dataset).replace('\\', '/')
         if not os.path.exists(self.dataset_directory): os.makedirs(self.dataset_directory)
 
-        # Parquet directory is subfolder in dataset_directory 
-        self.geoparquet_directory            = os.path.join(self.dataset_directory, 'geoparquet').replace('\\', '/')
+        # Grid directory (where the index is defined on) is subfolder in dataset_directory
+        self.grid_directory = os.path.join(
+            self.dataset_directory,
+            'grid=' + self.grid.__repr__()
+        ).replace('\\', '/')
+        if not os.path.exists(self.grid_directory): os.makedirs(self.grid_directory)
+
+        # Parquet directory is subfolder in grid_directory
+        self.geoparquet_directory = os.path.join(self.grid_directory, 'geoparquet').replace('\\', '/')
         if not os.path.exists(self.geoparquet_directory): os.makedirs(self.geoparquet_directory)
 
-        # Index directory is subfolder in dataset_directory 
-        self.index_directory            = os.path.join(self.dataset_directory, 'index').replace('\\', '/')
+        # Index directory is subfolder in grid_directory 
+        self.index_directory = os.path.join(self.grid_directory, 'index').replace('\\', '/')
         if not os.path.exists(self.index_directory): os.makedirs(self.index_directory)
 
         # Table specific column information
@@ -149,10 +161,11 @@ class Vectorstore():
         self.geom_area_col = self.GEOM_AREA_COL if geom_area_col is None else geom_area_col
         self.geom_length_col = self.GEOM_LENGTH_COL if geom_length_col is None else geom_length_col
 
-        self.max_level = self.morton.grid.max_levels if max_level is None else max_level
+        self.max_level = self.grid.max_levels if max_level is None else max_level
         self.target_level = self.TARGET_LEVEL if target_level is None else target_level
         self.max_depth = self.MAX_DEPTH if max_depth is None else max_depth
         self.max_inflation = self.MAX_INFLATION if max_inflation is None else max_inflation
+        self.target_rows = self.TARGET_ROWS if target_rows is None else target_rows
 
         self.verbose = verbose
 
@@ -296,7 +309,7 @@ class Vectorstore():
             stopwatch_start = time.time()
 
     
-    def create_partitions(self, target_rows=100000):
+    def create_partitions(self, target_rows=None):
         """Create spatial partitions of roughly equal size.
 
         :param target_rows:  Approximate number of rows per parquet file.
@@ -304,7 +317,8 @@ class Vectorstore():
         if self.verbose:
             stopwatch_start = time.time()
             
-        self.target_rows = target_rows
+        if target_rows is not None: self.target_rows = target_rows
+            
         self.gdf_partition = pandas.DataFrame()
         df_count = self.df_root.groupby(self.key_col)[self.id_col].count().rename('root_count').reset_index()
         
@@ -376,7 +390,7 @@ class Vectorstore():
         ).reset_index(drop=True)
         
         if self.verbose:
-            print('gdf_partition', len(self.gdf_partition['partition'].drop_duplicates()))
+            print('distributed over', len(self.gdf_partition['partition'].drop_duplicates()), 'partitions')
             print('Time for creating partitions in seconds', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
@@ -443,7 +457,7 @@ class Vectorstore():
             return geopandas.GeoDataFrame()
 
 
-    def _split(self, temporal_partition, source_partition, target_rows, gdf_source=None):
+    def _split(self, temporal_partition, source_partition, gdf_source=None):
         """Split contents of partition into new children partitions if enough records exist."""
         
         source_filepath = self._filepath(temporal_partition, source_partition)
@@ -459,7 +473,7 @@ class Vectorstore():
             gdf_child = gdf_source[gdf_source[self.key_col].apply(lambda x: x.startswith(child))]
             n_records = len(gdf_child)
 
-            if (n_records>target_rows/2) or (
+            if (n_records>self.target_rows/2) or (
                 (os.path.exists(self._filepath(temporal_partition, child)) and (n_records>0) and keep_partition)
             ):
                 # Split the records off and assign to the child
@@ -486,10 +500,10 @@ class Vectorstore():
             return gdf_source
 
 
-    def _combine(self, temporal_partition, target_rows, df_rows):
+    def _combine(self, temporal_partition, df_rows):
         """Shard the contents of source_partition to higher-resolution existing partitions whenever possible."""
 
-        df_small = df_rows[df_rows['n_rows']<=target_rows/2].sort_values(
+        df_small = df_rows[df_rows['n_rows']<=self.target_rows/2].sort_values(
             by='partition_level', ascending=False).reset_index(drop=True)
         
         merge_partitions = list(df_small['partition'])
@@ -512,7 +526,7 @@ class Vectorstore():
                 (
                     df_rows['partition'].apply(lambda x: x.startswith(merge_partition[:-2]))
                 ) & (
-                    df_rows['n_rows']<=target_rows/2
+                    df_rows['n_rows']<=self.target_rows/2
                 ) & (
                     df_rows['partition']!=merge_partition
                 )
@@ -554,17 +568,19 @@ class Vectorstore():
                 df_rows = df_rows[df_rows['partition']!=merge_partition].reset_index(drop=True)
         
             # Re-calculate the small partitions
-            df_small = df_rows[df_rows['n_rows']<=target_rows/2].sort_values(
+            df_small = df_rows[df_rows['n_rows']<=self.target_rows/2].sort_values(
                 by='partition_level', ascending=False).reset_index(drop=True)
             merge_partitions = list(df_small['partition'])
 
 
-    def repartition(self, temporal_partition, target_rows=100000):
+    def repartition(self, temporal_partition, target_rows=None):
         """Repartrition parquet files to balance number of rows in each file as much as possible."""
         
         if self.verbose:
             stopwatch_start = time.time()
                     
+        if target_rows is not None: self.target_rows = target_rows
+
         # Potential source partitions for sharding and/or splitting
         df_partitions = self._glob_partitions()
         
@@ -604,7 +620,7 @@ class Vectorstore():
 
                 # (2) Split contents of partition into new children partitions if enough records exist.
                 if len(gdf_source)>0:
-                    gdf_source = self._split(temporal_partition, source_partition, target_rows, gdf_source=gdf_source)
+                    gdf_source = self._split(temporal_partition, source_partition, gdf_source=gdf_source)
 
                 if len(gdf_source)>0:
                     dict_n_rows[source_partition] = len(gdf_source)
@@ -614,7 +630,7 @@ class Vectorstore():
         df_rows['partition_level'] = df_rows['partition'].apply(lambda x: len(x)-2)
         df_rows = df_rows.sort_values(by=['partition_level'], ascending=False)
 
-        self._combine(temporal_partition, target_rows, df_rows)
+        self._combine(temporal_partition, df_rows)
 
         if self.verbose:
             print('Time for repartitioning in seconds', round(time.time()-stopwatch_start, 3))
@@ -667,7 +683,7 @@ class Vectorstore():
                 # Found another temporal partition
                 temporal_partition[key] = value
             elif key=='grid':
-                assert value==self.morton.grid.__repr__()
+                assert value==self.grid.__repr__()
             else:
                 raise ValueError("Non-compliant filepath." )
 
@@ -735,7 +751,7 @@ class Vectorstore():
         # Check for intersection of original geometry with children
         for child in self.CHILDREN:
             mask1 = gdf_tree.intersects(
-                geopandas.GeoSeries(df_children[child + '_bounds']).set_crs(self.morton.grid.crs)
+                geopandas.GeoSeries(df_children[child + '_bounds']).set_crs(self.grid.crs)
             )
             df_children[child] = df_children[child].where(mask1)
         
@@ -764,7 +780,7 @@ class Vectorstore():
         )
 
         # Assign fully contained nodes from further splitting considerations.
-        mask3 = gdf_tree.contains(geopandas.GeoSeries(gdf_tree[self.idx_box_col]).set_crs(self.morton.grid.crs))
+        mask3 = gdf_tree.contains(geopandas.GeoSeries(gdf_tree[self.idx_box_col]).set_crs(self.grid.crs))
         
         gdf1 = gdf_tree[mask3].reset_index(drop=True)
         gdf_tree = gdf_tree[~mask3].reset_index(drop=True)
@@ -842,7 +858,7 @@ class Vectorstore():
 
         # Add a geometry column for the index bounds
         self.gdf_idx[self.idx_box_col] = self._base4_to_box(self.gdf_idx[self.idx_col])
-        self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry=self.idx_box_col).set_crs(self.morton.grid.crs)
+        self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry=self.idx_box_col).set_crs(self.grid.crs)
 
         # Add the original geometry column (we will cut the polygons below)
         self.gdf_idx = gdf_unique[[self.id_col, self.geom_col]].merge(
@@ -920,7 +936,7 @@ class Vectorstore():
 
         # Add a geometry column for the index bounds
         self.gdf_idx[self.idx_box_col] = self._base4_to_box(self.gdf_idx[self.idx_col])
-        self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry=self.idx_box_col).set_crs(self.morton.grid.crs)
+        self.gdf_idx = geopandas.GeoDataFrame(self.gdf_idx, geometry=self.idx_box_col).set_crs(self.grid.crs)
 
         # Add the original geometry column (we will cut the polygons below)
         self.gdf_idx = gdf_unique[[id_col, self.geom_col]].merge(
@@ -1115,11 +1131,10 @@ class Vectorstore():
             stopwatch_start = time.time()
 
 
-    def partial_upload(self, gdf, target_rows=100000, index=False):
+    def partial_upload(self, gdf, target_rows=None, index=False):
         """Register GeoDataFrame, create partition, and save parquet to disk.
 
         :param gdf:         Geopandas GeoDataFrame to be indexed and written to disk.
-        :param target_rows: Number of rows of typical partition.
         :param index:       Flag whether to create spatial index.
         """
         # We will be appending to existing partitions
@@ -1133,6 +1148,98 @@ class Vectorstore():
 
         # Write the dataset to parquet
         self.to_parquet(append=APPEND, index=index)
+
+
+    def _initialize_reproject(
+        self,
+        grid,
+        max_level = None,
+        target_level = None,
+        max_depth = None,
+        max_inflation = None,
+        target_rows = None,
+        valid_range = None,
+    ):
+        """Initialize a reprojected vectorstore.
+        
+        :param grid: target nestedgrid
+        """
+        if max_level is None: max_level = self.max_level
+        if target_level is None: target_level = self.target_level
+        if max_depth is None: max_depth = self.max_depth
+        if max_inflation is None: max_inflation = self.max_inflation
+        if target_rows is None: target_rows = self.target_rows
+
+        vs2 = Vectorstore(
+            dataset=self.dataset,
+            grid=grid,
+            dt_col=self.dt_col,
+            geom_col=self.geom_col,
+            id_col=self.id_col,
+            max_level=max_level,
+            target_level=target_level,
+            max_depth=max_depth,
+            max_inflation=max_inflation,
+            target_rows=target_rows,
+            valid_range=valid_range,
+            verbose=self.verbose,
+        )
+        
+        vs2.write_metadata()
+        vs2.read_metadata()
+
+        return vs2
+
+    
+    def _reproject_geodataframe(self, gdf, crs):
+        """Reproject a single in-memory geodataframe"""
+        try:
+            return gdf.drop([self.key_col], axis=1).to_crs(crs)
+        except:
+            return gdf.to_crs(crs)
+            
+    
+    def reproject(
+        self,
+        grid,
+        max_level = None,
+        target_level = None,
+        max_depth = None,
+        max_inflation = None,
+        valid_range = None,
+        target_rows = None, 
+        index = False,
+    ):
+        """Reproject vectorstore.
+        
+        :param grid: target nestedgrid
+        """
+        vs2 = self._initialize_reproject(
+            grid=grid,
+            max_level=max_level,
+            target_level=target_level,
+            max_depth=max_depth,
+            max_inflation=max_inflation,
+            valid_range=valid_range,
+            target_rows=target_rows,
+        )
+
+        df_partitions = self._glob_partitions()
+        source_partitions = list(df_partitions['partition'])
+        for source_partition in source_partitions:
+            gdf = geopandas.read_parquet(self._filepath({}, source_partition))
+
+            # Reproject
+            gdf2 = self._reproject_geodataframe(gdf, grid.crs)
+            
+            # Upload to new vectorstore
+            vs2.partial_upload(
+                gdf2,
+                target_rows=target_rows,
+                index=index,
+            )
+
+        return vs2
 
 
     def _read_parquet(
@@ -1190,6 +1297,7 @@ class Vectorstore():
         vs_settings['dataset'] = self.dataset
         vs_settings['vectorstore_directory'] = self.vectorstore_directory
         vs_settings['dataset_directory'] = self.dataset_directory
+        vs_settings['grid_directory'] = self.grid_directory
         vs_settings['geoparquet_directory'] = self.geoparquet_directory
         vs_settings['index_directory'] = self.index_directory
         vs_settings['temporal_levels'] = self.temporal_levels
@@ -1206,24 +1314,25 @@ class Vectorstore():
         vs_settings['target_level'] = self.target_level
         vs_settings['max_depth'] = self.max_depth
         vs_settings['max_inflation'] = self.max_inflation
-        #vs_settings['grid'] = self.grid.__repr__()  # Need a way to create a grid object from __repr__()
+        vs_settings['target_rows'] = self.target_rows
+        vs_settings['grid'] = self.grid.__repr__()
         vs_settings['valid_range'] = shapely.to_geojson(self.valid_range)
 
-        json_path = os.path.join(self.dataset_directory, 'metadata.json').replace('\\', '/')
+        json_path = os.path.join(self.grid_directory, 'metadata.json').replace('\\', '/')
         with open(json_path, 'w') as f:
             json.dump(vs_settings, f)
 
     
     def read_metadata(self):
-        json_path = os.path.join(self.dataset_directory, 'metadata.json').replace('\\', '/')
+        json_path = os.path.join(self.grid_directory, 'metadata.json').replace('\\', '/')
         with open(json_path) as f:
             vs_settings = json.load(f)
         for k in vs_settings:
             if k=='valid_range':
                 vs_settings[k] = shapely.from_geojson(vs_settings[k])
             elif k=='grid':
-                pass
-                # Need a way to create a grid object from __repr__()
+                # Recreate a grid object from __repr__()
+                vs_settings[k] = eval("nestedgrid." + vs_settings[k])
             setattr(self, k, vs_settings[k])
             
 
@@ -1380,7 +1489,7 @@ class Vectorstore():
     #         print('Time for to_parquet in seconds', round(time.time()-stopwatch_start, 3))
             
     def metadata_from_parquet(self, verbose=False):
-        glob_wildcard_path = self.dataset_directory
+        glob_wildcard_path = self.grid_directory
         for partition_name in self.partitions:
             #partition_value = df_part.loc[0, partition_name]
             glob_wildcard_path = os.path.join(glob_wildcard_path, partition_name + '*').replace('\\', '/')
@@ -1390,7 +1499,7 @@ class Vectorstore():
         globbed_filepaths = sorted(glob(glob_wildcard_path))
         
         # Remove the dataset directory and the filetype ('.parquet') from the paths
-        globbed = [g.split(self.dataset_directory)[-1] for g in globbed_filepaths]
+        globbed = [g.split(self.grid_directory)[-1] for g in globbed_filepaths]
         globbed = [g.split('.parquet')[0] for g in globbed]
         
         # Cast to pandas and split into several columns
