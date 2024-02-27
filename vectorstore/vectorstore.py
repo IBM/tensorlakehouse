@@ -18,6 +18,7 @@ import pytz
 import geopandas
 import shapely
 from rasterio import CRS
+import hashlib
 from functools import partial
 import json
 from multiprocessing import Pool
@@ -56,7 +57,7 @@ class Vectorstore():
     
     # Geopandas relies on this column being named 'geometry', so enforce this
     GEOM_COL                   = 'geometry'
-    ID_COL                     = 'geom_id'
+    ID_COL                     = '_geom_hash'
     KEY_COL                    = '_root' #'q_key'
     IDX_COL                    = '_idx'
     IDX_BOX_COL                = 'idx_bounds'
@@ -170,6 +171,13 @@ class Vectorstore():
         self.verbose = verbose
 
 
+    def _geometry_hash(self, geoseries):
+        """
+        Using sha256 hash on wkb representation of geometry to get a nearly unique geometry id
+        """
+        return geoseries.to_wkb().apply(lambda x: hashlib.sha256(x).hexdigest())
+
+    
     def _index_root(self, gdf):
         """Calculate the qtree index root for each geometry.
 
@@ -281,7 +289,20 @@ class Vectorstore():
                     )
 
     
-    def register_geodataframe(self, gdf):
+    def _preprocess_dimension_column(self, s):
+        """Preprocess dimension column. We require dimension columns to be of type int, datetime, or str.
+    
+        :param s: pandas Series
+        """
+        if pandas.api.types.is_float_dtype(s):
+            # Convert to string. Remove insignificant trailing zeros from the significand, and 
+            # remove the decimal point if there are no remaining digits.
+            s =  s.apply(lambda x: f'{x:g}')
+    
+        return s
+
+    
+    def register_geodataframe(self, gdf, validate_geometries=True):
         """Calculate the root index for each unique geometry.
 
         :param gdf:  Geopandas GeoDataFrame to be ingested.
@@ -292,8 +313,53 @@ class Vectorstore():
         self.gdf_ingest = gdf
         assert(self.dt_col in self.gdf_ingest.columns)
         assert(self.geom_col in self.gdf_ingest.columns)
-        assert(self.id_col in self.gdf_ingest.columns)
 
+        # We require dimension columns to be of type int, datetime, or str.
+        if len(self.dimension_values)>0:
+            for dimension in self.dimension_values:
+                gdf[dimension] = self._preprocess_dimension_column(gdf[dimension])
+    
+                # Register dimension values
+                self.dimension_values[dimension] = list(set(
+                    self.dimension_values[dimension]+list(gdf[dimension].drop_duplicates())
+                ))
+            self.write_metadata()
+
+            if self.verbose:
+                print('Time for preprocessing dimension columns in seconds', round(time.time()-stopwatch_start, 3))
+                stopwatch_start = time.time()
+
+        if validate_geometries:
+            # Make sure the geometries are valid
+            self.gdf_ingest[self.geom_col] = self.gdf_ingest[self.geom_col].apply(shapely.validation.make_valid)
+            
+            if self.verbose:
+                print('Time for validating geometries in seconds', round(time.time()-stopwatch_start, 3))
+                stopwatch_start = time.time()
+
+        # If an id_col was not privided, we calculate a geometry hash for each unique geometry
+        if self.id_col==self.ID_COL:
+            # Using sha256 hash on wkb representation of geometry to get a nearly unique id_col
+            self.gdf_ingest[self.id_col] = self._geometry_hash(self.gdf_ingest[self.geom_col])
+            
+            if self.verbose:
+                print('Time for calculating a geometry hash in seconds', round(time.time()-stopwatch_start, 3))
+                stopwatch_start = time.time()
+
+        # Drop duplicate primary keys (keeping the last version of the data)
+        len_before = len(self.gdf_ingest)
+        self.gdf_ingest = self.gdf_ingest.drop_duplicates(
+            subset=[self.dt_col, self.id_col]+list(self.dimension_values),
+            keep='last',
+        ).reset_index(drop=True)
+        len_after = len(self.gdf_ingest)
+        if len_before>len_after:
+            print('WARNING: -------------------------------------------------------------------')
+            print('dropping', len_before-len_after, 'rows with duplicate primary keys, composed of:')
+            print([self.dt_col, self.id_col] + list(self.dimension_values))
+            print('Keeping last version of the data')
+            print('----------------------------------------------------------------------------')
+        
         # Drop duplicate geometries before calculating spatial index (e.g. when we have multiple timestamps for the same geometry) 
         gdf_unique = self.gdf_ingest[[self.id_col, self.geom_col]].drop_duplicates(subset=self.id_col).reset_index(drop=True)
 
@@ -302,7 +368,7 @@ class Vectorstore():
 
         # Remember all root keys for each geometry
         self.df_root = gdf_unique[[self.id_col, self.key_col]]
-                
+
         if self.verbose:
             print('df_root', len(self.df_root))
             print('Time for indexing the root of each unique geometry in seconds', round(time.time()-stopwatch_start, 3))
@@ -344,7 +410,7 @@ class Vectorstore():
                     # Assign all remaining records to the finest possible partition
                     stop_l = min(
                         df_level[self.key_col].apply(len).min()-2,
-                        self.target_level+1
+                        self.target_level
                     )
                     l = 0
                     while l<stop_l:
@@ -501,7 +567,7 @@ class Vectorstore():
 
 
     def _combine(self, temporal_partition, df_rows):
-        """Shard the contents of source_partition to higher-resolution existing partitions whenever possible."""
+        """Combine the contents of tiny partitions at their parent levels."""
 
         df_small = df_rows[df_rows['n_rows']<=self.target_rows/2].sort_values(
             by='partition_level', ascending=False).reset_index(drop=True)
@@ -583,9 +649,7 @@ class Vectorstore():
 
         # Potential source partitions for sharding and/or splitting
         df_partitions = self._glob_partitions()
-        
-        # Exclude the highest partition level (self.target_level) from being sharded further
-        df_source_partitions = df_partitions[df_partitions['partition_level']<self.target_level].sort_values(
+        df_source_partitions = df_partitions[df_partitions['partition_level']<=self.target_level].sort_values(
             by='partition_level').reset_index(drop=True)
 
         # Keep track of the number or rows within each source partition after sharding and splitting
@@ -596,7 +660,7 @@ class Vectorstore():
             if level>min(df_source_partitions['partition_level']):
                 # Update source partitions, since partitions may have changed
                 df_partitions = self._glob_partitions()
-                df_source_partitions = df_partitions[df_partitions['partition_level']<self.target_level].sort_values(
+                df_source_partitions = df_partitions[df_partitions['partition_level']<=self.target_level].sort_values(
                     by='partition_level').reset_index(drop=True)
 
             if self.verbose:
@@ -621,8 +685,6 @@ class Vectorstore():
                 # (2) Split contents of partition into new children partitions if enough records exist.
                 if len(gdf_source)>0:
                     gdf_source = self._split(temporal_partition, source_partition, gdf_source=gdf_source)
-
-                if len(gdf_source)>0:
                     dict_n_rows[source_partition] = len(gdf_source)
 
         # (3) Combine multiple tiny files at high resolution to lower-resolution combined files
@@ -1074,31 +1136,34 @@ class Vectorstore():
         if gdf_part is None:
             # Creating gdf_part from latest self.gdf_ingest
             gdf_part = self._filter_partition(temporal_partition, spatial_partition)
-        debug_len_part = len(gdf_part)
 
         filepath = self._filepath(temporal_partition, spatial_partition)
         if append:
             try:
                 # See if there is something already present
                 gdf_existing = geopandas.read_parquet(filepath)
-                debug_len_existing = len(gdf_existing)
-                # print('debug_len_existing', debug_len_existing)
             except IOError:
                 pass
             else:
                 # Merge by concatenating and dropping duplicates (keeping the newer version)
-                gdf_part = pandas.concat([gdf_existing, gdf_part]).drop_duplicates(
-                    subset=[self.dt_col, self.id_col]+['dimension_' + d for d in self.dimension_values],
+                gdf_part = pandas.concat([gdf_existing, gdf_part])
+                len_before = len(gdf_part)
+                gdf_part = gdf_part.drop_duplicates(
+                    subset=[self.dt_col, self.id_col]+list(self.dimension_values),
                     keep='last',
                 )
-                debug_len_concat = len(gdf_part)
-                # print('debug_len_concat', debug_len_concat)
-                assert debug_len_concat==(debug_len_existing+debug_len_part)
+                len_after = len(gdf_part)
+                if len_before>len_after:
+                    print('WARNING: -------------------------------------------------------------------')
+                    print('dropping', len_before-len_after, 'rows with duplicate primary keys, composed of:')
+                    print([self.dt_col, self.id_col] + list(self.dimension_values))
+                    print('Keeping last version of the data')
+                    print('----------------------------------------------------------------------------')
                 
         if len(gdf_part)>0:
             # Sorting so that these columns are used as indices in parquet file
             gdf_part = gdf_part.sort_values(
-                by=[self.dt_col]+['dimension_' + d for d in self.dimension_values]+[self.key_col]
+                by=[self.dt_col]+list(self.dimension_values)+[self.key_col]
             ).reset_index(drop=True)
 
             gdf_part.to_parquet(
@@ -1131,7 +1196,7 @@ class Vectorstore():
             stopwatch_start = time.time()
 
 
-    def partial_upload(self, gdf, target_rows=None, index=False):
+    def partial_upload(self, gdf, target_rows=None, index=False, validate_geometries=False):
         """Register GeoDataFrame, create partition, and save parquet to disk.
 
         :param gdf:         Geopandas GeoDataFrame to be indexed and written to disk.
@@ -1141,7 +1206,7 @@ class Vectorstore():
         APPEND = True
 
         # Register data
-        self.register_geodataframe(gdf)
+        self.register_geodataframe(gdf, validate_geometries=validate_geometries)
 
         # Create suggestions for parquet file partitions
         self.create_partitions(target_rows)
@@ -1172,6 +1237,7 @@ class Vectorstore():
 
         vs2 = Vectorstore(
             dataset=self.dataset,
+            dimension_values=self.dimension_values,
             grid=grid,
             dt_col=self.dt_col,
             geom_col=self.geom_col,
@@ -1237,6 +1303,7 @@ class Vectorstore():
                 gdf2,
                 target_rows=target_rows,
                 index=index,
+                validate_geometries=False, #No need to validate since reprojecting from good geometries
             )
 
         return vs2
