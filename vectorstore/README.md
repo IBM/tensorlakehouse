@@ -14,6 +14,7 @@ Provides rapid access to large vector data persisted in GeoParquet and fuses vec
 
 ## Querying the Vectorstore
 
+- Bulk and filter queries (with push-down predicates) are supported.
 - SQL-like queries (including the ST_geometry extension) are supported.
 
 ## Vector-Raster Fusion
@@ -25,7 +26,8 @@ Facilitates rapid spatial joins between vector and raster data.
 
 ## Combined Vector-Raster Queries
 
-- Query through openEO with Vectorcubes as return values.
+- Aggregation queries through openEO with Vectorcubes as return values.
+- Raster queries filtered by arbitrary vector data attributes
 
 ## Vector HSI
 

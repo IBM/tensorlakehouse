@@ -76,7 +76,7 @@ class Rasteroverview():
     TMP_DIRECTORY              = 'data/raster/tmp'
     DELTA_PIXEL_OVERVIEW       = 5
     MAX_QUERY_PIXELS           = 5e8
-    DT_COL                     = 'time' #'timestamp'
+    DT_COL                     = 'time'
     # Geopandas relies on the geometry column being named 'geometry', so enforce this
     GEOM_COL                   = 'geometry'
     KEY_COL                    = 'q_key'
@@ -379,7 +379,7 @@ class Rasteroverview():
         # Get count, unique, top, freq statistics in one shot
         stats = grp.describe()['value']
 
-        # Get "first" statistic (bottom left corner value)
+        # Get "first" statistic (first non-nan value starting from bottom-left corner pixel)
         first = grp.first()
         first = first.rename(columns={'value': 'first'})
 
