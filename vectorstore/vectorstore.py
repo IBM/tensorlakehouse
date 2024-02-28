@@ -199,9 +199,11 @@ class Vectorstore():
         
             # If the keys are the same, we have a good key. Otherwise mask (with -1)
             keys = sw_keys.copy()
-            keys[sw_keys!=ne_keys] = -1 # -1 interpreted as nan
             levels = sw_keys * 0 + level
-            levels[sw_keys!=ne_keys] = -1 # -1 interpreted as nan
+            # Skip masking at level 0 to accomodate geometries that touch the top or left valid bounds.
+            if level>0:
+                keys[sw_keys!=ne_keys] = -1 # -1 interpreted as nan
+                levels[sw_keys!=ne_keys] = -1 # -1 interpreted as nan
         
             # Fill masked values by the next lower level if possible
             if level==self.max_level:
