@@ -127,7 +127,7 @@ class Vectorstore():
 
         # Dataset dimensions other than space and time
         self.dimension_values = dimension_values
-        
+
         # Vectorstore base directory
         self.vectorstore_directory = self.VECTORSTORE_DIRECTORY if vectorstore_directory is None else vectorstore_directory
         
@@ -162,6 +162,10 @@ class Vectorstore():
         self.geom_area_col = self.GEOM_AREA_COL if geom_area_col is None else geom_area_col
         self.geom_length_col = self.GEOM_LENGTH_COL if geom_length_col is None else geom_length_col
 
+        # Primary keys
+        self.primary_keys = [self.dt_col, self.id_col]+list(self.dimension_values)
+
+        # Indexing/partitioning parameters
         self.max_level = self.grid.max_levels if max_level is None else max_level
         self.target_level = self.TARGET_LEVEL if target_level is None else target_level
         self.max_depth = self.MAX_DEPTH if max_depth is None else max_depth
@@ -303,6 +307,16 @@ class Vectorstore():
     
         return s
 
+
+    def _warning_duplicate_primary_key(self, len_before, len_after):
+        """Warn the user when dropping rows."""
+        if len_before>len_after:
+            print('WARNING: -------------------------------------------------------------------')
+            print('dropping', len_before-len_after, 'rows with duplicate primary keys, composed of:')
+            print(self.primary_keys)
+            print('Keeping last version of the data')
+            print('----------------------------------------------------------------------------')
+
     
     def register_geodataframe(self, gdf, validate_geometries=True):
         """Calculate the root index for each unique geometry.
@@ -351,16 +365,12 @@ class Vectorstore():
         # Drop duplicate primary keys (keeping the last version of the data)
         len_before = len(self.gdf_ingest)
         self.gdf_ingest = self.gdf_ingest.drop_duplicates(
-            subset=[self.dt_col, self.id_col]+list(self.dimension_values),
+            subset=self.primary_keys,
             keep='last',
         ).reset_index(drop=True)
         len_after = len(self.gdf_ingest)
         if len_before>len_after:
-            print('WARNING: -------------------------------------------------------------------')
-            print('dropping', len_before-len_after, 'rows with duplicate primary keys, composed of:')
-            print([self.dt_col, self.id_col] + list(self.dimension_values))
-            print('Keeping last version of the data')
-            print('----------------------------------------------------------------------------')
+            self._warning_duplicate_primary_key(len_before, len_after)
         
         # Drop duplicate geometries before calculating spatial index (e.g. when we have multiple timestamps for the same geometry) 
         gdf_unique = self.gdf_ingest[[self.id_col, self.geom_col]].drop_duplicates(subset=self.id_col).reset_index(drop=True)
@@ -1151,17 +1161,13 @@ class Vectorstore():
                 gdf_part = pandas.concat([gdf_existing, gdf_part])
                 len_before = len(gdf_part)
                 gdf_part = gdf_part.drop_duplicates(
-                    subset=[self.dt_col, self.id_col]+list(self.dimension_values),
+                    subset=self.primary_keys,
                     keep='last',
                 )
                 len_after = len(gdf_part)
                 if len_before>len_after:
-                    print('WARNING: -------------------------------------------------------------------')
-                    print('dropping', len_before-len_after, 'rows with duplicate primary keys, composed of:')
-                    print([self.dt_col, self.id_col] + list(self.dimension_values))
-                    print('Keeping last version of the data')
-                    print('----------------------------------------------------------------------------')
-                
+                    self._warning_duplicate_primary_key(len_before, len_after)
+
         if len(gdf_part)>0:
             # Sorting so that these columns are used as indices in parquet file
             gdf_part = gdf_part.sort_values(
@@ -1379,6 +1385,7 @@ class Vectorstore():
         vs_settings['idx_box_col'] = self.idx_box_col
         vs_settings['geom_area_col'] = self.geom_area_col
         vs_settings['geom_length_col'] = self.geom_length_col
+        vs_settings['primary_keys'] = self.primary_keys
         vs_settings['max_level'] = self.max_level
         vs_settings['target_level'] = self.target_level
         vs_settings['max_depth'] = self.max_depth
