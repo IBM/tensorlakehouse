@@ -347,10 +347,11 @@ class Rasteroverview():
         stats = xarray.merge([stats, ds_wq])
 
         stats = stats.drop(['lat', 'lon'])
+        dims = ['dimension_' + d for d in self.dimension_values]
         if len(stats.dims)>1:
-            return stats.to_dataframe()
+            return stats.to_dataframe().reset_index().set_index(dims + ['time'])
         else:
-            return stats.to_pandas()
+            return stats.to_pandas().reset_index().set_index(dims + ['time'])
 
     def xarray_stats_categorical(self, arr, histogram=True):
         """Unweighted categorical statistics for the spatial dimensions of an xarray.

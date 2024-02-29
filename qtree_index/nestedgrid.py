@@ -431,6 +431,133 @@ class WorldMercator():
 
 
 @dataclass
+class User_defined_WGS84():
+    """User-defined WGS84 grid.
+
+    User provides coordinates at highest-resolution level.
+    xs: x center coordinates
+    ys: y center coordinates
+    epsg: coordinate reference system
+    """
+    def __init__(self, xs, ys, epsg=4326):
+        self.epsg = parse(epsg)
+
+        # World grid requires WGS84
+        assert self.epsg==4326
+
+        # get the coordinate reference system from rasterio
+        self.crs = CRS.from_epsg(self.epsg)
+
+        # We start at the bottom left corner pixel, so flip axes if needed
+        if xs[-1]<xs[0]:
+            xs = numpy.flip(xs)
+        if ys[-1]<ys[0]:
+            ys = numpy.flip(ys)
+    
+        # Maximum supported level (debug rename max_level)
+        self.max_levels = max(
+            int(numpy.ceil(numpy.log2(len(xs)))),
+            int(numpy.ceil(numpy.log2(len(ys))))
+        )
+
+        # Resolution at highest-resolution level
+        dx = (xs[-1] - xs[0])/(len(xs)-1)
+        dy = (ys[-1] - ys[0])/(len(ys)-1)
+
+        # Pixel resolution at level 0
+        self.res0 = Res0(
+            x = dx * 2**self.max_levels,
+            y = dy * 2**self.max_levels,
+        )
+        
+        # Define the origin of the grid (lower-left corner)
+        def _calc_origin(coords, delta, res0):
+            smallest = (coords[0] - delta/2) - (((coords[0] - delta/2) + 180) // delta) * delta
+            largest = coords[0] - delta/2
+            centered = (coords[len(coords)//2] * 2 - res0) / 2 - delta/2
+            if centered<smallest:
+                centered=smallest
+            if centered>largest:
+                centered=largest
+            return centered
+            
+        self.origin = Origin(
+            x = _calc_origin(xs, dx, self.res0.x),
+            y = _calc_origin(ys, dy, self.res0.y),
+        )
+            
+        # Extent of the level0 box (typically a square so pixels will be square as well)
+        self.level0_bounds = [
+            self.origin.x,
+            self.origin.y,
+            self.origin.x + self.res0.x,
+            self.origin.y + self.res0.y,
+        ] #west, south, east, north
+
+        # Define an epsilon here, smaller than the resolution of the highest level
+        # These are used to approximate half-open intervals [south,north) and [west,east),
+        # so that points (and some lines) are assigned to exactly one box on each resolution level.
+        self.epsilon = 1e-13
+
+        # Define the valid range (west, south, east, north)
+        self.valid_bounds = [-180, -90, 180 - self.epsilon, 90 - self.epsilon]
+        self.valid_bounds[0] = max(self.valid_bounds[0], self.level0_bounds[0])
+        self.valid_bounds[1] = max(self.valid_bounds[1], self.level0_bounds[1])
+        self.valid_bounds[2] = min(self.valid_bounds[2], self.level0_bounds[2])
+        self.valid_bounds[3] = min(self.valid_bounds[3], self.level0_bounds[3])
+
+        self.valid_bounds_wgs84 = self.valid_bounds
+        
+    def __repr__(self):
+        """Adding the epsg to the class so that we can use eval to instantiate."""
+        cls = type(self)
+        return f"{cls.__name__}({self.epsg.__repr__()})"
+
+    def area_weights(self, x_coord, y_coord):
+        """Weights for area normalizations (return 1 if equal area grid)."""
+        return numpy.cos(numpy.deg2rad(y_coord))
+
+    def _y_degrees_to_meters(self, y_coord):
+        """Calculate the length of a degree of longitude and latitude in meters.
+
+        Adapted from the accepted answer from whuber
+        https://gis.stackexchange.com/questions/75528/
+            understanding-terms-in-length-of-degree-formula/75535#75535
+        :param y_coord:  y coordinate of pixel (e.g. latitude)
+        """
+        # y-coordinate in radians
+        phi = numpy.deg2rad(y_coord)
+        # The principal radius of the WGS84 spheroid is
+        a = 6378137.
+        # meters and its inverse flattening is
+        f = 298.257223563
+        # , whence the squared eccentricity is 0.0066943799901413165
+        e2 = (2 - 1/f)/f
+        # The meridional radius of curvature at latitude phi is
+        M = a * (1 - e2) / (1 - e2 * numpy.sin(phi)**2)**(3/2)
+        # and the radius of curvature along the prime vertical is
+        N = a / (1 - e2 * numpy.sin(phi)**2)**(1/2)
+        # Furthermore, the radius of the parallel is
+        r = N * numpy.cos(phi)
+        # Finally then length (in meters) per degree in x and y direction are
+        x_length = r * numpy.pi / 180
+        y_length = M * numpy.pi / 180
+        return x_length, y_length
+
+    def pixel_area(self, x_coord, y_coord, res_x, res_y):
+        """Pixel area [square meters].
+
+        Pixel with lateral dimensions res_x, res_y at position (x_coord, y_coord).
+        :param x_coord:  x coordinate of pixel (e.g. longitude)
+        :param y_coord:  y coordinate of pixel (e.g. latitude)
+        :param res_x:    width of pixel
+        :param res_y:    height of pixel
+        """
+        x_length, y_length = self._y_degrees_to_meters(y_coord)
+        return res_x * x_length * res_y * y_length
+
+
+@dataclass
 class UTM30m_North():
     """WGS 84 / UTM zone North (EPSG:32601 - 32660).
     
