@@ -215,7 +215,7 @@ def stac_search_items_to_raster_local_metadata(
         # Or (B) use mounted s3fs
         raise NotImplementedError()
         # gdf_local_meta['filepath'] = gdf_local_meta['remote_path'].apply(
-        #     lambda x: os.path.join('/path/to/mount/point', x.split(cos_bucket+'/')[-1])
+        #     lambda x: os.path.join('/path/to/mount/point', x.split(cos_bucket+'/')[-1]).replace('\\', '/')
         # )
     else:
         raise NotImplementedError()
@@ -245,7 +245,7 @@ def stac_search_items_to_raster_local_metadata(
 
 
 def setup_hsi(
-    overviewstore_directory,
+    hsi_directory,
     tmp_directory,
     grid,
     gdf_local_meta,
@@ -256,7 +256,7 @@ def setup_hsi(
 ):
     """Create the Hierarchical Spatial Index from Data in COS."""
     PIXEL_LEVEL = 20 # 30m UTM30m grid
-    DELTA_PIXEL_OVERVIEW = 5
+    DELTA_PIXEL_HSI = 5
     SPATIAL_PARTITION_LEVEL = 7
 
     # Projection from grid
@@ -289,12 +289,12 @@ def setup_hsi(
 
     if verbose:
         print('epsg                    ', epsg)
-        print('overviewstore_directory ', overviewstore_directory)
+        print('hsi_directory           ', hsi_directory)
         print('tmp_directory           ', tmp_directory)
         print('dataservice_type        ', dataservice_type)
         print('dimension_values        ', dimension_values)
-        print('delta_pixel_overview    ', DELTA_PIXEL_OVERVIEW)
-        print('overview level          ', PIXEL_LEVEL - DELTA_PIXEL_OVERVIEW)
+        print('delta_pixel_hsi         ', DELTA_PIXEL_HSI)
+        print('hsi level               ', PIXEL_LEVEL - DELTA_PIXEL_HSI)
         print('numeric_or_categorical  ', numeric_or_categorical)
         print('timestamps              ', len(timestamps))
         print('total_bounds            ', total_bounds.bounds)
@@ -305,8 +305,8 @@ def setup_hsi(
     # Initialize
     raster = rasteroverview.Rasteroverview(
         pixel_level=PIXEL_LEVEL,
-        delta_pixel_overview=DELTA_PIXEL_OVERVIEW,
-        overviewstore_directory=overviewstore_directory,
+        delta_pixel_hsi=DELTA_PIXEL_HSI,
+        hsi_directory=hsi_directory,
         tmp_directory=tmp_directory,
         dset_id=None,
         layer_id=None,
@@ -318,8 +318,8 @@ def setup_hsi(
         verbose=False,
     )
 
-    # Determine overview cells using qtree algorithm
-    gdf_grid = raster.qtree_spatial_overview()
+    # Determine hsi cells using qtree algorithm
+    gdf_grid = raster.qtree_hsi()
 
     # Temporal partitions
     t_part = partition.TemporalPartition(
@@ -334,13 +334,13 @@ def setup_hsi(
         print('len(temporal_partitions)', len(t_part.temporal_partitions))
         print('temporal_partitions     ', t_part.temporal_partitions)
 
-    # Spatial partitions: Group overview cells in appropriate spatial partitions
+    # Spatial partitions: Group hsi cells in appropriate spatial partitions
 
-    # Eiter Split the geometric area until the number of overview keys per partition is below a threshold level
+    # Eiter Split the geometric area until the number of hsi keys per partition is below a threshold level
     # split_n = 100000 #256 #1024 #200 #500 
     # s_part = partition.SpatialPartition(
     #     raster_or_vector = 'raster',
-    #     max_spatial_level = raster.overview_level,
+    #     max_spatial_level = raster.hsi_level,
     #     split_n = split_n,
     # )
 
@@ -408,7 +408,7 @@ def hsi_worker(
         for i, temporal_level in enumerate(raster.temporal_levels):
             temporal_partition[temporal_level] = temporal_elements[i]
 
-    raster.overview_statistics(
+    raster.hsi_statistics(
         temporal_partition, 
         spatial_partition, 
         probe_local_timestamps=False, 
@@ -542,7 +542,7 @@ def register_hsi_items_stac(
 
     if dataservice_type=='local_filesystem':
         # Accessing in local (or mounted) drive
-        storage_urls = glob(os.path.join(hsi_directory, '*/*/*/*.parquet'))
+        storage_urls = glob(os.path.join(hsi_directory, '*/*/*/*.parquet').replace('\\', '/'))
     elif dataservice_type=='remote_filesystem':
         # Using s3fs to access
         storage_urls = remote_fs.glob(os.path.join(hsi_directory, '**/*.parquet').replace('\\', '/'))
@@ -566,7 +566,7 @@ def register_hsi_items_stac(
                 's3://' + cos_bucket,
                 'hsi',
                 storage_url_part.split('/hsi/')[1]
-            )
+            ).replace('\\', '/')
             try:
                 # If available and installed properly, dask_geopandas can read the metadata faster
                 gdf1 = dask_geopandas.read_parquet(storage_url_part)
@@ -576,7 +576,7 @@ def register_hsi_items_stac(
             except:
                 # Read with geopandas
                 gdf1 = geopandas.read_parquet(storage_url_part)
-                # Spatial extent in native coordinates based on overview cells (slow)
+                # Spatial extent in native coordinates based on hsi cells (slow)
                 poly_native = gdf1.buffer(grid.epsilon).unary_union
                 gdf1 = gdf1.set_crs(grid.crs)
                 
@@ -605,7 +605,7 @@ def register_hsi_items_stac(
                         'client_kwargs' : {'endpoint_url': endpoint_url},
                     },
                 )
-                # Spatial extent in native coordinates based on overview cells (slow)
+                # Spatial extent in native coordinates based on HSI cells (slow)
                 poly_native = gdf1.buffer(grid.epsilon).unary_union
                 gdf1 = gdf1.set_crs(grid.crs)
         
@@ -637,8 +637,8 @@ def register_hsi_items_stac(
                 description = 'dataset ID'
             elif col=='layer_id':
                 description = 'layer ID'
-            elif col=='overview_level':
-                description = 'spatial level of the overview'
+            elif col=='hsi_level':
+                description = 'spatial level of the HSI'
             elif col=='spatial_partition':
                 description = 'base4 key of the spatial partition'
             elif col in ('year', 'month', 'day'):
@@ -663,10 +663,10 @@ def register_hsi_items_stac(
             )
 
         datetime_lst = [t.strftime(ISO_8601) for t in sorted(gdf1['time'].unique())]
-        overview_level = int([
-            d for d in storage_url_part.split('/') if "overview_level" in d
+        hsi_level = int([
+            d for d in storage_url_part.split('/') if "hsi_level" in d
         ][0].split('=')[1])
-        #resolution = raster.morton.resolution(overview_level)[0]
+        #resolution = raster.morton.resolution(hsi_level)[0]
 
         cube_dimensions = {
             "q_key": {
@@ -774,7 +774,7 @@ def register_hsi_items_stac(
             json.dump(stac_item_dict, outfile, indent=4, sort_keys=False)
             
     # See what json files are there
-    # glob(os.path.join(json_folder, '*.json'))
+    # glob(os.path.join(json_folder, '*.json').replace('\\', '/')))
     
     # Debug: catch the case where the collection_id contains space characters
     arg_collection_id = hsi_collection_id.replace(" ", "%20")

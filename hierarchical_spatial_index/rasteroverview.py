@@ -1,4 +1,4 @@
-"""Generate raster overviews (Hierarchical Spatial Index)
+"""Generate raster overviews (Hierarchical Spatial Index HSI)
 
     Classes
 
@@ -29,13 +29,13 @@ from qtree_index import mortoncurve, qtree
 class Rasteroverview():
     """Generating raster overviews.
 
-    Generates overviews and persist them in spatially and/or temporally partitioned parquet files.
+    Generates Hirarchical Spatial Inices and persist them in spatially and/or temporally partitioned parquet files.
 
     Attributes:
 
         pixel_level             Pixel level
-        delta_pixel_overview    Difference between pixel level and overview level.
-        overviewstore_directory Base directory where dataset overviews are stored.
+        delta_pixel_hsi         Difference between pixel level and hsi level.
+        hsi_directory           Base directory where dataset hsi are stored.
         dset_id                 Dataset ID
         layer_id                Layer ID
         dimension_values        Dictionary of valid dimension values indexed by dimension_names
@@ -45,8 +45,8 @@ class Rasteroverview():
         key_col                 Name of spatial key column in DataFrame.
         numeric_or_categorical  Flag to indicate numeric or categorical type of statistics.
         stats                   Statistics (metadata) concerning available timestamps,
-                                overview keys, and spatio-temporal partitions.
-        overview_keys           List of the unique overview keys
+                                hsi keys, and spatio-temporal partitions.
+        hsi_keys                List of the unique hsi keys
         temporal_levels         List of the timestamp hierarchy levels ('year', 'month', ...)
         temporal_partitions     Dictionary of the temporal partitions
         spatial_partition_level Level of the spatial partitions
@@ -56,12 +56,12 @@ class Rasteroverview():
     Methods
 
         available_timestamps    Query the dataservice for global timestamps.
-        qtree_spatial_overview  Determine overview cells using qtree algorithm.
+        qtree_hsi               Determine hsi cells using qtree algorithm.
         partitions              Let raster object know about the partitions.
         xarray_stats_numeric    Area-weighted statistics for the spatial dimensions of an xarray.
         xarray_stats_categorical  Unweighted categorical statistics for the spatial dimensions 
                                 of an xarray.
-        overview_statistics     Calculate overviews and append or write to file.
+        hsi_statistics          Calculate HSI and append or write to file.
         to_parquet              Write GeoDataFrame partition to parquet.
         to_dataframe            Compose DataFrame from the layer's parquet files.
         to_zarr                 Write entire GeoDataFrame to zarr.
@@ -72,9 +72,9 @@ class Rasteroverview():
     """
     # Default values for class attributes
     DATASERVICE_TYPE           = 'hbase'
-    OVERVIEWSTORE_DIRECTORY    = 'data/raster/overviews/'
+    HSI_DIRECTORY              = 'data/raster/hsi/'
     TMP_DIRECTORY              = 'data/raster/tmp'
-    DELTA_PIXEL_OVERVIEW       = 5
+    DELTA_PIXEL_HSI            = 5
     MAX_QUERY_PIXELS           = 5e8
     DT_COL                     = 'time'
     # Geopandas relies on the geometry column being named 'geometry', so enforce this
@@ -89,8 +89,8 @@ class Rasteroverview():
     def __init__(
         self,
         pixel_level,
-        delta_pixel_overview = None,
-        overviewstore_directory = None,
+        delta_pixel_hsi = None,
+        hsi_directory = None,
         tmp_directory = None,
         dset_id = None,
         layer_id = None,
@@ -118,11 +118,11 @@ class Rasteroverview():
         self.dimension_values = dimension_values
 
         # Overview level calculated relative to pixel level
-        if delta_pixel_overview is None:
-            self.delta_pixel_overview = self.DELTA_PIXEL_OVERVIEW
+        if delta_pixel_hsi is None:
+            self.delta_pixel_hsi = self.DELTA_PIXEL_HSI
         else:
-            self.delta_pixel_overview = delta_pixel_overview
-        self.overview_level   = self.pixel_level - self.delta_pixel_overview
+            self.delta_pixel_hsi = delta_pixel_hsi
+        self.hsi_level   = self.pixel_level - self.delta_pixel_hsi
 
         # Type of dataservice (e.g. 'hbase', 'local_filesystem', 'remote_filesystem')
         if dataservice_type is None:
@@ -130,11 +130,11 @@ class Rasteroverview():
         else:
             self.dataservice_type = dataservice_type
 
-        # overviewstore_directory base directory
-        if overviewstore_directory is None:
-            self.overviewstore_directory = self.OVERVIEWSTORE_DIRECTORY
+        # hsi_directory base directory
+        if hsi_directory is None:
+            self.hsi_directory = self.HSI_DIRECTORY
         else:
-            self.overviewstore_directory = overviewstore_directory
+            self.hsi_directory = hsi_directory
 
         # tmp_directory
         if tmp_directory is None:
@@ -157,7 +157,7 @@ class Rasteroverview():
         else:
             self.numeric_or_categorical = numeric_or_categorical
 
-        # Dict of statistics about timestamps, overview keys, and spatio-temporal partitions
+        # Dict of statistics about timestamps, hsi keys, and spatio-temporal partitions
         self.stats = {}
 
         self.verbose = verbose
@@ -166,7 +166,7 @@ class Rasteroverview():
         self.timestamps = None
         self.temporal_levels = None
         self.temporal_partitions = None
-        self.overview_keys = None
+        self.hsi_keys = None
         self.spatial_partition_level = None
         self.spatial_partitions = None
 
@@ -220,24 +220,24 @@ class Rasteroverview():
         return timestamps
 
     
-    def qtree_spatial_overview(self, key_col=None, level_col=None, geom_col=None):
-        """Determine overview cells using qtree algorithm."""
-        # Get the gridded geometries (boxes) at the overview level
-        qt = qtree.QTree(self.valid_range, self.overview_level, grid=self.grid) # initialize
+    def qtree_hsi(self, key_col=None, level_col=None, geom_col=None):
+        """Determine hsi cells using qtree algorithm."""
+        # Get the gridded geometries (boxes) at the hsi level
+        qt = qtree.QTree(self.valid_range, self.hsi_level, grid=self.grid) # initialize
         qt.quadtree_dfs() # build the quadtree (depth first search)
         gdf_grid = qt.gridded_to_geodataframe(
             key_col=key_col, level_col=level_col, hash_col='q_key', geom_col=geom_col
         ) # grid
 
-        # Set of overview keys
-        self.overview_keys = gdf_grid[self.key_col].to_list()
-        self.stats['number_overview_keys'] = len(self.overview_keys)
+        # Set of hsi keys
+        self.hsi_keys = gdf_grid[self.key_col].to_list()
+        self.stats['number_hsi_keys'] = len(self.hsi_keys)
         if self.verbose:
-            print('number_overview_keys            ', self.stats['number_overview_keys'])
+            print('number_hsi_keys                 ', self.stats['number_hsi_keys'])
 
-        # # Building separate (very narrow) trees for each overview cell
+        # # Building separate (very narrow) trees for each hsi cell
         # gdf_grid['qt'] = gdf_grid[self.geom_col].apply(
-        #     lambda x: qtree.QTree(x, self.overview_level, grid=self.grid)
+        #     lambda x: qtree.QTree(x, self.hsi_level, grid=self.grid)
         # )
         # # apply the quadtree algorithm
         # gdf_grid['qt'].apply(lambda x: x.quadtree_dfs())
@@ -261,8 +261,8 @@ class Rasteroverview():
             self.temporal_levels = []
             self.temporal_partitions = {}
 
-        # if self.overview_keys is None:
-        #     self.qtree_spatial_overview()
+        # if self.hsi_keys is None:
+        #     self.qtree_hsi()
 
         if s_part is not None:
             self.spatial_partitions = s_part.spatial_partitions
@@ -284,9 +284,9 @@ class Rasteroverview():
         """Collect spatio-temporal partition statistics (counts per partition)."""
         # Add spatio-temporal stats
         self.stats['max_rows_per_temp_part'] = self.stats[
-            'number_overview_keys'] * self.stats['max_ts_per_temp_part']
+            'number_hsi_keys'] * self.stats['max_ts_per_temp_part']
         self.stats['max_total_records'] = (self.stats['number_global_timestamps']
-                                           * self.stats['number_overview_keys'])
+                                           * self.stats['number_hsi_keys'])
         self.stats['max_rows_per_spatial_part'] = (self.stats['number_global_timestamps']
                                                    * self.stats['max_ovw_keys_per_spatial_part'])
         self.stats['max_rows_per_part'] = (self.stats['max_ts_per_temp_part']
@@ -296,7 +296,7 @@ class Rasteroverview():
 
         if self.verbose:
             print('number_global_timestamps        ', self.stats['number_global_timestamps'])
-            print('number_overview_keys            ', self.stats['number_overview_keys'])
+            print('number_hsi_keys                 ', self.stats['number_hsi_keys'])
             print('max_total_records (Million)     ', self.stats['max_total_records'] * 1e-6)
             print()
             print('number_temporal_partitions      ', self.stats['number_temporal_partitions'])
@@ -314,7 +314,7 @@ class Rasteroverview():
     def xarray_stats_numeric(self, arr, weights):
         """Area-weighted statistics for the spatial dimensions of an xarray.
         
-        :param arr:  xarray of lateral dimensions equaling exactly one overview cell.
+        :param arr:  xarray of lateral dimensions equaling exactly one hsi cell.
                      multiple timestamps may be included 
         """
         mod_ys = numpy.array(arr.mod_y)
@@ -419,11 +419,11 @@ class Rasteroverview():
         return stats.reset_index().set_index(dims + ['time'])
 
     
-    def overview_statistics(
+    def hsi_statistics(
         self, temporal_partition={}, spatial_partition=None, chunk_n=None,
         probe_local_timestamps=False, skip_existing=True, debug=False, **kwargs
     ):
-        """Calculate overviews and append or write to file.
+        """Calculate HSIs and append or write to file.
         
         temporal_partition calculating query timestamps based on a specific
                            temporal_partition. (E.g. specific year, month)
@@ -461,11 +461,11 @@ class Rasteroverview():
             # Query global
             spatial_partition =  '0q'
             query_key = '0q'
-            aggregation_keys = self.overview_keys
+            aggregation_keys = self.hsi_keys
         else:
             # Query spatial partition
             query_key        = spatial_partition
-            aggregation_keys = [o for o in self.overview_keys if o.startswith(query_key)]
+            aggregation_keys = [o for o in self.hsi_keys if o.startswith(query_key)]
 
             if probe_local_timestamps:
                 # probe the query_key area in the four corners as well as the center.
@@ -496,24 +496,24 @@ class Rasteroverview():
                 print('Found', len(query_epochtimes), 'new timestamps')
                 
             if debug:
-                return self._overview_statistics(
+                return self._hsi_statistics(
                     query_epochtimes, query_key, aggregation_keys, dimensions_lst,
                     chunk_n=chunk_n, debug=debug,
                     temporal_partition=temporal_partition, **kwargs
                 )
 
-            gdf_overview = self._overview_statistics(
+            gdf_hsi = self._hsi_statistics(
                 query_epochtimes, query_key, aggregation_keys, dimensions_lst,
                 chunk_n=chunk_n, temporal_partition=temporal_partition, **kwargs
             )
             
-            if len(gdf_overview)>0:
+            if len(gdf_hsi)>0:
                 # Append (if existing rows skipped)
                 self.to_parquet(
-                    gdf_overview, temporal_partition, spatial_partition, append=True
+                    gdf_hsi, temporal_partition, spatial_partition, append=True
                 )
                 # Free memory
-                del gdf_overview
+                del gdf_hsi
 
     
     def _probe_query_timestamps(self, query_key, query_epochtimes, **kwargs):
@@ -523,7 +523,7 @@ class Rasteroverview():
         :param query_epochtimes: "global" timestamps (for current temporal partition)
         :param kwargs:           cluster, dataserviceendpoint
         """
-        delta = self.overview_level - self.spatial_partition_level
+        delta = self.hsi_level - self.spatial_partition_level
         probe_keys = []
         probe_keys.append(query_key + '0' * delta) #sw
         probe_keys.append(query_key + '1' * delta) #se
@@ -600,7 +600,7 @@ class Rasteroverview():
         return weights_chunk
 
     
-    def _overview_statistics(
+    def _hsi_statistics(
         self, query_epochtimes, query_key, aggregation_keys, dimensions_lst, 
         chunk_n=None, debug=False, temporal_partition=None, **kwargs
     ):
@@ -608,7 +608,7 @@ class Rasteroverview():
         query_epochtimes list of timestamps
         query_key        quaternary key to define the query area. (E.g., one spatial partition)
                          Usually called as: query_key = spatial_partition
-        aggregation_keys list of q_keys to collect overview stats for. 
+        aggregation_keys list of q_keys to collect hsi stats for. 
                          (E.g., belonging to the spatial partition).
         chunk_n          limit number of timestamps queried at a time
         """
@@ -634,7 +634,7 @@ class Rasteroverview():
         if chunk_n is None:
             max_query_pixels_per_ts = (
                 self.stats['max_ovw_keys_per_spatial_part']
-                * 4**self.delta_pixel_overview
+                * 4**self.delta_pixel_hsi
             )
             chunk_n = int(self.MAX_QUERY_PIXELS // max_query_pixels_per_ts)
 
@@ -690,7 +690,7 @@ class Rasteroverview():
                         lst.append(arr)
                     arr = xarray.merge(lst)[self.layer_id]
 
-                # Overview grid is automatically aligned with pixel grid
+                # HSI grid is automatically aligned with pixel grid
                 delta_x = 0
                 delta_y = 0
 
@@ -787,7 +787,7 @@ class Rasteroverview():
                     # Unstacking the multiindex
                     arr = arr.set_index(midx=['time'] + list(self.dimension_values)).unstack('midx')
 
-                    # Align overview grid with pixel grid
+                    # Align hsi grid with pixel grid
                     delta_pixel_partition = self.pixel_level - self.spatial_partition_level
 
                     x0 = arr.x.min().item()-self.morton.resolution(self.pixel_level)[0]/2
@@ -805,18 +805,18 @@ class Rasteroverview():
 
             if not arr is None:
                 self.arr = arr #debug
-                # Multiindex in order to select all the lat/lon values belonging to overview cells
+                # Multiindex in order to select all the lat/lon values belonging to hsi cells
                 ovw_x = [
-                    l//2**self.delta_pixel_overview for l in range(delta_x, len(arr.x)+delta_x)
+                    l//2**self.delta_pixel_hsi for l in range(delta_x, len(arr.x)+delta_x)
                 ]
                 mod_x = [
-                    l%2**self.delta_pixel_overview for l in range(delta_x, len(arr.x)+delta_x)
+                    l%2**self.delta_pixel_hsi for l in range(delta_x, len(arr.x)+delta_x)
                 ]
                 ovw_y = list(reversed([
-                    l//2**self.delta_pixel_overview for l in range(delta_y, len(arr.y)+delta_y)
+                    l//2**self.delta_pixel_hsi for l in range(delta_y, len(arr.y)+delta_y)
                 ]))
                 mod_y = list(reversed([
-                    l%2**self.delta_pixel_overview for l in range(delta_y, len(arr.y)+delta_y)
+                    l%2**self.delta_pixel_hsi for l in range(delta_y, len(arr.y)+delta_y)
                 ]))
                 
                 midx_x = pandas.MultiIndex.from_arrays(
@@ -886,13 +886,15 @@ class Rasteroverview():
             
                 # Pandas is fastest at a length around 1Mio rows, so target aerial chunks to that size
                 # Making chunks small also allows us to remove all-nan chunks before heavy calculations
-                TARGET = 5e6
+                TARGET = 1e7
                 
                 target_chunks = numpy.ceil(numpy.prod(arr.shape) / TARGET) # ceil assures at least one chunk
                 target_len_x = int(numpy.ceil(arr.ovw_x.shape[0]/numpy.sqrt(target_chunks)))
                 target_len_y = int(numpy.ceil(arr.ovw_y.shape[0]/numpy.sqrt(target_chunks)))
-                print(int(arr.ovw_x.min()), int(arr.ovw_x.max()), int(arr.ovw_y.min()), int(arr.ovw_y.max()))
-                print('--------------')
+                if self.verbose:
+                    print('ovw_x.min, ovw_x.max, ovw_y.min, ovw_y.max')
+                    print(int(arr.ovw_x.min()), int(arr.ovw_x.max()), int(arr.ovw_y.min()), int(arr.ovw_y.max()))
+                    print('--------------')
                 for ovw_x_range in self._chunks(list(arr.ovw_x.to_numpy()), target_len_x):
                     for ovw_y_range in self._chunks(list(arr.ovw_y.to_numpy()), target_len_y):
                         # Work on each chunk sequentially
@@ -900,7 +902,8 @@ class Rasteroverview():
                         idx_y = numpy.array(ovw_y_range) - int(arr.ovw_y[0])
                         arr_chunk = arr[idx_y[0]:idx_y[-1]+1, idx_x[0]:idx_x[-1]+1,::]
                         if not arr_chunk.isnull().all():
-                            print(int(arr_chunk.ovw_x.min()), int(arr_chunk.ovw_x.max()), int(arr_chunk.ovw_y.min()), int(arr_chunk.ovw_y.max()))
+                            if self.verbose:
+                                print(int(arr_chunk.ovw_x.min()), int(arr_chunk.ovw_x.max()), int(arr_chunk.ovw_y.min()), int(arr_chunk.ovw_y.max()))
                             if self.numeric_or_categorical == 'numeric':
                                 weights_chunk = self._weights_chunk(weights, idx_y, idx_x)
                                 df_stats.append(self.xarray_stats_numeric(arr_chunk, weights_chunk))
@@ -922,13 +925,13 @@ class Rasteroverview():
         # Get the quaternary key from the ovw_x and ovw_y positions within the xarray
         #x_min, y_min = self.morton.base4_to_xy_indices(min(aggregation_keys))
         x_min, y_min = self.morton.base4_to_xy_indices(
-            query_key + '0' * (self.overview_level-self.spatial_partition_level)
+            query_key + '0' * (self.hsi_level-self.spatial_partition_level)
         )
         gdf_unique = df_stats[['ovw_y', 'ovw_x']].drop_duplicates().reset_index(drop=True)
-        xs = self.morton.x_idx_to_center_coord(gdf_unique['ovw_x'] + x_min, self.overview_level)
-        ys = self.morton.y_idx_to_center_coord(gdf_unique['ovw_y'] + y_min, self.overview_level)
-        keys = self.morton.get_key(numpy.array(ys), numpy.array(xs), [self.overview_level]*len(xs))
-        q_keys = self.morton.encode(keys, [self.overview_level]*len(xs))
+        xs = self.morton.x_idx_to_center_coord(gdf_unique['ovw_x'] + x_min, self.hsi_level)
+        ys = self.morton.y_idx_to_center_coord(gdf_unique['ovw_y'] + y_min, self.hsi_level)
+        keys = self.morton.get_key(numpy.array(ys), numpy.array(xs), [self.hsi_level]*len(xs))
+        q_keys = self.morton.encode(keys, [self.hsi_level]*len(xs))
         gdf_unique[self.key_col] = q_keys
 
         # Convert to geopandas GeoDataFrame
@@ -945,7 +948,7 @@ class Rasteroverview():
         # assert set(gdf_unique[self.key_col]).issubset(set(aggregation_keys))
 
         # Merge keys and stats
-        gdf_overview = pandas.merge(
+        gdf_hsi = pandas.merge(
             gdf_unique,
             df_stats.reset_index().rename(
                 # Keeping the dimension prefix due to possible clashes with statistic columns
@@ -954,24 +957,24 @@ class Rasteroverview():
             ),
             on=['ovw_x', 'ovw_y']
         )
-        del gdf_overview['ovw_x']
-        del gdf_overview['ovw_y']
+        del gdf_hsi['ovw_x']
+        del gdf_hsi['ovw_y']
         
         # Debug: Strangely we are getting epochtimes here instead of datetimes, so catching here
-        if gdf_overview[self.dt_col].dtype == numpy.dtype('int64'):
+        if gdf_hsi[self.dt_col].dtype == numpy.dtype('int64'):
             print('WARNING: ', self.dt_col, 'of dtype int64 detected. Translating to datetime')
             try:
-                gdf_overview[self.dt_col] = gdf_overview[self.dt_col].apply(
+                gdf_hsi[self.dt_col] = gdf_hsi[self.dt_col].apply(
                     lambda x: datetime.utcfromtimestamp(x).replace(tzinfo=pytz.utc)
                 )
             except OSError as e:
                 # Maybe value was too large (nano second timestamp definition)
-                gdf_overview[self.dt_col] = gdf_overview[self.dt_col].apply(
+                gdf_hsi[self.dt_col] = gdf_hsi[self.dt_col].apply(
                     lambda x: datetime.utcfromtimestamp(x/1e9).replace(tzinfo=pytz.utc)
                 )
 
-        gdf_overview = gdf_overview.set_crs(self.grid.crs)
-        return gdf_overview
+        gdf_hsi = gdf_hsi.set_crs(self.grid.crs)
+        return gdf_hsi
 
     
     def _chunks(self, lst, chunk_n):
@@ -984,14 +987,14 @@ class Rasteroverview():
     
     def _parquet_directory(self):
         """Composing the parquet directory."""
-        parquet_directory = self.overviewstore_directory
+        parquet_directory = self.hsi_directory
         if self.dset_id is not None:
             parquet_directory = os.path.join(parquet_directory, 'dset_id=' + self.dset_id).replace('\\', '/')
         if self.layer_id is not None:
             parquet_directory = os.path.join(parquet_directory, 'layer_id=' + self.layer_id).replace('\\', '/')
         parquet_directory = os.path.join(
             parquet_directory,
-            'overview_level=' + str(self.overview_level)
+            'hsi_level=' + str(self.hsi_level)
         ).replace('\\', '/')
         if not os.path.exists(parquet_directory):
             os.makedirs(parquet_directory)
@@ -1010,7 +1013,7 @@ class Rasteroverview():
         if create_path and not os.path.exists(filepath):
             os.makedirs(filepath)
 
-        filename = 'overview.parquet'
+        filename = 'hsi.parquet'
         return os.path.join(filepath, filename).replace('\\', '/')
 
     
@@ -1035,9 +1038,9 @@ class Rasteroverview():
             if key in self.temporal_levels:
                 # Found another temporal partition
                 temporal_partition[key] = value
-            elif key=='overview_level':
-                overview_level = int(value)
-                assert overview_level==self.overview_level
+            elif key=='hsi_level':
+                hsi_level = int(value)
+                assert hsi_level==self.hsi_level
             elif key=='layer_id':
                 layer_id = int(value)
                 assert layer_id==self.layer_id
@@ -1047,8 +1050,8 @@ class Rasteroverview():
             else:
                 raise ValueError("Non-compliant filepath." )
 
-        # Finally we should be left with the overviewstore_directory
-        assert dirname.rstrip('/')==self.overviewstore_directory.rstrip('/')
+        # Finally we should be left with the hsi_directory
+        assert dirname.rstrip('/')==self.hsi_directory.rstrip('/')
 
         return temporal_partition, spatial_partition
 
@@ -1151,9 +1154,9 @@ class Rasteroverview():
             dset_id = self.dset_id,
             layer_id = self.layer_id,
             pixel_level = self.pixel_level,
-            delta_pixel_overview = self.delta_pixel_overview,
-            overview_level = self.overview_level,
-            max_pixel_count = 4**self.delta_pixel_overview,
+            delta_pixel_hsi = self.delta_pixel_hsi,
+            hsi_level = self.hsi_level,
+            max_pixel_count = 4**self.delta_pixel_hsi,
         )
         # Rechunk uniformly for zarr
         ds = ds.chunk(chunks)
@@ -1197,14 +1200,14 @@ class Rasteroverview():
         zarr_directory = self._parquet_directory()
         # We don's store the zarr file(s) within the parquet directory, so go one level back.
         zarr_directory = os.path.split(zarr_directory)[0]
-        return os.path.join(zarr_directory, 'zarr_level' + str(self.overview_level)).replace('\\', '/')
+        return os.path.join(zarr_directory, 'zarr_level' + str(self.hsi_level)).replace('\\', '/')
 
     
     def _csv_path(self):
         csv_directory = self._parquet_directory()
         # We don's store the csv file within the parquet directory, so go one level back.
         csv_directory = os.path.split(csv_directory)[0]
-        csv_name = self.layer_id + '_level' + str(self.overview_level) + '.csv'
+        csv_name = self.layer_id + '_level' + str(self.hsi_level) + '.csv'
         return os.path.join(csv_directory, csv_name).replace('\\', '/')
 
     
@@ -1212,7 +1215,7 @@ class Rasteroverview():
         json_directory = self._parquet_directory()
         # We don's store the json file within the parquet directory, so go one level back.
         json_directory = os.path.split(json_directory)[0]
-        json_name = 'level' + str(self.overview_level) + '.json'
+        json_name = 'level' + str(self.hsi_level) + '.json'
         return os.path.join(json_directory, json_name).replace('\\', '/')
 
     
@@ -1220,9 +1223,9 @@ class Rasteroverview():
         """Dump attributes to a json file."""
         json_dict = {}
         json_dict['pixel_level'] = self.pixel_level
-        json_dict['delta_pixel_overview'] = self.delta_pixel_overview
-        json_dict['overview_level'] = self.overview_level
-        json_dict['overviewstore_directory'] = self.overviewstore_directory
+        json_dict['delta_pixel_hsi'] = self.delta_pixel_hsi
+        json_dict['hsi_level'] = self.hsi_level
+        json_dict['hsi_directory'] = self.hsi_directory
         json_dict['dset_id'] = self.dset_id
         json_dict['layer_id'] = self.layer_id
         json_dict['dimension_values'] = self.dimension_values
@@ -1233,7 +1236,7 @@ class Rasteroverview():
         json_dict['spatial_partition_level'] = self.spatial_partition_level
         json_dict['spatial_partitions'] = self.spatial_partitions
         json_dict['stats'] = self.stats
-        json_dict['overview_keys'] = self.overview_keys
+        json_dict['hsi_keys'] = self.hsi_keys
         json_dict['numeric_or_categorical'] = self.numeric_or_categorical
 
         json_path = self._json_path()
