@@ -649,7 +649,10 @@ def register_hsi_items_stac(
                 description = 'band'
             elif col=='dimension_tile':
                 description = 'tile'
+            elif col=='grid':
+                description = 'grid'
             else:
+                print('Gdf columns', gdf1.columns)
                 raise ValueError(f'"{col}" column name not understood.')
                 description = None
 
@@ -657,7 +660,6 @@ def register_hsi_items_stac(
                 {
                     "name": col,
                     "description": description,
-                    #"type": str(gdf1[col].dtype),
                     "type": repr(gdf1[col].dtype),
                 }
             )
@@ -782,7 +784,7 @@ def register_hsi_items_stac(
     # Upload using shellscript
     #os.system(f'{load_hsi_stac_filepath} >/dev/null 2>&1')
     #print(os.system(f'{load_hsi_stac_filepath}'))
-    os.system(f'{load_hsi_stac_filepath} --collection_id={arg_collection_id} --json_folder={json_folder} --stac_url={stac_url} --CERTIFICATE={CERTIFICATE}')
+    os.system(f'sh {load_hsi_stac_filepath} --collection_id={arg_collection_id} --json_folder={json_folder} --stac_url={stac_url} --CERTIFICATE={CERTIFICATE}')
     
     return
 
