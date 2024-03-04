@@ -1406,10 +1406,15 @@ class Vectorstore():
         for k in vs_settings:
             if k=='valid_range':
                 vs_settings[k] = shapely.from_geojson(vs_settings[k])
+                setattr(self, k, vs_settings[k])
             elif k=='grid':
                 # Recreate a grid object from __repr__()
                 vs_settings[k] = eval("nestedgrid." + vs_settings[k])
-            setattr(self, k, vs_settings[k])
+                setattr(self, k, vs_settings[k])
+                # Initialize morton since it depends on grid
+                self.morton = mortoncurve.Morton(self.grid)
+            else:
+                setattr(self, k, vs_settings[k])
             
 
 

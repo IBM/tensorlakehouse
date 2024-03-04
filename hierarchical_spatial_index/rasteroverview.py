@@ -1257,10 +1257,15 @@ class Rasteroverview():
         for k in json_dict:
             if k=='valid_range':
                 json_dict[k] = shapely.from_geojson(json_dict[k])
+                setattr(self, k, json_dict[k])
             elif k=='grid':
                 # Recreate a grid object from __repr__()
                 json_dict[k] = eval("nestedgrid." + json_dict[k])
-            setattr(self, k, json_dict[k])
+                setattr(self, k, json_dict[k])
+                # Initialize morton since it depends on grid
+                self.morton = mortoncurve.Morton(self.grid)
+            else:
+                setattr(self, k, json_dict[k])
 
 
 class NpEncoder(json.JSONEncoder):
