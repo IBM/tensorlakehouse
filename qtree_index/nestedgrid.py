@@ -440,6 +440,8 @@ class User_defined_WGS84():
     epsg: coordinate reference system
     """
     def __init__(self, xs, ys, epsg=4326):
+        self.xs = xs
+        self.ys = ys
         self.epsg = parse(epsg)
 
         # World grid requires WGS84
@@ -509,9 +511,9 @@ class User_defined_WGS84():
         self.valid_bounds_wgs84 = self.valid_bounds
         
     def __repr__(self):
-        """Adding the epsg to the class so that we can use eval to instantiate."""
+        """Adding the parameters xs, ys, epsg to the class so that we can use eval to instantiate."""
         cls = type(self)
-        return f"{cls.__name__}({self.epsg.__repr__()})"
+        return f"{cls.__name__}([{','.join([str(f) for f in self.xs])}],[{','.join([str(f) for f in self.ys])}],{self.epsg.__repr__()})"
 
     def area_weights(self, x_coord, y_coord):
         """Weights for area normalizations (return 1 if equal area grid)."""

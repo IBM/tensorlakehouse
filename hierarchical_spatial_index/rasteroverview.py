@@ -15,6 +15,7 @@ from multiprocessing import Pool
 import numpy
 import pandas
 import geopandas
+import shapely
 import pytz
 import xarray
 import dask
@@ -23,7 +24,7 @@ import itertools
 import dataservice.query
 
 sys.path.insert(1, os.path.abspath(".."))
-from qtree_index import mortoncurve, qtree
+from qtree_index import nestedgrid, mortoncurve, qtree
 
 
 class Rasteroverview():
@@ -1229,6 +1230,7 @@ class Rasteroverview():
         json_dict['dset_id'] = self.dset_id
         json_dict['layer_id'] = self.layer_id
         json_dict['dimension_values'] = self.dimension_values
+        json_dict['dataservice_type'] = self.dataservice_type
         json_dict['dt_col'] = self.dt_col
         json_dict['geom_col'] = self.geom_col
         json_dict['temporal_levels'] = self.temporal_levels
@@ -1238,19 +1240,27 @@ class Rasteroverview():
         json_dict['stats'] = self.stats
         json_dict['hsi_keys'] = self.hsi_keys
         json_dict['numeric_or_categorical'] = self.numeric_or_categorical
+        # The following objects require special attention to serialize and read back
+        json_dict['valid_range'] = shapely.to_geojson(self.valid_range)
+        json_dict['grid'] = self.grid.__repr__()
 
         json_path = self._json_path()
         with open(json_path, 'w') as file:
             json.dump(json_dict, file, cls=NpEncoder)
 
-    
+
     def from_json(self):
         """Load attributes from a json file."""
         json_path = self._json_path()
         with open(json_path) as file:
             json_dict = json.load(file)
-        for key in json_dict:
-            setattr(self, key, json_dict[key])
+        for k in json_dict:
+            if k=='valid_range':
+                json_dict[k] = shapely.from_geojson(json_dict[k])
+            elif k=='grid':
+                # Recreate a grid object from __repr__()
+                json_dict[k] = eval("nestedgrid." + json_dict[k])
+            setattr(self, k, json_dict[k])
 
 
 class NpEncoder(json.JSONEncoder):
