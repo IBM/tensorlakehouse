@@ -527,7 +527,7 @@ def register_hsi_items_stac(
     If dataservice_type=='remote_filesystem' please provide
     remote_fs, access_key_id, secret_access_key, and endpoint_url in the kwargs.
     """
-    CERTIFICATE = "ca.cert.txt"
+    CERTIFICATE = kwargs.get('certificate', 'ca.cert.txt')
     if dataservice_type=='remote_filesystem':
         remote_fs = kwargs.get('remote_fs')
         access_key_id = kwargs.get('access_key_id')
@@ -555,8 +555,7 @@ def register_hsi_items_stac(
 
     for i, storage_url_part in enumerate(storage_urls):
         print('debug storage_url_part', storage_url_part)
-        if not os.path.exists(json_folder):
-            os.makedirs(json_folder)
+        os.makedirs(os.path.join(json_folder, 'submitted'), exist_ok=True)
         json_filepath = f'{json_folder}/item{i}.json'
 
         #epsg = grid.crs.to_epsg()
