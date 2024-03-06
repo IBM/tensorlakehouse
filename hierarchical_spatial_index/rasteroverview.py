@@ -171,6 +171,14 @@ class Rasteroverview():
         self.spatial_partition_level = None
         self.spatial_partitions = None
 
+
+    def utcfromtimestamp(self, x):
+        try:
+            return datetime.utcfromtimestamp(x).replace(tzinfo=pytz.utc)
+        except OSError as e:
+            # Maybe value was too large (nano second timestamp definition)
+            return datetime.utcfromtimestamp(x/1e9).replace(tzinfo=pytz.utc)
+
     
     def available_timestamps(
         self,
@@ -214,9 +222,7 @@ class Rasteroverview():
             print('len(timestamps)                 ', len(epochtimes))
 
         # Translate to datetime
-        timestamps = [
-            datetime.utcfromtimestamp(e).replace(tzinfo=pytz.utc) for e in epochtimes
-        ]
+        timestamps = [self.utcfromtimestamp(e) for e in epochtimes]
 
         return timestamps
 
@@ -654,7 +660,7 @@ class Rasteroverview():
         print('Numbers of query_epochtimes to work on:', len(query_epochtimes))
         for i, chunk in enumerate(self._chunks(query_epochtimes, chunk_n)):
             print(query_key, temporal_partition, '; chunk', i, ': ', len(chunk))
-            print('chunk', chunk)
+            print('chunk', [self.utcfromtimestamp(c) for c in chunk])
  
             if self.dataservice_type=='hbase':
                 # Get the data from the hbase dataservice
@@ -696,7 +702,7 @@ class Rasteroverview():
                 for elements in itertools.product(*({'time':chunk} | self.dimension_values).values()):
                     # Filtering the metadata using specific epochtime and dimension values
                     flt = {
-                        'time': datetime.utcfromtimestamp(elements[0]).replace(tzinfo=pytz.utc)
+                        'time': self.utcfromtimestamp(elements[0])
                     } | {
                         d:elements[i+1] for i, d in enumerate(self.dimension_values)
                     }
@@ -952,17 +958,10 @@ class Rasteroverview():
         
         # Debug: Strangely we are getting epochtimes here instead of datetimes, so catching here
         if gdf_hsi[self.dt_col].dtype == numpy.dtype('int64'):
+            gdf_hsi[self.dt_col] = gdf_hsi[self.dt_col].apply(lambda x: self.utcfromtimestamp(x))
+            
             if self.verbose:
                 print('WARNING: ', self.dt_col, 'of dtype int64 detected. Translating to datetime')
-            try:
-                gdf_hsi[self.dt_col] = gdf_hsi[self.dt_col].apply(
-                    lambda x: datetime.utcfromtimestamp(x).replace(tzinfo=pytz.utc)
-                )
-            except OSError as e:
-                # Maybe value was too large (nano second timestamp definition)
-                gdf_hsi[self.dt_col] = gdf_hsi[self.dt_col].apply(
-                    lambda x: datetime.utcfromtimestamp(x/1e9).replace(tzinfo=pytz.utc)
-                )
 
         gdf_hsi = gdf_hsi.set_crs(self.grid.crs)
         return gdf_hsi

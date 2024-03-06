@@ -29,7 +29,7 @@ def stac_search_available(
     day = None,
     fields = None,
     filter_band = None,
-    filter_crs = None, #DEBUG, DOES NOT WORK YET SINCE RAW DATA HAS WRONG CRS
+    filter_epsg = None, 
     verbose = False,
 ):
     """Search for available raw data."""
@@ -59,17 +59,17 @@ def stac_search_available(
             if year is None:
                 dt_start = None
             else:
-                dt_start = datetime(year, 1, 1)
-                dt_end = (datetime(year+1, 1, 1)-timedelta(seconds=1))
+                dt_start = datetime(year, 1, 1, tzinfo=pytz.utc)
+                dt_end = (datetime(year+1, 1, 1, tzinfo=pytz.utc)-timedelta(seconds=1))
         else:
             if year is None:
                 raise ValueError
             else:
-                dt_start = datetime(year, month, 1)
+                dt_start = datetime(year, month, 1, tzinfo=pytz.utc)
                 if month<12:
-                    dt_end = (datetime(year, month+1, 1)-timedelta(seconds=1))
+                    dt_end = (datetime(year, month+1, 1, tzinfo=pytz.utc)-timedelta(seconds=1))
                 elif month==12:
-                    dt_end = (datetime(year+1, 1, 1)-timedelta(seconds=1))
+                    dt_end = (datetime(year+1, 1, 1, tzinfo=pytz.utc)-timedelta(seconds=1))
                 else:
                     raise ValueError
     else:
@@ -78,8 +78,8 @@ def stac_search_available(
         elif month is None:
             raise ValueError
         else:
-            dt_start = datetime(year, month, day)
-            dt_end = datetime(year, month, day)+timedelta(seconds=24*3600-1)
+            dt_start = datetime(year, month, day, tzinfo=pytz.utc)
+            dt_end = datetime(year, month, day, tzinfo=pytz.utc)+timedelta(seconds=24*3600-1)
 
     # Translate datetime to format stac understands
     dt_string = None
@@ -113,11 +113,12 @@ def stac_search_available(
                 item for item in next_items if (filter_band in item.properties['cube:variables'])
             ]
 
-        # Filter crs
-        if filter_crs is not None:
-            next_items = [item for item in next_items if (
-                f'EPSG:'+str(item.properties['cube:dimensions']['x']['reference_system'])==filter_crs
-            )]
+        # # debug: DOES NOT WORK YET SINCE RAW DATA HAS WRONG CRS
+        # # Filter epsg
+        # if filter_epsg is not None:
+        #     next_items = [item for item in next_items if (
+        #         f'EPSG:'+str(item.properties['cube:dimensions']['x']['reference_system'])==filter_epsg
+        #     )]
             
         if verbose:
             print('batch', i, '; filtered', len(next_items))
@@ -166,6 +167,7 @@ def stac_search_items_to_raster_local_metadata(
     cos_bucket,
     grid,
     dataservice_type,
+    filter_epsg_using_utm_zone_from_tile,
 ):
     # Create metadataframe from stac search_items
     gdf_local_meta = geopandas.GeoDataFrame([{
@@ -201,11 +203,13 @@ def stac_search_items_to_raster_local_metadata(
 
     gdf_local_meta['epoch'] = gdf_local_meta['time'].apply(lambda x: int(x.timestamp()))
 
-    # Instead of relying on the crs directly, we can use the tile information to deduce the UTM zone
-    gdf_local_meta['zone_number'] = gdf_local_meta['tile'].str[1:3].astype(int)
+    if filter_epsg_using_utm_zone_from_tile:
+        # Using the zone_number from the tile designation to deduce the UTM zone 
+        # (Note currently reference_system in STAC items cube:dimensions extension is unreliable)
+        gdf_local_meta['zone_number'] = gdf_local_meta['tile'].str[1:3].astype(int)
 
-    # Filter UTM zone
-    gdf_local_meta = gdf_local_meta[gdf_local_meta['zone_number']==grid.zone_number]
+        # Filter UTM zone
+        gdf_local_meta = gdf_local_meta[gdf_local_meta['zone_number']==grid.zone_number]
 
     # Since we got the geometry in WGS84 coordinates, transform to native grid
     gdf_local_meta = gdf_local_meta.set_crs('4326').to_crs(grid.crs)
@@ -814,13 +818,6 @@ def search_hsi(
     for search_item in search_items:
         storage_url = search_item.assets['data'].href
         epsg = search_item.properties['proj:epsg']
-        
-        # if (required_crs is not None) and (epsg!=required_crs):
-        #     continue
-
-        # if verbose:
-        #     print('storage_url       ', storage_url)
-
         try:
             gdf_hsi = geopandas.read_parquet(
                 storage_url,
