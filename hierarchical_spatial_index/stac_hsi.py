@@ -518,7 +518,6 @@ def register_hsi_items_stac(
     grid,
     json_folder,
     dataservice_type,
-    load_hsi_stac_filepath, #'/path/to/shellscript/load_hsi_stac.sh',
     stac_url,
     **kwargs,
 ):
@@ -527,7 +526,7 @@ def register_hsi_items_stac(
     If dataservice_type=='remote_filesystem' please provide
     remote_fs, access_key_id, secret_access_key, and endpoint_url in the kwargs.
     """
-    CERTIFICATE = kwargs.get('certificate', 'ca.cert.txt')
+    certificate = kwargs.get('certificate', 'ca.cert.txt')
     if dataservice_type=='remote_filesystem':
         remote_fs = kwargs.get('remote_fs')
         access_key_id = kwargs.get('access_key_id')
@@ -542,7 +541,7 @@ def register_hsi_items_stac(
 
     if dataservice_type=='local_filesystem':
         # Accessing in local (or mounted) drive
-        storage_urls = glob(os.path.join(hsi_directory, '*/*/*/*.parquet').replace('\\', '/'))
+        storage_urls = glob(os.path.join(hsi_directory, '**/*.parquet').replace('\\', '/'))
     elif dataservice_type=='remote_filesystem':
         # Using s3fs to access
         storage_urls = remote_fs.glob(os.path.join(hsi_directory, '**/*.parquet').replace('\\', '/'))
@@ -552,11 +551,12 @@ def register_hsi_items_stac(
 
     print('storage_urls', len(storage_urls))
     #print(*storage_urls, sep='\n')
+    json_folder_submitted = os.path.join(json_folder, 'submitted') 
+    os.makedirs(json_folder_submitted, exist_ok=True)
 
     for i, storage_url_part in enumerate(storage_urls):
         print('debug storage_url_part', storage_url_part)
-        os.makedirs(os.path.join(json_folder, 'submitted'), exist_ok=True)
-        json_filepath = f'{json_folder}/item{i}.json'
+        json_filepath = os.path.join(json_folder, f'item{i}.json')
 
         #epsg = grid.crs.to_epsg()
         epsg = grid.epsg
@@ -773,17 +773,13 @@ def register_hsi_items_stac(
 
         with open(json_filepath, 'w') as outfile:
             json.dump(stac_item_dict, outfile, indent=4, sort_keys=False)
-            
-    # See what json files are there
-    # glob(os.path.join(json_folder, '*.json').replace('\\', '/')))
-    
-    # Debug: catch the case where the collection_id contains space characters
-    arg_collection_id = hsi_collection_id.replace(" ", "%20")
-    
-    # Upload using shellscript
-    #os.system(f'{load_hsi_stac_filepath} >/dev/null 2>&1')
-    #print(os.system(f'{load_hsi_stac_filepath}'))
-    os.system(f'sh {load_hsi_stac_filepath} --collection_id={arg_collection_id} --json_folder={json_folder} --stac_url={stac_url} --CERTIFICATE={CERTIFICATE}')
+
+    # Upload files to STAC
+    stac_collection_url = os.path.join(stac_url, 'collections', hsi_collection_id.replace(" ", "%20"), 'items').replace('\\', '/')
+    for file in glob(os.path.join(json_folder, '*.json')):
+        file = file.replace('\\', '/')
+        os.system(f'curl -H "Content-Type: application/json" -X POST {stac_collection_url} -kL {certificate} -d "@{file}"')
+        os.system(f'mv {file} {json_folder_submitted}')
     
     return
 
