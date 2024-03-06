@@ -19,6 +19,7 @@ import itertools
 import uuid
 import pystac_client
 
+
 def stac_search_available(
     stac_url,
     collection_id,
@@ -136,36 +137,6 @@ def stac_search_available(
     return search_items
 
 
-# If necessary, get additional data from the filepath or file metadata
-def _dt_from_filepath(filepath):
-    dt_string = filepath.split('.')[-5]
-    return datetime.strptime(dt_string, '%Y%jT%H%M%S').replace(tzinfo=pytz.utc)
-
-def _tile_from_filepath(filepath):
-    return filepath.split('.')[-6]
-
-def _band_from_filepath(filepath):
-    return filepath.split('.')[-2]
-
-def _product_from_filepath(filepath):
-    return filepath.split('.')[-7]
-
-def _bounds_from_file(filepath):
-    # Finding the bounds of the data and the available timestamps
-    arr = xarray.open_dataarray(
-        filepath,
-        masked=True, 
-    )
-    #dx, dy = morton.resolution(pixel_level)
-    dx = abs(arr.x[1].item()-arr.x[0].item())
-    dy = abs(arr.y[1].item()-arr.y[0].item())
-    return shapely.box(
-        arr.x.min().item()-dx/2,
-        arr.y.min().item()-dy/2,
-        arr.x.max().item()+dx/2,
-        arr.y.max().item()+dy/2,
-    )
-
 def _epsg_from_file(filepath):
     arr = xarray.open_dataarray(
         filepath,
@@ -189,6 +160,7 @@ def _epsg_from_file(filepath):
         
     return epsg
 
+
 def stac_search_items_to_raster_local_metadata(
     search_items,
     cos_bucket,
@@ -197,9 +169,8 @@ def stac_search_items_to_raster_local_metadata(
 ):
     # Create metadataframe from stac search_items
     gdf_local_meta = geopandas.GeoDataFrame([{
-        #'item': item,
         'id': item.id,
-        #'time': item.datetime,
+        'time': item.datetime,
         'cloud_coverage': item.properties['cloud_coverage'],
         'tile': item.properties['tile'],
         'band': list(item.properties['cube:variables'].keys())[0],
@@ -220,14 +191,15 @@ def stac_search_items_to_raster_local_metadata(
     else:
         raise NotImplementedError()
     
-    # Gather additional properties from filepath
-    gdf_local_meta['time'] = gdf_local_meta['filepath'].apply(_dt_from_filepath)
+    # Truncate the time at least to seconds since we use epochtime internally
+    gdf_local_meta['time_original'] = gdf_local_meta['time']
+    gdf_local_meta['time'] = gdf_local_meta['time'].apply(lambda x: datetime(
+        x.year, x.month, x.day, x.hour, x.minute, x.second, tzinfo=pytz.utc
+    ))
+    # debug: Truncating to minute, hour, or day may allow merging multiple timestamps
+    #gdf_local_meta['time'] = gdf_local_meta['time'].apply(lambda x: datetime(x.year, x.month, x.day, tzinfo=pytz.utc))
+
     gdf_local_meta['epoch'] = gdf_local_meta['time'].apply(lambda x: int(x.timestamp()))
-    # gdf_local_meta['tile'] = gdf_local_meta['filepath'].apply(_tile_from_filepath)
-    # gdf_local_meta['band'] = gdf_local_meta['filepath'].apply(_band_from_filepath)
-    gdf_local_meta['product'] = gdf_local_meta['filepath'].apply(_product_from_filepath)
-    #gdf_local_meta['geometry_utm'] = gdf_local_meta['filepath'].apply(_bounds_from_filepath)
-    #gdf_local_meta['epsg'] = gdf_local_meta['filepath'].apply(_epsg_from_file)
 
     # Instead of relying on the crs directly, we can use the tile information to deduce the UTM zone
     gdf_local_meta['zone_number'] = gdf_local_meta['tile'].str[1:3].astype(int)
@@ -239,7 +211,7 @@ def stac_search_items_to_raster_local_metadata(
     gdf_local_meta = gdf_local_meta.set_crs('4326').to_crs(grid.crs)
 
     # Sort
-    gdf_local_meta = gdf_local_meta.sort_values(by=['product', 'band', 'tile', 'time']).reset_index(drop=True)
+    gdf_local_meta = gdf_local_meta.sort_values(by=['band', 'tile', 'time']).reset_index(drop=True)
     
     return gdf_local_meta
 
@@ -264,28 +236,15 @@ def setup_hsi(
     epsg = grid.epsg
 
     dimension_values = {
-        'product':[
-            'L30', # Landsat
-            'S30', # Sentinel
-        ],
         'band':bands,
         'tile':sorted(gdf_local_meta['tile'].unique()),
     }
 
     # Available timestamps
-    timestamps = []
-    for filepath in gdf_local_meta['filepath']:
-        # Timestamps
-        timestamps.append(_dt_from_filepath(filepath))
-    timestamps = sorted(set(timestamps))
-
-    # # Valid range
-    # valid_bounds = morton.valid_range.bounds
-    # valid_range = shapely.box(*valid_bounds)
-    # print('valid_range            ', valid_range.bounds)
+    timestamps = sorted(set(gdf_local_meta['time']))
 
     # Total bounds of all the data
-    total_bounds = shapely.ops.unary_union(gdf_local_meta['geometry'])
+    total_bounds = shapely.ops.unary_union(gdf_local_meta['geometry'].drop_duplicates())
 
     if verbose:
         print('epsg                    ', epsg)
@@ -335,17 +294,6 @@ def setup_hsi(
         print('temporal_partitions     ', t_part.temporal_partitions)
 
     # Spatial partitions: Group hsi cells in appropriate spatial partitions
-
-    # Eiter Split the geometric area until the number of hsi keys per partition is below a threshold level
-    # split_n = 100000 #256 #1024 #200 #500 
-    # s_part = partition.SpatialPartition(
-    #     raster_or_vector = 'raster',
-    #     max_spatial_level = raster.hsi_level,
-    #     split_n = split_n,
-    # )
-
-    # Or use uniform SPATIAL_PARTITION_LEVEL
-
     s_part = partition.UniformSpatialPartition(
         raster_or_vector = 'raster',
         spatial_level = SPATIAL_PARTITION_LEVEL,
@@ -642,14 +590,10 @@ def register_hsi_items_stac(
                 description = 'base4 key of the spatial partition'
             elif col in ('year', 'month', 'day'):
                 description = 'temporal partition: ' + col
-            elif col=='dimension_product':
-                description = 'product'
             elif col=='dimension_band':
                 description = 'band'
             elif col=='dimension_tile':
                 description = 'tile'
-            elif col=='grid':
-                description = 'grid'
             else:
                 print('Gdf columns', gdf1.columns)
                 raise ValueError(f'"{col}" column name not understood.')

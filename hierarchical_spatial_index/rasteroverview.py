@@ -331,7 +331,6 @@ class Rasteroverview():
         maximum.name = 'max'
 
         arr_weighted = arr.weighted(weights)
-        self.weights = weights #debug
 
         weighted_mean = arr_weighted.mean(("mod_x", "mod_y")).astype(numpy.float32, casting='same_kind')
         weighted_mean.name = 'mean'
@@ -422,7 +421,7 @@ class Rasteroverview():
     
     def hsi_statistics(
         self, temporal_partition={}, spatial_partition=None, chunk_n=None,
-        probe_local_timestamps=False, skip_existing=True, debug=False, **kwargs
+        probe_local_timestamps=False, skip_existing=True, **kwargs
     ):
         """Calculate HSIs and append or write to file.
         
@@ -472,8 +471,8 @@ class Rasteroverview():
                 # probe the query_key area in the four corners as well as the center.
                 query_epochtimes = self._probe_query_timestamps(query_key, query_epochtimes, **kwargs)
 
-        # check for existing timestamps and coverage in parquet files
         if skip_existing:
+            # check for existing timestamps and coverage in parquet files
             filepath = self._filepath(spatial_partition, temporal_partition, create_path=False)
             try:
                 df1 = pandas.read_parquet(filepath, columns=[self.dt_col, self.key_col])
@@ -496,13 +495,6 @@ class Rasteroverview():
             if self.verbose:
                 print('Found', len(query_epochtimes), 'new timestamps')
                 
-            if debug:
-                return self._hsi_statistics(
-                    query_epochtimes, query_key, aggregation_keys, dimensions_lst,
-                    chunk_n=chunk_n, debug=debug,
-                    temporal_partition=temporal_partition, **kwargs
-                )
-
             gdf_hsi = self._hsi_statistics(
                 query_epochtimes, query_key, aggregation_keys, dimensions_lst,
                 chunk_n=chunk_n, temporal_partition=temporal_partition, **kwargs
@@ -603,7 +595,7 @@ class Rasteroverview():
     
     def _hsi_statistics(
         self, query_epochtimes, query_key, aggregation_keys, dimensions_lst, 
-        chunk_n=None, debug=False, temporal_partition=None, **kwargs
+        chunk_n=None, temporal_partition=None, **kwargs
     ):
         """
         query_epochtimes list of timestamps
@@ -655,10 +647,14 @@ class Rasteroverview():
             # Find timestamps of filtered data
             filtered_epochtimes = [int(t.timestamp()) for t in sorted(set(gdf_local_meta[self.dt_col]))]
             query_epochtimes = sorted(set(query_epochtimes) & set(filtered_epochtimes))
+            if self.verbose:
+                print('filtered query_epochtimes', query_epochtimes)
 
         df_stats = []
         for i, chunk in enumerate(self._chunks(query_epochtimes, chunk_n)):
             print(query_key, temporal_partition, '; chunk', i, ': ', len(chunk))
+            if self.verbose:
+                print('chunk', chunk)
  
             if self.dataservice_type=='hbase':
                 # Get the data from the hbase dataservice
@@ -741,6 +737,8 @@ class Rasteroverview():
                             if i==0:
                                 arr = xarray.load_dataarray(local_path)
                             else:
+                                if self.verbose:
+                                    print('filling nan values with', local_path)
                                 arr.fillna(xarray.load_dataarray(local_path))
                             if (self.dataservice_type=='remote_filesystem') and os.path.isfile(local_path):
                                 # clean up
@@ -805,7 +803,7 @@ class Rasteroverview():
                 raise NotImplementedError(self.dataservice_type)
 
             if not arr is None:
-                self.arr = arr #debug
+                self.arr = arr
                 # Multiindex in order to select all the lat/lon values belonging to hsi cells
                 ovw_x = [
                     l//2**self.delta_pixel_hsi for l in range(delta_x, len(arr.x)+delta_x)
@@ -882,9 +880,6 @@ class Rasteroverview():
                 # get weights dims in the same order as arr dims for fast positional indexing
                 weights = weights.transpose(*[d for d in arr.dims if d in weights.dims])
             
-                # # Debug: Apply the area weights
-                # arr_weighted = arr.weighted(weights)
-            
                 # Pandas is fastest at a length around 1Mio rows, so target aerial chunks to that size
                 # Making chunks small also allows us to remove all-nan chunks before heavy calculations
                 TARGET = 1e7
@@ -943,11 +938,6 @@ class Rasteroverview():
         # Catch the case when the valid range intersects with the query partition
         gdf_unique = gdf_unique[~gdf_unique[self.geom_col].is_empty].reset_index(drop=True)
         
-        # Debug: There may be another problem when the valid range intersects, where gdf_unique has additional keys
-        # print('debug gdf_unique', gdf_unique)
-        # print('debug set(aggregation_keys)', set(aggregation_keys))
-        # assert set(gdf_unique[self.key_col]).issubset(set(aggregation_keys))
-
         # Merge keys and stats
         gdf_hsi = pandas.merge(
             gdf_unique,
@@ -963,7 +953,8 @@ class Rasteroverview():
         
         # Debug: Strangely we are getting epochtimes here instead of datetimes, so catching here
         if gdf_hsi[self.dt_col].dtype == numpy.dtype('int64'):
-            print('WARNING: ', self.dt_col, 'of dtype int64 detected. Translating to datetime')
+            if self.verbose:
+                print('WARNING: ', self.dt_col, 'of dtype int64 detected. Translating to datetime')
             try:
                 gdf_hsi[self.dt_col] = gdf_hsi[self.dt_col].apply(
                     lambda x: datetime.utcfromtimestamp(x).replace(tzinfo=pytz.utc)
