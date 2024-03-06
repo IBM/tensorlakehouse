@@ -651,10 +651,10 @@ class Rasteroverview():
                 print('filtered query_epochtimes', query_epochtimes)
 
         df_stats = []
+        print('Numbers of query_epochtimes to work on:', len(query_epochtimes))
         for i, chunk in enumerate(self._chunks(query_epochtimes, chunk_n)):
             print(query_key, temporal_partition, '; chunk', i, ': ', len(chunk))
-            if self.verbose:
-                print('chunk', chunk)
+            print('chunk', chunk)
  
             if self.dataservice_type=='hbase':
                 # Get the data from the hbase dataservice
@@ -803,7 +803,6 @@ class Rasteroverview():
                 raise NotImplementedError(self.dataservice_type)
 
             if not arr is None:
-                self.arr = arr
                 # Multiindex in order to select all the lat/lon values belonging to hsi cells
                 ovw_x = [
                     l//2**self.delta_pixel_hsi for l in range(delta_x, len(arr.x)+delta_x)

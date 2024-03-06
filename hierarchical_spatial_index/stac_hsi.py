@@ -165,7 +165,7 @@ def stac_search_items_to_raster_local_metadata(
     search_items,
     cos_bucket,
     grid,
-    dataservice_type, # 'local_filesystem', 'remote_filesystem'
+    dataservice_type,
 ):
     # Create metadataframe from stac search_items
     gdf_local_meta = geopandas.GeoDataFrame([{
@@ -221,50 +221,38 @@ def setup_hsi(
     tmp_directory,
     grid,
     gdf_local_meta,
-    bands,
+    dimension_values,
     numeric_or_categorical, 
-    dataservice_type, # 'local_filesystem', 'remote_filesystem'
+    dataservice_type,
+    pixel_level,
+    delta_pixel_hsi,
+    spatial_partition_level,
     verbose = False,
 ):
     """Create the Hierarchical Spatial Index from Data in COS."""
-    PIXEL_LEVEL = 20 # 30m UTM30m grid
-    DELTA_PIXEL_HSI = 5
-    SPATIAL_PARTITION_LEVEL = 7
-
-    # Projection from grid
-    #epsg = grid.crs.to_epsg()
-    epsg = grid.epsg
-
-    dimension_values = {
-        'band':bands,
-        'tile':sorted(gdf_local_meta['tile'].unique()),
-    }
-
     # Available timestamps
     timestamps = sorted(set(gdf_local_meta['time']))
 
     # Total bounds of all the data
     total_bounds = shapely.ops.unary_union(gdf_local_meta['geometry'].drop_duplicates())
+    gdf_total_bounds = geopandas.GeoDataFrame([{'geometry': total_bounds}])
 
     if verbose:
-        print('epsg                    ', epsg)
+        print('epsg                    ', grid.epsg)
         print('hsi_directory           ', hsi_directory)
         print('tmp_directory           ', tmp_directory)
         print('dataservice_type        ', dataservice_type)
         print('dimension_values        ', dimension_values)
-        print('delta_pixel_hsi         ', DELTA_PIXEL_HSI)
-        print('hsi level               ', PIXEL_LEVEL - DELTA_PIXEL_HSI)
+        print('delta_pixel_hsi         ', delta_pixel_hsi)
+        print('hsi level               ', pixel_level - delta_pixel_hsi)
         print('numeric_or_categorical  ', numeric_or_categorical)
         print('timestamps              ', len(timestamps))
         print('total_bounds            ', total_bounds.bounds)
 
-    # For plotting purposes
-    gdf_total_bounds = geopandas.GeoDataFrame([{'geometry': total_bounds}])
-
     # Initialize
     raster = rasteroverview.Rasteroverview(
-        pixel_level=PIXEL_LEVEL,
-        delta_pixel_hsi=DELTA_PIXEL_HSI,
+        pixel_level=pixel_level,
+        delta_pixel_hsi=delta_pixel_hsi,
         hsi_directory=hsi_directory,
         tmp_directory=tmp_directory,
         dset_id=None,
@@ -288,6 +276,7 @@ def setup_hsi(
     t_part.get_temporal_partition_levels(['year', 'month'])
     #t_part.get_temporal_partition_levels()
     t_part.get_temporal_partitions()
+
     if verbose:
         print('temporal_levels         ', t_part.temporal_levels)
         print('len(temporal_partitions)', len(t_part.temporal_partitions))
@@ -296,13 +285,8 @@ def setup_hsi(
     # Spatial partitions: Group hsi cells in appropriate spatial partitions
     s_part = partition.UniformSpatialPartition(
         raster_or_vector = 'raster',
-        spatial_level = SPATIAL_PARTITION_LEVEL,
+        spatial_level = spatial_partition_level,
     )
-
-    if verbose:
-        print('spatial_partition_level ', SPATIAL_PARTITION_LEVEL)
-
-    df_partition_count = s_part.planned_partitions(gdf_grid)
 
     # Let the raster object know about the partitions
     raster.partitions(t_part=t_part, s_part=s_part)
@@ -337,8 +321,8 @@ def setup_hsi(
 def hsi_worker(
     elements,
     raster,
-    CHUNK_N, #1
-    SKIP_EXISTING, #False
+    chunk_n,
+    skip_existing,
     **kwargs,
 ):
     print('elements ', elements)
@@ -360,9 +344,8 @@ def hsi_worker(
         temporal_partition, 
         spatial_partition, 
         probe_local_timestamps=False, 
-        skip_existing=SKIP_EXISTING,
-        n_workers = 1,
-        chunk_n = CHUNK_N,
+        chunk_n = chunk_n,
+        skip_existing=skip_existing,
         **kwargs,
     )
     return spatial_partition, temporal_partition
@@ -371,7 +354,7 @@ def hsi_worker(
 def upload_hsi_cos(
     src,
     dst,
-    dataservice_type, # 'local_filesystem', 'remote_filesystem'
+    dataservice_type,
     verbose = False,
     **kwargs,
 ):
@@ -581,9 +564,9 @@ def register_hsi_items_stac(
             elif col=='time':
                 description = 'time of the observation'
             elif col=='dset_id':
-                description = 'dataset ID'
+                description = 'PAIRS dataset ID'
             elif col=='layer_id':
-                description = 'layer ID'
+                description = 'PAIRS layer ID'
             elif col=='hsi_level':
                 description = 'spatial level of the HSI'
             elif col=='spatial_partition':
@@ -611,12 +594,11 @@ def register_hsi_items_stac(
         hsi_level = int([
             d for d in storage_url_part.split('/') if "hsi_level" in d
         ][0].split('=')[1])
-        #resolution = raster.morton.resolution(hsi_level)[0]
 
         cube_dimensions = {
             "q_key": {
                 "axis": "q_key",
-                "extent": None, #sorted(gdf1['q_key'].unique()),
+                "extent": None,
                 "description": 'base4 key of the Morton curve',
                 "step": None,
                 "type": "spatial",
