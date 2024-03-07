@@ -598,6 +598,35 @@ class Rasteroverview():
                 
         return weights_chunk
 
+
+    def _concat(self, lst, flt, dim):
+        """Fast xarray.concat for merging data that may not have the same lat/lon coordiates.
+    
+        xarray.concat works correctly as long as xs and ys of the individual arrays overlap.
+        However, if xs or ys have gaps, the data becomes corrupted.
+        Here we us a dummy with the target xs and ys to force everything onto the same grid.
+        """
+        # Gather the x and y extent
+        minx = min([a.x.min().to_numpy() for a in lst])
+        miny = min([a.y.min().to_numpy() for a in lst])
+        maxx = max([a.x.max().to_numpy() for a in lst])
+        maxy = max([a.y.max().to_numpy() for a in lst])
+        dx = self.morton.resolution_x(self.pixel_level)
+        dy = self.morton.resolution_y(self.pixel_level)
+    
+        # Creating an empty dummy dataset with shape (1, len(ys), len(xs))
+        xs = numpy.arange(minx, maxx+dx, dx)
+        ys = numpy.arange(maxy, miny-dy, -dy)
+        midx = pandas.MultiIndex.from_arrays(
+            [['dummy'] for v in list(flt.values())], names=list(flt)
+        )
+        a = numpy.empty((1, int(1+(maxy-miny)/dy), int(1+(maxx-minx)/dx)))
+        a[:] = numpy.nan
+        arr_dummy = xarray.DataArray(a, coords=[midx, ys, xs], dims=[dim, 'y', 'x'], attrs={})
+        
+        # Concating by forcing everything onto the dummy grid and immediately dropping the dummy
+        return xarray.concat([arr_dummy]+lst, dim=dim)[1:, ::]
+
     
     def _hsi_statistics(
         self, query_epochtimes, query_key, aggregation_keys, dimensions_lst, 
@@ -782,11 +811,13 @@ class Rasteroverview():
                             lst.append(arr)
 
                 if len(lst)>0:
-                    arr = xarray.concat(lst, dim='midx')
+                    #arr = xarray.concat(lst, dim='midx') # debug: This produces errors in some cases
+                    arr = self._concat(lst, flt, dim='midx')
 
                     # Concat apparently does the padding of non-commensurate arrays correctly, 
                     # but it may reverse the y-axis direction, so switch back here if needed.
                     if arr.y.values[1]>arr.y.values[0]:
+                        print('Warning: reversed y-axis direction after concat')
                         arr = arr.reindex(y=arr.y[::-1])
 
                     # Unstacking the multiindex
