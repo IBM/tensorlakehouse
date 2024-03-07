@@ -269,9 +269,6 @@ def setup_hsi(
         verbose=False,
     )
 
-    # Determine hsi cells using qtree algorithm
-    gdf_grid = raster.qtree_hsi()
-
     # Temporal partitions
     t_part = partition.TemporalPartition(
         raster_or_vector = 'raster',
@@ -319,7 +316,7 @@ def setup_hsi(
             print('Skipping spatial partitions plot.')
             pass
         
-    return raster, gdf_grid, gdf_grid_partitions, gdf_total_bounds
+    return raster, gdf_grid_partitions, gdf_total_bounds
 
 
 def hsi_worker(

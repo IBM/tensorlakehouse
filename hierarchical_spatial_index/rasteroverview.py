@@ -45,9 +45,6 @@ class Rasteroverview():
         geom_col                Name of geometry column in DataFrame.
         key_col                 Name of spatial key column in DataFrame.
         numeric_or_categorical  Flag to indicate numeric or categorical type of statistics.
-        stats                   Statistics (metadata) concerning available timestamps,
-                                hsi keys, and spatio-temporal partitions.
-        hsi_keys                List of the unique hsi keys
         temporal_levels         List of the timestamp hierarchy levels ('year', 'month', ...)
         temporal_partitions     Dictionary of the temporal partitions
         spatial_partition_level Level of the spatial partitions
@@ -158,16 +155,12 @@ class Rasteroverview():
         else:
             self.numeric_or_categorical = numeric_or_categorical
 
-        # Dict of statistics about timestamps, hsi keys, and spatio-temporal partitions
-        self.stats = {}
-
         self.verbose = verbose
 
         # For later use
         self.timestamps = None
         self.temporal_levels = None
         self.temporal_partitions = None
-        self.hsi_keys = None
         self.spatial_partition_level = None
         self.spatial_partitions = None
 
@@ -234,22 +227,7 @@ class Rasteroverview():
         qt.quadtree_dfs() # build the quadtree (depth first search)
         gdf_grid = qt.gridded_to_geodataframe(
             key_col=key_col, level_col=level_col, hash_col='q_key', geom_col=geom_col
-        ) # grid
-
-        # Set of hsi keys
-        self.hsi_keys = gdf_grid[self.key_col].to_list()
-        self.stats['number_hsi_keys'] = len(self.hsi_keys)
-        if self.verbose:
-            print('number_hsi_keys                 ', self.stats['number_hsi_keys'])
-
-        # # Building separate (very narrow) trees for each hsi cell
-        # gdf_grid['qt'] = gdf_grid[self.geom_col].apply(
-        #     lambda x: qtree.QTree(x, self.hsi_level, grid=self.grid)
-        # )
-        # # apply the quadtree algorithm
-        # gdf_grid['qt'].apply(lambda x: x.quadtree_dfs())
-        # gdf_grid['qt_dict'] = gdf_grid['qt'].apply(lambda x: x.walker())
-
+        )
         return gdf_grid
 
     
@@ -263,59 +241,16 @@ class Rasteroverview():
             self.timestamps = t_part.timestamps
             self.temporal_levels = t_part.temporal_levels
             self.temporal_partitions = t_part.temporal_partitions
-            self.stats = self.stats | t_part.stats
         else:
             self.temporal_levels = []
             self.temporal_partitions = {}
 
-        # if self.hsi_keys is None:
-        #     self.qtree_hsi()
-
         if s_part is not None:
             self.spatial_partitions = s_part.spatial_partitions
             self.spatial_partition_level = s_part.spatial_level
-            self.stats = self.stats | s_part.stats
         else:
             self.spatial_partitions = ['0q']
             self.spatial_partition_level = 0
-
-        if (t_part is not None) and (s_part is not None):
-            # Calculate additional spatio-temporal stats
-            try:
-                self._partition_stats()
-            except:
-                pass
-
-    
-    def _partition_stats(self):
-        """Collect spatio-temporal partition statistics (counts per partition)."""
-        # Add spatio-temporal stats
-        self.stats['max_rows_per_temp_part'] = self.stats[
-            'number_hsi_keys'] * self.stats['max_ts_per_temp_part']
-        self.stats['max_total_records'] = (self.stats['number_global_timestamps']
-                                           * self.stats['number_hsi_keys'])
-        self.stats['max_rows_per_spatial_part'] = (self.stats['number_global_timestamps']
-                                                   * self.stats['max_ovw_keys_per_spatial_part'])
-        self.stats['max_rows_per_part'] = (self.stats['max_ts_per_temp_part']
-                                           * self.stats['max_ovw_keys_per_spatial_part'])
-        self.stats['total_number_partitions'] = (self.stats['number_temporal_partitions']
-                                                 * self.stats['number_spatial_partitions'])
-
-        if self.verbose:
-            print('number_global_timestamps        ', self.stats['number_global_timestamps'])
-            print('number_hsi_keys                 ', self.stats['number_hsi_keys'])
-            print('max_total_records (Million)     ', self.stats['max_total_records'] * 1e-6)
-            print()
-            print('number_temporal_partitions      ', self.stats['number_temporal_partitions'])
-            print('max_ts_per_temp_part            ', self.stats['max_ts_per_temp_part'])
-            print('max_rows_per_temp_part (Million)', self.stats['max_rows_per_temp_part'] * 1e-6)
-            print()
-            print('number_spatial_partitions       ', self.stats['number_spatial_partitions'])
-            print('max_ovw_keys_per_spatial_part   ', self.stats['max_ovw_keys_per_spatial_part'])
-            print('max_rows_per_spatial_part (Mill)', self.stats['max_rows_per_spatial_part']*1e-6)
-            print()
-            print('max_rows_per_part (Million)     ', self.stats['max_rows_per_part'] * 1e-6)
-            print('total_number_partitions         ', self.stats['total_number_partitions'])
 
     
     def xarray_stats_numeric(self, arr, weights):
@@ -426,7 +361,7 @@ class Rasteroverview():
 
     
     def hsi_statistics(
-        self, temporal_partition={}, spatial_partition=None, chunk_n=None,
+        self, temporal_partition={}, spatial_partition=None, chunk_n=1,
         probe_local_timestamps=False, skip_existing=True, **kwargs
     ):
         """Calculate HSIs and append or write to file.
@@ -467,11 +402,9 @@ class Rasteroverview():
             # Query global
             spatial_partition =  '0q'
             query_key = '0q'
-            aggregation_keys = self.hsi_keys
         else:
             # Query spatial partition
             query_key        = spatial_partition
-            aggregation_keys = [o for o in self.hsi_keys if o.startswith(query_key)]
 
             if probe_local_timestamps:
                 # probe the query_key area in the four corners as well as the center.
@@ -487,8 +420,6 @@ class Rasteroverview():
                 pass
             else:
                 # debug: consider dimensions here
-                #df1 = df1.groupby(self.dt_col)[self.key_col].apply(set).reset_index()
-                #df1 = df1[df1[self.key_col]==set(aggregation_keys)]
                 exclude_timestamps = set(df1[self.dt_col].apply(
                     lambda x: x.timestamp()
                 ).astype(int))
@@ -502,7 +433,7 @@ class Rasteroverview():
                 print('Found', len(query_epochtimes), 'new timestamps')
                 
             gdf_hsi = self._hsi_statistics(
-                query_epochtimes, query_key, aggregation_keys, dimensions_lst,
+                query_epochtimes, query_key, dimensions_lst,
                 chunk_n=chunk_n, temporal_partition=temporal_partition, **kwargs
             )
             
@@ -629,15 +560,13 @@ class Rasteroverview():
 
     
     def _hsi_statistics(
-        self, query_epochtimes, query_key, aggregation_keys, dimensions_lst, 
-        chunk_n=None, temporal_partition=None, **kwargs
+        self, query_epochtimes, query_key, dimensions_lst, 
+        chunk_n=1, temporal_partition=None, **kwargs
     ):
         """
         query_epochtimes list of timestamps
         query_key        quaternary key to define the query area. (E.g., one spatial partition)
                          Usually called as: query_key = spatial_partition
-        aggregation_keys list of q_keys to collect hsi stats for. 
-                         (E.g., belonging to the spatial partition).
         chunk_n          limit number of timestamps queried at a time
         """
         HISTOGRAM = True
@@ -657,21 +586,6 @@ class Rasteroverview():
             latmax = min(latmax, north - res_y/2)
             lonmin = max(lonmin, west + res_x/2)
             lonmax = min(lonmax, east - res_x/2)
-
-        # Number of timestamps queried at a time
-        if chunk_n is None:
-            max_query_pixels_per_ts = (
-                self.stats['max_ovw_keys_per_spatial_part']
-                * 4**self.delta_pixel_hsi
-            )
-            chunk_n = int(self.MAX_QUERY_PIXELS // max_query_pixels_per_ts)
-
-        if chunk_n==0:
-            if self.stats['number_global_timestamps']>0:
-                s = 'Too many query pixels per timestamp. Define smaller spatial partitions'
-                raise ValueError(s)
-            else:
-                raise RuntimeError('Nothing found.')
                 
         if self.dataservice_type in ['local_filesystem', 'remote_filesystem']:
             gdf_local_meta = kwargs.get('gdf_local_meta')
@@ -811,8 +725,11 @@ class Rasteroverview():
                             lst.append(arr)
 
                 if len(lst)>0:
-                    #arr = xarray.concat(lst, dim='midx') # debug: This produces errors in some cases
-                    arr = self._concat(lst, flt, dim='midx')
+                    if len(lst)==1:
+                        arr = lst[0]
+                    else:
+                        #arr = xarray.concat(lst, dim='midx') # debug: This produces errors in some cases
+                        arr = self._concat(lst, flt, dim='midx')
 
                     # Concat apparently does the padding of non-commensurate arrays correctly, 
                     # but it may reverse the y-axis direction, so switch back here if needed.
@@ -955,7 +872,6 @@ class Rasteroverview():
             df_stats[hist_cols] = df_stats[hist_cols].fillna(0).astype(int)
 
         # Get the quaternary key from the ovw_x and ovw_y positions within the xarray
-        #x_min, y_min = self.morton.base4_to_xy_indices(min(aggregation_keys))
         x_min, y_min = self.morton.base4_to_xy_indices(
             query_key + '0' * (self.hsi_level-self.spatial_partition_level)
         )
@@ -1257,8 +1173,6 @@ class Rasteroverview():
         json_dict['temporal_partitions'] = self.temporal_partitions
         json_dict['spatial_partition_level'] = self.spatial_partition_level
         json_dict['spatial_partitions'] = self.spatial_partitions
-        json_dict['stats'] = self.stats
-        json_dict['hsi_keys'] = self.hsi_keys
         json_dict['numeric_or_categorical'] = self.numeric_or_categorical
         # The following objects require special attention to serialize and read back
         json_dict['valid_range'] = shapely.to_geojson(self.valid_range)
