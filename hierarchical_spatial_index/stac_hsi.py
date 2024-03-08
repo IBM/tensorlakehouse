@@ -226,14 +226,15 @@ def setup_hsi(
     grid,
     gdf_local_meta,
     dimension_values,
-    numeric_or_categorical, 
+    statistics_type,
+    histogram,
     dataservice_type,
     pixel_level,
     delta_pixel_hsi,
     spatial_partition_level,
     verbose = False,
 ):
-    """Create the Hierarchical Spatial Index from Data in COS."""
+    """Create the Hierarchical Spatial Index from Data in COS."""    
     # Available timestamps
     timestamps = sorted(set(gdf_local_meta['time']))
 
@@ -249,7 +250,8 @@ def setup_hsi(
         print('dimension_values        ', dimension_values)
         print('delta_pixel_hsi         ', delta_pixel_hsi)
         print('hsi level               ', pixel_level - delta_pixel_hsi)
-        print('numeric_or_categorical  ', numeric_or_categorical)
+        print('statistics_type         ', statistics_type)
+        print('histogram               ', histogram)
         print('timestamps              ', len(timestamps))
         print('total_bounds            ', total_bounds.bounds)
 
@@ -264,7 +266,8 @@ def setup_hsi(
         dimension_values=dimension_values,
         dataservice_type=dataservice_type,
         valid_range=None,
-        numeric_or_categorical=numeric_or_categorical,
+        statistics_type=statistics_type,
+        histogram=histogram,
         grid=grid,
         verbose=False,
     )
