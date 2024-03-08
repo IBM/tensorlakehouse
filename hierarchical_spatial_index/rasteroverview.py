@@ -365,13 +365,13 @@ class Rasteroverview():
         self, temporal_partition={}, spatial_partition=None, chunk_n=1,
         probe_local_timestamps=False, skip_existing=True, **kwargs
     ):
-        """Calculate HSIs and append or write to file.
+        """Calculate HSIs for one partition and append or write to file.
         
         temporal_partition calculating query timestamps based on a specific
                            temporal_partition. (E.g. specific year, month)
         spatial_partition  calculating query box based on spatial_partition
         chunk_n            limit number of timestamps queried at a time
-        :param kwargs:     cluster, dataserviceendpoint,
+        :param kwargs:     cluster, dataserviceendpoint, gdf_local_meta, remote_fs
         """
         if len(temporal_partition)==0:
             if self.dataservice_type=='hbase':
@@ -390,15 +390,6 @@ class Rasteroverview():
             else:
                 query_epochtimes = self._get_query_timestamps(temporal_partition, self.timestamps)
 
-        dimensions_lst = []  # List of all valid dimension dictionaries
-        if len(self.dimension_values)>0: # Debug consider dimension partitions
-            for elements in itertools.product(*self.dimension_values.values()):
-                # Looping through the cartesian product
-                dimensions={}
-                for i, dimension_name in enumerate(self.dimension_values):
-                    dimensions[dimension_name] = elements[i]
-                dimensions_lst.append(dimensions)
-
         if spatial_partition is None:
             # Query global
             spatial_partition =  '0q'
@@ -411,28 +402,27 @@ class Rasteroverview():
                 # probe the query_key area in the four corners as well as the center.
                 query_epochtimes = self._probe_query_timestamps(query_key, query_epochtimes, **kwargs)
 
+
+        # Initializing df_existing with zero rows
+        df_existing = pandas.DataFrame(
+            columns=[self.dt_col] + list(self.dimension_values.keys())
+        )
         if skip_existing:
-            # check for existing timestamps and coverage in parquet files
+            # check for existing HSI coverage in parquet files
             filepath = self._filepath(spatial_partition, temporal_partition, create_path=False)
             try:
-                df1 = pandas.read_parquet(filepath, columns=[self.dt_col, self.key_col])
+                df_existing = pandas.read_parquet(
+                    filepath,
+                    columns=[self.dt_col] + ['dimension_' + d for d in self.dimension_values.keys()]
+                ).drop_duplicates().reset_index(drop=True)
             except IOError:
                 # Likely nothing there yet
                 pass
             else:
-                # debug: consider dimensions here
-                exclude_timestamps = set(df1[self.dt_col].apply(
-                    lambda x: x.timestamp()
-                ).astype(int))
-                query_epochtimes = sorted(set(query_epochtimes) - exclude_timestamps)
-
-        if len(query_epochtimes)==0:
-            if self.verbose:
-                print('No new timestamps available')
-            return
-            
-        if self.verbose:
-            print('Found', len(query_epochtimes), 'new timestamps')
+                # Drop the 'dimension_' prefix
+                df_existing.columns = [
+                    c.lstrip('dimension_') if c.startswith('dimension_') else c for c in df_existing
+                ]
 
         # query box 
         lonmin, latmin, lonmax, latmax = self.valid_range.bounds
@@ -451,8 +441,8 @@ class Rasteroverview():
             latmax = min(latmax, north - res_y/2)
                 
         if self.dataservice_type in ['local_filesystem', 'remote_filesystem']:
-            gdf_local_meta = kwargs.get('gdf_local_meta')
             # Filter by query area
+            gdf_local_meta = kwargs.get('gdf_local_meta')
             gdf_local_meta = gdf_local_meta[
                 gdf_local_meta.intersects(self.morton.base4_to_box(query_key))
             ].reset_index(drop=True)
@@ -461,32 +451,35 @@ class Rasteroverview():
             kwargs_filtered = kwargs.copy()
             kwargs_filtered['gdf_local_meta'] = gdf_local_meta
             
-            # Find timestamps of filtered data
+            # Find available timestamps within reduced spatial coverage
             filtered_epochtimes = [int(t.timestamp()) for t in sorted(set(gdf_local_meta[self.dt_col]))]
             query_epochtimes = sorted(set(query_epochtimes) & set(filtered_epochtimes))
-            if self.verbose:
-                print('filtered query_epochtimes', query_epochtimes)
 
+        print('Numbers of query_epochtimes found:', len(query_epochtimes))
+        if self.verbose:
+            print('query_epochtimes', query_epochtimes)
+            
         df_stats = []
-        print('Numbers of query_epochtimes to work on:', len(query_epochtimes))
         for i, chunk in enumerate(self._chunks(query_epochtimes, chunk_n)):
             # Do the heavy lifting in chunks
-            print(query_key, temporal_partition, '; chunk', i, ': ', len(chunk))
-            print('chunk', [self._utcfromtimestamp(c) for c in chunk])
+            if self.verbose:
+                print('chunk', i, [self._utcfromtimestamp(c).strftime(self.ISO_8601) for c in chunk])
 
             df_stats_chunk = self._hsi_statistics(
                 chunk,
-                dimensions_lst, 
                 lonmin=lonmin,
                 latmin=latmin,
                 lonmax=lonmax, 
                 latmax=latmax,
+                df_existing=df_existing,
                 **kwargs_filtered
             )
             if len(df_stats_chunk)>0:
                 df_stats.append(df_stats_chunk)
 
-        df_stats = pandas.concat(df_stats)
+        if len(df_stats)>0:
+            # Concating the list
+            df_stats = pandas.concat(df_stats)
 
         if len(df_stats)==0:
             print('Nothing Found')
@@ -613,30 +606,44 @@ class Rasteroverview():
         return query_epochtimes
 
 
+    def _exclude_timestamps(self, chunk, df_existing, flt=None):
+        """Exclude existing timestamps.
+        
+        chunk          list of timestamps
+        df_existing    Existing unique combinations of timstamps / dimensions
+        flt            Dictionary to filter on
+                           Keys:   dimension or time column names
+                           Values: Values already present in the Parket file
+        """
+        if flt is None:
+            df_flt = df_existing
+        else:
+            # Check if the dimension and/or time combination already exists.
+            df_flt = df_existing.loc[(df_existing[list(flt)] == pandas.Series(flt)).all(axis=1)]
+
+        # Exclude existing timestamps.
+        exclude_ts = set(df_flt[self.dt_col].apply(lambda x: int(x.timestamp())))
+
+        if self.verbose and len(exclude_ts)>0:
+            print('Skipping', len(exclude_ts), 'existing timestamp(s).' )
+
+        return sorted(set(chunk) - exclude_ts)
+        
+
     def _hsi_statistics(
-        self, chunk, dimensions_lst, lonmin, latmin, lonmax, latmax, **kwargs
+        self, chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
     ):
         """
         chunk            List of query_epochtimes for this chunk
-        dimensions_lst   List of all valid dimension dictionaries
         """
+        arr = None
         if self.dataservice_type=='hbase':
             # Get the data from the hbase dataservice
-            if len(dimensions_lst)==0:
-                # No dimensions
-                arr = dataservice.query.to_xarray(
-                    layer_id=self.layer_id,
-                    level=self.pixel_level,
-                    latmin=latmin,
-                    lonmin=lonmin,
-                    latmax=latmax,
-                    lonmax=lonmax,
-                    timestamps=chunk,
-                    **kwargs,
-                )
-            else:
-                lst = []
-                for dimensions in dimensions_lst:
+            if len(self.dimension_values)==0:
+                # Exclude existing timestamps when instructed by skip_existing
+                chunk = self._exclude_timestamps(chunk, df_existing)
+
+                if len(chunk)>0:
                     arr = dataservice.query.to_xarray(
                         layer_id=self.layer_id,
                         level=self.pixel_level,
@@ -645,10 +652,30 @@ class Rasteroverview():
                         latmax=latmax,
                         lonmax=lonmax,
                         timestamps=chunk,
-                        dimensions=dimensions,
                         **kwargs,
                     )
-                    lst.append(arr)
+            else:
+                for elements in itertools.product(*self.dimension_values.values()):
+                    dimensions={}
+                    for i, dimension_name in enumerate(self.dimension_values):
+                        dimensions[dimension_name] = elements[i]
+
+                    chunk = self._exclude_timestamps(chunk, df_existing, flt)
+
+                    if len(chunk)>0:
+                        arr = dataservice.query.to_xarray(
+                            layer_id=self.layer_id,
+                            level=self.pixel_level,
+                            latmin=latmin,
+                            lonmin=lonmin,
+                            latmax=latmax,
+                            lonmax=lonmax,
+                            timestamps=chunk,
+                            dimensions=dimensions,
+                            **kwargs,
+                        )
+                        lst.append(arr)
+                        
                 arr = xarray.merge(lst)[self.layer_id]
 
             # HSI grid is automatically aligned with pixel grid
@@ -671,75 +698,89 @@ class Rasteroverview():
                 ]
                 
                 if len(df_filtered)==0:
+                    continue
+
+                if self.verbose:
+                    print('Timestamp/dimension combination', elements)
+                    
+                # Skipping existing time and/or dimension combinations
+                if len(df_existing)>0:
+                    # Perform an anti-merge with the existing times/dimensions filter
+                    df_filtered = pandas.merge(
+                        df_filtered, df_existing, how='outer', indicator=True
+                    ).query('_merge == "left_only"').drop(columns='_merge')
+                    
+                if len(df_filtered)==0:
                     if self.verbose:
-                        print('Warning: dimension combination not found', elements)
-                else:
-                    if self.dataservice_type=='local_filesystem':
-                        # Data is present locally
-                        local_paths = df_filtered['filepath'].values
-                    elif self.dataservice_type=='remote_filesystem':
-                        # Download the remote data to a temporary directory
-                        local_paths = []
-                        for remote_path in df_filtered['filepath'].values:
-                            try:
-                                local_path = os.path.join(
-                                    self.tmp_directory,
-                                    os.path.split(remote_path)[1]
-                                ).replace('\\', '/')
-                                remote_fs = kwargs.get('remote_fs')
-                                remote_fs.download(remote_path, local_path)
-                            except IOerror as e:
-                                print(e)
-                                return
-                            else:
-                                local_paths.append(local_path)
+                        print('Skipping existing timestamp/dimension combination')
+                    continue
 
-                    if len(local_paths)>1:
-                        print('Warning: combining multiple files with the same dimensions', elements)
-                    i=0
-                    for local_path in local_paths:
-                        if self.verbose:
-                            print('local_path', local_path)
-                        if i==0:
-                            arr = xarray.load_dataarray(local_path)
+                if self.dataservice_type=='local_filesystem':
+                    # Data is present locally
+                    local_paths = df_filtered['filepath'].values
+                elif self.dataservice_type=='remote_filesystem':
+                    # Download the remote data to a temporary directory
+                    local_paths = []
+                    for remote_path in df_filtered['filepath'].values:
+                        try:
+                            local_path = os.path.join(
+                                self.tmp_directory,
+                                os.path.split(remote_path)[1]
+                            ).replace('\\', '/')
+                            remote_fs = kwargs.get('remote_fs')
+                            remote_fs.download(remote_path, local_path)
+                        except IOerror as e:
+                            print(e)
+                            return
                         else:
-                            if self.verbose:
-                                print('filling nan values with', local_path)
-                            arr.fillna(xarray.load_dataarray(local_path))
-                        if (self.dataservice_type=='remote_filesystem') and os.path.isfile(local_path):
-                            # clean up
-                            os.remove(local_path)
-                        i+=1
+                            local_paths.append(local_path)
 
-                    try:
-                        # Clip according to the query bounds
-                        arr = arr.where(
-                            (arr.x>lonmin) &
-                            (arr.x<lonmax) &
-                            (arr.y>latmin) &
-                            (arr.y<latmax),
-                            drop=True
-                        )
-                    except ValueError as e:
-                        print('Warning at elements ', elements, ': ', e)
+                if len(local_paths)>1:
+                    print('Warning: combining multiple files with the same dimensions', elements)
+                i=0
+                for local_path in local_paths:
+                    if self.verbose:
+                        print('local_path', local_path)
+                    if i==0:
+                        arr = xarray.load_dataarray(local_path)
                     else:
-                        # Build a multiindex for all the timestamps and dimension values,
-                        # so that we can simpliy concat the arrays.
-                        midx = pandas.MultiIndex.from_arrays(
-                            [[v] for v in list(flt.values())], names=list(flt)
-                        )
-    
-                        # Recast to 3D using the multiindex
-                        arr = xarray.DataArray(
-                            numpy.array(arr),
-                            coords = [midx, arr.y, arr.x],
-                            dims =  ['midx', 'y', 'x'],
-                        )
-                        
-                        # Asserting that the y axis values are always in descending order
-                        assert arr.y.values[1]<arr.y.values[0]
-                        
-                        lst.append(arr)
+                        if self.verbose:
+                            print('filling nan values with', local_path)
+                        arr.fillna(xarray.load_dataarray(local_path))
+                    if (self.dataservice_type=='remote_filesystem') and os.path.isfile(local_path):
+                        # clean up
+                        os.remove(local_path)
+                    i+=1
+
+                try:
+                    # Clip according to the query bounds
+                    arr = arr.where(
+                        (arr.x>lonmin) &
+                        (arr.x<lonmax) &
+                        (arr.y>latmin) &
+                        (arr.y<latmax),
+                        drop=True
+                    )
+                except ValueError as e:
+                    print('Warning at elements ', elements, ': ', e)
+                else:
+                    # Build a multiindex for all the timestamps and dimension values,
+                    # so that we can simpliy concat the arrays.
+                    midx = pandas.MultiIndex.from_arrays(
+                        [[v] for v in list(flt.values())], names=list(flt)
+                    )
+
+                    # Recast to 3D using the multiindex
+                    arr = xarray.DataArray(
+                        numpy.array(arr),
+                        coords = [midx, arr.y, arr.x],
+                        dims =  ['midx', 'y', 'x'],
+                    )
+                    
+                    # Asserting that the y axis values are always in descending order
+                    assert arr.y.values[1]<arr.y.values[0]
+                    
+                    lst.append(arr)
 
             if len(lst)>0:
                 if len(lst)==1:
@@ -854,7 +895,7 @@ class Rasteroverview():
     
         # Pandas is fastest at a length around 1Mio rows, so target aerial chunks to that size
         # Making chunks small also allows us to remove all-nan chunks before heavy calculations
-        TARGET = 5e5
+        TARGET = 1e6
         
         target_chunks = numpy.ceil(numpy.prod(arr.shape) / TARGET) # ceil assures at least one chunk
         target_len_x = int(numpy.ceil(arr.ovw_x.shape[0]/numpy.sqrt(target_chunks)))

@@ -269,7 +269,7 @@ def setup_hsi(
         statistics_type=statistics_type,
         histogram=histogram,
         grid=grid,
-        verbose=False,
+        verbose=verbose,
     )
 
     # Temporal partitions
@@ -297,7 +297,7 @@ def setup_hsi(
 
     # Cash attributes in json file
     raster.to_json()
-    raster.from_json()
+    #raster.from_json()
     
     # Figure out the spatial partitions
     qt = qtree.QTree(total_bounds, raster.spatial_partition_level, grid=grid)
@@ -329,8 +329,6 @@ def hsi_worker(
     skip_existing,
     **kwargs,
 ):
-    print('elements ', elements)
-    
     if len(raster.temporal_partitions)==0:
         # Only spatial partitions present
         spatial_partition = elements
