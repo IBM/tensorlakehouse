@@ -28,7 +28,6 @@ def stac_search_available(
     month = None,
     day = None,
     fields = None,
-    filter_band = None,
     filter_epsg = None, 
     verbose = False,
 ):
@@ -107,18 +106,11 @@ def stac_search_available(
         if verbose:
             print('batch', i, '; raw     ', len(next_items))
 
-        # Filter band
-        if filter_band is not None:
-            next_items = [
-                item for item in next_items if (filter_band in item.properties['cube:variables'])
-            ]
-
-        # # debug: DOES NOT WORK YET SINCE RAW DATA HAS WRONG CRS
-        # # Filter epsg
-        # if filter_epsg is not None:
-        #     next_items = [item for item in next_items if (
-        #         f'EPSG:'+str(item.properties['cube:dimensions']['x']['reference_system'])==filter_epsg
-        #     )]
+        # Filter epsg
+        if filter_epsg is not None:
+            next_items = [item for item in next_items if (
+                item.properties['cube:dimensions']['x']['reference_system']==filter_epsg
+            )]
             
         if verbose:
             print('batch', i, '; filtered', len(next_items))
@@ -167,19 +159,34 @@ def stac_search_items_to_raster_local_metadata(
     cos_bucket,
     grid,
     dataservice_type,
-    filter_epsg_using_utm_zone_from_tile,
+    tile_from_filepath,
+    filter_epsg_using_tile_zone,
+    filter_bands,
 ):
     # Create metadataframe from stac search_items
-    gdf_local_meta = geopandas.GeoDataFrame([{
-        'id': item.id,
-        'time': item.datetime,
-        'cloud_coverage': item.properties['cloud_coverage'],
-        'tile': item.properties['tile'],
-        'band': list(item.properties['cube:variables'].keys())[0],
-        'geometry': shapely.box(*item.bbox),
-        'remote_path': item.assets['data'].href.split('s3://')[-1],
-    } for item in search_items])
-
+    if 'data' in search_items[0].assets:
+        # (A) Single-asset items:
+        gdf_local_meta = geopandas.GeoDataFrame([{
+            'id': item.id,
+            'time': item.datetime,
+            #'cloud_coverage': item.properties['cloud_coverage'],
+            #'tile': item.properties['tile'],
+            'band': list(item.properties['cube:variables'].keys())[0],
+            'geometry': shapely.box(*item.bbox),
+            'remote_path': item.assets['data'].href.split('s3://')[-1],
+        } for item in search_items])
+    else:
+        # (B) Multi-asset items:
+        gdf_local_meta = geopandas.GeoDataFrame([{
+            'id': item.id,
+            'time': item.datetime,
+            #'cloud_coverage': item.properties['cloud_coverage'],
+            #'tile': item.properties['tile'],
+            'band': band,
+            'geometry': shapely.box(*item.bbox),
+            'remote_path': item.assets[band].href.split('s3://')[-1],
+        } for item in search_items for band in item.assets if band in filter_bands])
+        
     # Local path from remote path
     if dataservice_type=='remote_filesystem':
         # Either (A) download file from remote folder
@@ -192,7 +199,13 @@ def stac_search_items_to_raster_local_metadata(
         # )
     else:
         raise NotImplementedError()
-    
+
+    if tile_from_filepath:
+        def _tile_from_filepath(filepath):
+            """Hack the tilename since we don't have this from the item property directly."""
+            return filepath.split('.')[-6][1:]
+        gdf_local_meta['tile'] = gdf_local_meta['filepath'].apply(_tile_from_filepath)
+
     # Truncate the time at least to seconds since we use epochtime internally
     gdf_local_meta['time_original'] = gdf_local_meta['time']
     gdf_local_meta['time'] = gdf_local_meta['time'].apply(lambda x: datetime(
@@ -203,7 +216,7 @@ def stac_search_items_to_raster_local_metadata(
 
     gdf_local_meta['epoch'] = gdf_local_meta['time'].apply(lambda x: int(x.timestamp()))
 
-    if filter_epsg_using_utm_zone_from_tile:
+    if filter_epsg_using_tile_zone:
         # Using the zone_number from the tile designation to deduce the UTM zone 
         # (Note currently reference_system in STAC items cube:dimensions extension is unreliable)
         gdf_local_meta['zone_number'] = gdf_local_meta['tile'].str[1:3].astype(int)
