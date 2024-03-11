@@ -482,8 +482,13 @@ class Rasteroverview():
             df_stats = pandas.concat(df_stats)
 
         if len(df_stats)==0:
-            print('Nothing Found')
-            return pandas.DataFrame()
+            if skip_existing:
+                print('No new timestamp/dimension combination found for this partition.')
+            else:
+                print('No data found for this partition.')
+                
+            found_something = False
+            return found_something
             
         if self.statistics_type == 'categorical' and self.histogram:
             # Histogram columns may not be present in all parts
@@ -531,13 +536,22 @@ class Rasteroverview():
 
         gdf_hsi = gdf_hsi.set_crs(self.grid.crs)
         
-        if len(gdf_hsi)>0:
-            # Append (if existing rows skipped)
+        if skip_existing:
+            # Append
             self.to_parquet(
                 gdf_hsi, temporal_partition, spatial_partition, append=True
             )
-            # Free memory
-            del gdf_hsi
+        else:
+            # Overwrite
+            self.to_parquet(
+                gdf_hsi, temporal_partition, spatial_partition, append=False
+            )
+            
+        # Free memory
+        del gdf_hsi
+
+        found_something = True
+        return found_something
 
     
     def _probe_query_timestamps(self, query_key, query_epochtimes, **kwargs):

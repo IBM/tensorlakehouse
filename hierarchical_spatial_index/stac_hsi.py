@@ -340,6 +340,17 @@ def hsi_worker(
     raster,
     chunk_n,
     skip_existing,
+    collection_id,
+    hsi_collection_id,
+    stac_url,
+    json_folder,
+    hsi_dataservice_type,
+    hsi_bucket,
+    hsi_remote_fs,
+    hsi_access_key_id,
+    hsi_secret_access_key,
+    hsi_endpoint_url,
+    certificate,
     **kwargs,
 ):
     if len(raster.temporal_partitions)==0:
@@ -355,7 +366,26 @@ def hsi_worker(
         for i, temporal_level in enumerate(raster.temporal_levels):
             temporal_partition[temporal_level] = temporal_elements[i]
 
-    raster.hsi_statistics(
+    # Path to HSI
+    hsi_local_path = raster._filepath(spatial_partition, temporal_partition)
+    if hsi_dataservice_type == 'local_filesystem':
+        prefix = os.path.join('data', 'hsi', collection_id).replace('\\', '/')
+    elif hsi_dataservice_type == 'remote_filesystem':
+        prefix = os.path.join(hsi_bucket, 'hsi', collection_id).replace('\\', '/')
+    elif hsi_dataservice_type == 'hbase':
+        raise NotImplementedError('hbase not supported for hsi upload.')
+    else:
+        raise ValueError(f'"{hsi_dataservice_type}" hsi_dataservice_type not understood.')
+    hsi_remote_path = os.path.join(prefix, hsi_local_path.split(raster.hsi_directory)[-1].lstrip('\/')).replace('\\', '/')
+
+    if skip_existing and hsi_dataservice_type == 'remote_filesystem':
+        # Download existing HSI for this partition to skip existing timestamp/dimension combinations.
+        try:
+            hsi_remote_fs.download(hsi_remote_path, hsi_local_path)
+        except FileNotFoundError:
+            print('Did not find any existing HSI parquet file in cloud for this partition.')
+    
+    found_something = raster.hsi_statistics(
         temporal_partition, 
         spatial_partition, 
         probe_local_timestamps=False, 
@@ -363,7 +393,36 @@ def hsi_worker(
         skip_existing=skip_existing,
         **kwargs,
     )
-    return spatial_partition, temporal_partition
+
+    if found_something:
+        # Upload HSI
+        if hsi_dataservice_type == 'remote_filesystem':
+            print(f'hsi_local_path : {hsi_local_path}')
+            print(f'hsi_remote_path: {hsi_remote_path}')
+            hsi_remote_fs.upload(hsi_local_path, hsi_remote_path)
+
+        # Registering HSI items in STAC
+        hsi_directory = os.path.split(hsi_remote_path)[0].replace('\\', '/')
+        # Using absolute path for stac json files
+        abs_json_folder = os.path.join('/opt/app-root/src/', json_folder)
+
+        register_hsi_items_stac(
+            cos_bucket=hsi_bucket,
+            hsi_collection_id=hsi_collection_id,
+            hsi_directory=hsi_directory,
+            grid=raster.grid,
+            json_folder=abs_json_folder,
+            dataservice_type=hsi_dataservice_type,
+            stac_url=stac_url,
+            remote_fs=hsi_remote_fs,
+            access_key_id=hsi_access_key_id,
+            secret_access_key=hsi_secret_access_key,
+            endpoint_url=hsi_endpoint_url,
+            certificate=certificate,
+        )
+        print(f'Registered hsi for partition {elements}')
+
+    return spatial_partition, temporal_partition, found_something
 
 
 def upload_hsi_cos(
@@ -501,7 +560,6 @@ def register_hsi_items_stac(
     os.makedirs(json_folder_submitted, exist_ok=True)
 
     for i, storage_url_part in enumerate(storage_urls):
-        print('debug storage_url_part', storage_url_part)
         json_filepath = os.path.join(json_folder, f'item{i}.json')
 
         #epsg = grid.crs.to_epsg()
