@@ -30,7 +30,7 @@ from qtree_index import nestedgrid, mortoncurve, qtree
 class Rasteroverview():
     """Generating raster overviews.
 
-    Generates Hirarchical Spatial Inices and persist them in spatially and/or temporally partitioned parquet files.
+    Generates Hirarchical Spatial Indices and persist them in spatially and/or temporally partitioned parquet files.
 
     Attributes:
 
@@ -743,7 +743,7 @@ class Rasteroverview():
                             ).replace('\\', '/')
                             remote_fs = kwargs.get('remote_fs')
                             remote_fs.download(remote_path, local_path)
-                        except IOerror as e:
+                        except IOError as e:
                             print(e)
                             return
                         else:
