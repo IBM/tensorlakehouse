@@ -33,15 +33,60 @@ class HSI():
     Orchestrates the generation of Hirarchical Spatial Indices for GeoDN data registered in STAC.
 
     Attributes:
+        bands                       Bands to be indexed
+        pixel_level                 Pixel level of the raw data
+        delta_pixel_hsi             Difference between HSI level and raw data level
+        spatial_partition_level     Spatial partition level
+        hsi_directory               Local HSI directory where parquet files are assembled
+        tmp_directory               Temporary directory
+        statistics_type             Statistics type (numeric or categorical)
+        histogram                   Flag to indicate if histograms are requested for categorical data
+        grid                        Nested grid defined for the raw data
+        
+        stac_url                    STAC URL
+        collection_id               STAC collection ID of the raw data
+        hsi_collection_id           STAC collection ID of the HSI
+        json_folder                 Local json folder for STAC items
+        certificate                 STAC certificate
 
-        hsi_directory           Local HSI directory
+        dataservice_type            Dataservice type (raw data)
+        data_bucket                 COS bucket of the raw data
+        remote_fs                   Remote filesystem handle for the raw data
+        # data_access_key_id          Raw data access key ID
+        # data_secret_access_key      Raw data sectre access key ID
+        # data_endpoint_url           Raw data endpoint URL
+
+        hsi_dataservice_type        Dataservice type (HSI)
+        hsi_bucket                  COS bucket of the HSI data
+        hsi_remote_fs               Remote filesystem handle for the HSI data
+        hsi_access_key_id           HSI access key ID
+        hsi_secret_access_key       HSI sectret access key ID
+        hsi_endpoint_url            HSI endpoint URL
+
+        chunk_n                     Number of timestamps to process concurrently (best to keep chunk_n=1)
+        skip_existing               Flag to indicate if existing timestamp/dimension combinations should be skipped
+
+        temporal_levels             Temporal partition levels (e.g. ['year', 'month'])
+        year                        Temporal partition value for the year (if any)
+        month                       Temporal partition value for the month (if any)
+        day                         Temporal partition value for the day (if any)
+        verbose                     Detailed output 
+
+        # Debug: Remove this flag once we decided how to generalize dimensions
+        tile_from_filepath          Get the tile information from the filepath
+        # Debug: Not needed anymore in the new HLS collection which has corret epsg information in STAC
+        filter_epsg_using_tile_zone Filter the UTM EPSG using the zone info from the zone
 
         
     Methods
 
-        available_timestamps    Query the dataservice for global timestamps.
-
-
+        stac_search_available       Search for available raw data in STAC.
+        search_items_local_metadata Create metadataframe from STAC search_items.
+        setup_rasteroverview        Setup the Rasteroverviw object with appropriate partitions for HSI creation.
+        hsi_worker                  Calculate HSI for one partition 
+                                        (uses one CPU and memory dependent on size of partitions.
+        register_hsi_items_stac     Register HSI items in STAC.
+        
     """
     # Constants
     ISO_8601                   = '%Y-%m-%dT%H:%M:%SZ'
@@ -197,7 +242,7 @@ class HSI():
         )
 
         # Create the metadata table for the Rasteroverview
-        self.stac_search_items_to_raster_local_metadata()
+        self.search_items_local_metadata()
 
         # Now since we know the local metadata, define the dimensions
         self.dimension_values = {
@@ -205,9 +250,8 @@ class HSI():
             'tile':sorted(self.gdf_local_meta['tile'].unique()),
         }
 
-        # Setup the Rasteroverviw object for the HSI creation 
-        self.setup_hsi()
-
+        # Setup the Rasteroverviw object with appropriate partitions for HSI creation.
+        self.setup_rasteroverview()
 
 
     def stac_search_available(
@@ -312,8 +356,8 @@ class HSI():
                 print('Found no search items')
 
 
-    def stac_search_items_to_raster_local_metadata(self):
-        """Create metadataframe from stac search_items."""
+    def search_items_local_metadata(self):
+        """Create metadataframe from STAC search_items."""
         if 'data' in self.search_items[0].assets:
             # (A) Single-asset items:
             self.gdf_local_meta = geopandas.GeoDataFrame([{
@@ -378,17 +422,17 @@ class HSI():
         self.gdf_local_meta = self.gdf_local_meta.set_crs('4326').to_crs(self.grid.crs)
 
 
-    def setup_hsi(self):
-        """Search for available raw data."""
+    def setup_rasteroverview(self):
+        """Setup the Rasteroverviw object with appropriate partitions for HSI creation."""
         # Available timestamps
         self.timestamps = sorted(set(self.gdf_local_meta['time']))
-        # Debug: getting rid of the temporal partitions dependency on the partition module
+        # Debug: getting rid of the temporal partitions dependency in the partition module
         self.t_part.timestamps = self.timestamps
     
         # Total bounds of all the data
         self.total_bounds = shapely.ops.unary_union(self.gdf_local_meta['geometry'].drop_duplicates())
         self.gdf_total_bounds = geopandas.GeoDataFrame([{'geometry': self.total_bounds}])
-    
+
         if self.verbose:
             print('epsg                    ', self.grid.epsg)
             print('hsi_directory           ', self.hsi_directory)
@@ -477,6 +521,7 @@ class HSI():
         elements,
         **kwargs,
     ):
+        """Calculate HSI for one partition (uses one CPU and memory dependent on size of partitions."""
         if len(self.raster.temporal_partitions)==0:
             # Only spatial partitions present
             self.spatial_partition = elements
@@ -782,6 +827,11 @@ class HSI():
         description,
         outpath,
     ):
+        """
+        Register HSI collection in STAC.
+
+        Debug: NEED TO CHECK IF THIS METHOD IS STILL WORKING
+        """
         # # Debug
         # stac = pystac_client.Client.open(self.stac_url)
         # stac_collections = list(stac.get_all_collections())
@@ -954,65 +1004,65 @@ def search_hsi(
     return pandas.concat(gdf_concat).reset_index(drop=True)
 
 
-def _epsg_from_file(filepath):
-    arr = xarray.open_dataarray(
-        filepath,
-        masked=True, 
-    )
-    epsg = arr.rio.crs.to_epsg()
+# def _epsg_from_file(filepath):
+#     arr = xarray.open_dataarray(
+#         filepath,
+#         masked=True, 
+#     )
+#     epsg = arr.rio.crs.to_epsg()
     
-    if epsg is None:
-        # Parse the wkt string instead
-        crs = arr.rio.crs
-        assert crs.data['proj']=='utm'
-        zone_number = crs.data['zone']
-        if 'Northern Hemisphere' in pyproj.Proj(crs).crs.name:
-            north_or_south = 'north'
-            epsg = int(f'326{zone_number:02}')
-        elif 'Southern Hemisphere' in pyproj.Proj(crs).crs.name:
-            north_or_south = 'south'
-            epsg = int(f'327{zone_number:02}')
-        else:
-            raise ValueError('projection not understood')
+#     if epsg is None:
+#         # Parse the wkt string instead
+#         crs = arr.rio.crs
+#         assert crs.data['proj']=='utm'
+#         zone_number = crs.data['zone']
+#         if 'Northern Hemisphere' in pyproj.Proj(crs).crs.name:
+#             north_or_south = 'north'
+#             epsg = int(f'326{zone_number:02}')
+#         elif 'Southern Hemisphere' in pyproj.Proj(crs).crs.name:
+#             north_or_south = 'south'
+#             epsg = int(f'327{zone_number:02}')
+#         else:
+#             raise ValueError('projection not understood')
         
-    return epsg
+#     return epsg
 
 
 
-def upload_hsi_cos(
-    src,
-    dst,
-    dataservice_type,
-    verbose = False,
-    **kwargs,
-):
-    """
-    Upload all the parquet files in the src directory to dst.
-    If dataservice_type=='remote_filesystem' please provide a remote_fs with write credentials in the kwargs.
-    """
-    for src_path in glob(os.path.join(src, '**/*.parquet'), recursive=True):
-        dst_path = dst + src_path.split(src)[-1]
+# def upload_hsi_cos(
+#     src,
+#     dst,
+#     dataservice_type,
+#     verbose = False,
+#     **kwargs,
+# ):
+#     """
+#     Upload all the parquet files in the src directory to dst.
+#     If dataservice_type=='remote_filesystem' please provide a remote_fs with write credentials in the kwargs.
+#     """
+#     for src_path in glob(os.path.join(src, '**/*.parquet'), recursive=True):
+#         dst_path = dst + src_path.split(src)[-1]
         
-        if dataservice_type=='local_filesystem':
-            # Using local (or mounted) drive to upload to
-            if not os.path.exists(dst_path):
-                dst_dir = os.path.dirname(dst_path)
-                if not os.path.exists(dst_dir):
-                    os.makedirs(dst_dir)
-                shutil.copy(src_path, dst_path)
-            else:
-                if verbose:
-                    print('WARNING: file exists', dst_path)
-        elif dataservice_type=='remote_filesystem':
-            # Using s3fs to upload data to COS
-            remote_fs = kwargs.get('remote_fs')
-            if not remote_fs.exists(dst_path):
-                remote_fs.upload(src_path, dst_path)
-            else:
-                if verbose:
-                    print('WARNING: file exists', dst_path)
-        elif dataservice_type=='hbase':
-            raise NotImplementedError('hbase not supported for hsi upload.')
-        else:
-            raise ValueError(f'"{dataservice_type}" dataservice_type not understood.')
-    return
+#         if dataservice_type=='local_filesystem':
+#             # Using local (or mounted) drive to upload to
+#             if not os.path.exists(dst_path):
+#                 dst_dir = os.path.dirname(dst_path)
+#                 if not os.path.exists(dst_dir):
+#                     os.makedirs(dst_dir)
+#                 shutil.copy(src_path, dst_path)
+#             else:
+#                 if verbose:
+#                     print('WARNING: file exists', dst_path)
+#         elif dataservice_type=='remote_filesystem':
+#             # Using s3fs to upload data to COS
+#             remote_fs = kwargs.get('remote_fs')
+#             if not remote_fs.exists(dst_path):
+#                 remote_fs.upload(src_path, dst_path)
+#             else:
+#                 if verbose:
+#                     print('WARNING: file exists', dst_path)
+#         elif dataservice_type=='hbase':
+#             raise NotImplementedError('hbase not supported for hsi upload.')
+#         else:
+#             raise ValueError(f'"{dataservice_type}" dataservice_type not understood.')
+#     return
