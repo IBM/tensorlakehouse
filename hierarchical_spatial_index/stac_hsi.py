@@ -660,7 +660,7 @@ class HSI():
                 if col in self.REQUIRED_STATS_CATEGORICAL | self.REQUIRED_STATS_NUMERIC:
                     description = 'statistic: ' + col
                 elif col.startswith(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH):
-                    description = 'value_count for category ' + col.lstrip(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH)
+                    description = 'value_count for category ' + col[len(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH):]
                 elif col.endswith(self.OPTIONAL_STATS_NUMERIC_ENDSWITH):
                     description = 'quantile: ' + col
                 elif col=='q_key':
@@ -759,7 +759,6 @@ class HSI():
                     "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
                     "https://stac-extensions.github.io/table/v1.2.0/schema.json",
                 ],
-                #"id": storage_url_part.lstrip('s3://').rsplit('/',1)[0],
                 "id": uuid.uuid4().hex,
                 "collection": self.hsi_collection_id,
                 "bbox": total_bounds_wgs84,

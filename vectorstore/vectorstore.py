@@ -499,12 +499,19 @@ class Vectorstore():
 
     def _glob_partitions(self):
         """Parse the geoparquet directory to find existing partitions."""
-        
-        partitions = [f.name.lstrip('spatial_partition=') for f in os.scandir(self.geoparquet_directory) if f.is_dir()]
+    
+        prefix = 'spatial_partition='
+        partitions = []
+        for f in os.scandir(self.geoparquet_directory):
+            if f.is_dir():
+                assert f.name.startswith(prefix)
+                partitions.append(f.name[len(prefix):])
+                
         df_partitions = pandas.DataFrame({
             'partition': partitions,
             'partition_level': [len(p)-2 for p in partitions],
         }).sort_values(by=['partition_level', 'partition']).reset_index(drop=True)
+        
         return df_partitions
 
 
@@ -1337,6 +1344,11 @@ class Vectorstore():
         )
 
 
+    def _swap_prefixes(self, folderpath, prefix_old, prefix_new):
+        assert folderpath.startswith(prefix_old)
+        return os.path.join(prefix_new, folderpath[len(prefix_old):]).replace('\\', '/')
+
+        
     def to_cos(self, upload_type, bucket=None, access_key_id=None, secret_access_key=None, endpoint_url=None):
         """Push local vectorstore (all partitions) to cloud objectstore.
         
@@ -1363,12 +1375,14 @@ class Vectorstore():
         if not hasattr(self, 'remote_fs'):
             self._connect_s3()
 
+        local_prefix = self.vectorstore_directory
         remote_prefix = os.path.join(self.bucket, REMOTE_VECTORSTORE_DIRECTORY).replace('\\', '/')
         spatial_partitions = sorted(self._glob_partitions()['partition'])
         if upload_type=='replace_all':
             # Remove existing remote parquet_directory
             local_folderpath = self.geoparquet_directory
-            remote_folderpath = os.path.join(remote_prefix, local_folderpath.lstrip(self.vectorstore_directory)).replace('\\', '/')
+
+            remote_folderpath = self._swap_prefixes(local_folderpath, local_prefix, remote_prefix)
             remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**.parquet').replace('\\', '/'))
             if len(remote_filepaths)>0:
                 if self.verbose:
@@ -1380,7 +1394,7 @@ class Vectorstore():
                 temporal_partition = {}
                 # Remove remote partition that exists locally
                 local_folderpath = self._folderpath(temporal_partition, spatial_partition)
-                remote_folderpath = os.path.join(remote_prefix, local_folderpath.lstrip(self.vectorstore_directory)).replace('\\', '/')
+                remote_folderpath = self._swap_prefixes(local_folderpath, local_prefix, remote_prefix)
                 remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**.parquet').replace('\\', '/'))
                 if len(remote_filepaths)>0:
                     if self.verbose:
@@ -1400,7 +1414,7 @@ class Vectorstore():
             local_paths = [f.replace('\\', '/') for f in local_paths]
 
             for local_path in local_paths:
-                remote_path = os.path.join(remote_prefix, local_path.lstrip(self.vectorstore_directory)).replace('\\', '/')
+                remote_path = self._swap_prefixes(local_path, local_prefix, remote_prefix)
                 if upload_type!='add' or (not self.remote_fs.exists(remote_path)):
                     if self.verbose:
                         print('uploading to remote_path', remote_path)
@@ -1410,6 +1424,231 @@ class Vectorstore():
             print('Time for pushing local vectorstore to COS', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
+
+    # def to_stac(self):
+    #     """Register vectorstore partitions as items in STAC."""
+    #     REMOTE_VECTORSTORE_DIRECTORY = 'vectorstore'
+        
+    #     if self.verbose:
+    #         stopwatch_start = time.time()
+
+    #     if bucket is not None: self.bucket = bucket
+    #     if access_key_id is not None: self.access_key_id = access_key_id
+    #     if secret_access_key is not None: self.secret_access_key = secret_access_key
+    #     if endpoint_url is not None: self.endpoint_url = endpoint_url
+
+    #     if not hasattr(self, 'remote_fs'):
+    #         self._connect_s3()
+            
+    #     storage_urls = self.remote_fs.glob(os.path.join(self.geoparquet_directory, '**.parquet').replace('\\', '/'))
+    
+    #     if self.verbose:
+    #         print('storage_urls            ', len(self.storage_urls))
+    #         #print(*self.storage_urls, sep='\n')
+    #     self.json_folder_submitted = os.path.join(self.json_folder, 'submitted') 
+    #     os.makedirs(self.json_folder_submitted, exist_ok=True)
+    
+    #     for i, storage_url_part in enumerate(self.storage_urls):
+    #         json_filepath = os.path.join(self.json_folder, f'item{i}.json')
+
+    #         href = 's3://' + storage_url_part
+    #         try:
+    #             # If available and installed properly, dask_geopandas can read the metadata faster
+    #             gdf1 = dask_geopandas.read_parquet(
+    #                 's3://'+storage_url_part,
+    #                 storage_options={
+    #                     'key' : self.hsi_access_key_id,
+    #                     'secret' : self.hsi_secret_access_key,
+    #                     'client_kwargs' : {'endpoint_url': self.hsi_endpoint_url},
+    #                 },
+    #             )
+    #             # Spatial extent in native coordinates based on partition (fast):
+    #             poly_native = gdf1.spatial_partitions.unary_union
+    #             gdf1 = gdf1.set_crs(self.grid.crs).compute()
+    #         except:
+    #             # Read with geopandas
+    #             gdf1 = geopandas.read_parquet(
+    #                 's3://'+storage_url_part,
+    #                 storage_options={
+    #                     'key' : self.hsi_access_key_id,
+    #                     'secret' : self.hsi_secret_access_key,
+    #                     'client_kwargs' : {'endpoint_url': self.hsi_endpoint_url},
+    #                 },
+    #             )
+    #             # Spatial extent in native coordinates based on HSI cells (slow)
+    #             poly_native = gdf1.buffer(self.grid.epsilon).unary_union
+    #             gdf1 = gdf1.set_crs(self.grid.crs)
+        
+    #         poly_wgs84 = geopandas.GeoDataFrame([
+    #             {'geometry': poly_native}
+    #         ]).set_crs(self.grid.crs).to_crs(4326).loc[0, 'geometry']
+    #         geometry_native = json.loads(shapely.to_geojson(poly_native))
+    #         geometry_wgs84 = json.loads(shapely.to_geojson(poly_wgs84))
+    #         total_bounds_native = list(poly_native.bounds)
+    #         total_bounds_wgs84 = list(poly_wgs84.bounds)
+    
+    #         table_columns = []
+    #         for col in gdf1.columns:
+    #             if col in self.REQUIRED_STATS_CATEGORICAL | self.REQUIRED_STATS_NUMERIC:
+    #                 description = 'statistic: ' + col
+    #             elif col.startswith(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH):
+    #                 description = 'value_count for category ' + col.lstrip(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH)
+    #             elif col.endswith(self.OPTIONAL_STATS_NUMERIC_ENDSWITH):
+    #                 description = 'quantile: ' + col
+    #             elif col=='q_key':
+    #                 description = 'base4 key of the observation location'
+    #             elif col=='geometry':
+    #                 description = 'location of the observation'
+    #             elif col=='crs':
+    #                 description = 'coordinate reference system'
+    #             elif col=='time':
+    #                 description = 'time of the observation'
+    #             elif col=='dset_id':
+    #                 description = 'PAIRS dataset ID'
+    #             elif col=='layer_id':
+    #                 description = 'PAIRS layer ID'
+    #             elif col=='hsi_level':
+    #                 description = 'spatial level of the HSI'
+    #             elif col=='spatial_partition':
+    #                 description = 'base4 key of the spatial partition'
+    #             elif col in ('year', 'month', 'day'):
+    #                 description = 'temporal partition: ' + col
+    #             elif col=='dimension_band':
+    #                 description = 'band'
+    #             elif col=='dimension_tile':
+    #                 description = 'tile'
+    #             else:
+    #                 print('Gdf columns', gdf1.columns)
+    #                 raise ValueError(f'"{col}" column name not understood.')
+    #                 description = None
+    
+    #             table_columns.append(
+    #                 {
+    #                     "name": col,
+    #                     "description": description,
+    #                     "type": repr(gdf1[col].dtype),
+    #                 }
+    #             )
+    
+    #         datetime_lst = [t.strftime(self.ISO_8601) for t in sorted(gdf1['time'].unique())]
+    #         hsi_level = int([
+    #             d for d in storage_url_part.split('/') if "hsi_level" in d
+    #         ][0].split('=')[1])
+    
+    #         cube_dimensions = {
+    #             "q_key": {
+    #                 "axis": "q_key",
+    #                 "extent": None,
+    #                 "description": 'base4 key of the Morton curve',
+    #                 "step": None,
+    #                 "type": "spatial",
+    #                 "reference_system": None
+    #             },
+    #             "time": {
+    #                 "extent": [
+    #                     datetime_lst[0],
+    #                     datetime_lst[-1],
+    #                 ],
+    #                 "description": None,
+    #                 "step": None,
+    #                 "type": "temporal"
+    #             }
+    #         }
+    
+    #         for col in gdf1.columns:
+    #             if col.startswith('dimension'):
+    #                 cube_dimensions[col] = {
+    #                     "axis": col,
+    #                     "extent": sorted(gdf1[col].unique()),
+    #                     "description": None,
+    #                     "step": None,
+    #                     "type": "other",
+    #                     "reference_system": None
+    #                     }
+    
+    #         cube_variables = {}
+    #         for col in gdf1.columns:
+    #             if (
+    #                 (col in self.REQUIRED_STATS_CATEGORICAL) |
+    #                 (col in self.REQUIRED_STATS_NUMERIC) | 
+    #                 col.startswith(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH) | 
+    #                 col.endswith(self.OPTIONAL_STATS_NUMERIC_ENDSWITH)
+    #             ):
+    #                 cube_variables[col] = {
+    #                     "dimensions": [
+    #                           "q_key",
+    #                           "time",
+    #                     ] + [c for c in gdf1.columns if c.startswith('dimension')],
+    #                     "type": "data",
+    #                     "description": "",
+    #                     "unit": "",
+    #                 }
+    
+    #         stac_item_dict = {
+    #             "type": "Feature",
+    #             "stac_version": "1.0.0",
+    #             "stac_extensions": [
+    #                 "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+    #                 "https://stac-extensions.github.io/table/v1.2.0/schema.json",
+    #             ],
+    #             #"id": storage_url_part.lstrip('s3://').rsplit('/',1)[0],
+    #             "id": uuid.uuid4().hex,
+    #             "collection": self.hsi_collection_id,
+    #             "bbox": total_bounds_wgs84,
+    #             "geometry": geometry_wgs84,
+    
+    #             "properties": {
+    #                 # debug: may need to indicate that datetime can be a list?
+    #                 "datetime": datetime_lst[0],
+    #                 "start_datetime": datetime_lst[0],
+    #                 "end_datetime": datetime_lst[-1],
+    
+    #                 # Projection Extension (https://github.com/stac-extensions/projection)
+    #                 #debug: need to set the projection in the geoparquet so that we can import here
+    #                 "proj:epsg": self.grid.epsg,
+    #                 "proj:bbox": total_bounds_native,
+    #                 "proj:geometry": geometry_native,
+    
+    #                 "table:columns": table_columns,
+    #                 "table:primary_geometry": "geometry",
+    #                 "table:row_count": len(gdf1),
+    
+    #                 #debug: this is a hack to make the item openEO compatible
+    #                 "cube:dimensions": cube_dimensions,
+    #                 #debug: this is a hack to make the item openEO compatible
+    #                 "cube:variables": cube_variables,
+    #             },
+    #             "links": [
+    #                 {
+    #                     "href": "./collection.json",
+    #                     "rel": "collection",
+    #                 },
+    #             ],
+    #             "assets": {
+    #                 "data": {
+    #                     "href": href,
+    #                     "type": "table/parquet; application=geoparquet; profile=cloud-optimized",
+    #                     "title": self.hsi_collection_id,
+    #                     "roles": [
+    #                         "hierarchical spatial index"
+    #                     ],
+    #                     "description": ""
+    #                 },
+    #             }
+    #         }
+    
+    #         with open(json_filepath, 'w') as outfile:
+    #             json.dump(stac_item_dict, outfile, indent=4, sort_keys=False)
+    
+    #     # Upload files to STAC
+    #     stac_collection_url = os.path.join(
+    #         self.stac_url, 'collections', self.hsi_collection_id.replace(" ", "%20"), 'items'
+    #     ).replace('\\', '/')
+    #     for file in glob(os.path.join(self.json_folder, '*.json')):
+    #         file = file.replace('\\', '/')
+    #         os.system(f'curl -H "Content-Type: application/json" -X POST {stac_collection_url} -kL {self.certificate} -d "@{file}"')
+    #         os.system(f'mv {file} {self.json_folder_submitted}')
+            
 
     def _initialize_reproject(
         self,

@@ -421,7 +421,7 @@ class Rasteroverview():
             else:
                 # Drop the 'dimension_' prefix
                 df_existing.columns = [
-                    c.lstrip('dimension_') if c.startswith('dimension_') else c for c in df_existing
+                    c[len('dimension_'):] if c.startswith('dimension_') else c for c in df_existing
                 ]
 
         # query box 
