@@ -423,7 +423,7 @@ class HSI():
 
 
     def setup_rasteroverview(self):
-        """Setup the Rasteroverviw object with appropriate partitions for HSI creation."""
+        """Setup the Rasteroverview object with appropriate partitions for HSI creation."""
         # Available timestamps
         self.timestamps = sorted(set(self.gdf_local_meta['time']))
         # Debug: getting rid of the temporal partitions dependency in the partition module

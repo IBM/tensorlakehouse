@@ -18,11 +18,11 @@ from datetime import datetime, timedelta
 import pytz
 import geopandas
 import shapely
-from rasterio import CRS
 import hashlib
 from functools import partial
 import json
 import uuid
+import s3fs
 from multiprocessing import Pool
 #from pathos.pools import ProcessPool
 
@@ -37,17 +37,37 @@ class Vectorstore():
 
     Attributes:
 
+        dataset                 Dataset name
         vectorstore_directory   Base directory where the vectorstore is persisted.
         dimension_values        Dictionary of valid dimension values indexed by dimension_names.
+        dt_col                  Datetime column name.
+        geom_col                Geometry column name.
+        id_col                  ID column name (we will create a hash_id if id_col==None).
+        key_col                 Base4 key column.
+        idx_col                 Quadtree index column.
+        idx_box_col             Column name of geometry of the quadtree index.
+        geom_area_col           Area column name.
+        geom_length_col         Length column name.
+        max_level               Maximum level for root index.
+        target_level            Target level for detailed quadtree index.
+        max_depth               Maximum depth of detailed quadtree (measured from root).
+        max_inflation           Maximum inflation factor (max number rows / number geometries) for quadtree index.
+        target_rows             Approximate number of rows per parquet file.
+        grid                    Nested grid used to index the Vectorstore.
+        valid_range             Valid range of the Vectorstore. 
+        verbose                 detailed logging
         
     Methods
 
-        register_geodataframe   Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
+        load_geodataframe       Load and transform GeoDataFrame into a spatially indexed GeoDataFrame.
         create_partitions       Create spatial partitions of roughly equal size.
         to_parquet              Write entire GeoDataFrame (all partitions) to parquet.
         partial_upload          Register GeoDataFrame, create partition, and save parquet to disk.
         repartition             Repartrition parquet files to balance number of rows in each file.
+        defrag                  Defragment all partitions with multiple files.
         reindex                 (Re-)create a qtree spatial index for the entire dataset.
+        reproject               Reproject vectorstore.
+        to_cos                  Push local vectorstore (all partitions) to cloud objectstore.
 
     """
 
@@ -320,7 +340,7 @@ class Vectorstore():
             print('----------------------------------------------------------------------------')
 
     
-    def register_geodataframe(self, gdf, validate_geometries=True):
+    def load_geodataframe(self, gdf, validate_geometries=True):
         """Calculate the root index for each unique geometry.
 
         :param gdf:  Geopandas GeoDataFrame to be ingested.
@@ -1296,10 +1316,99 @@ class Vectorstore():
         :param index:       Flag whether to create spatial index.
         """
         # Register data
-        self.register_geodataframe(gdf, validate_geometries=validate_geometries)
+        self.load_geodataframe(gdf, validate_geometries=validate_geometries)
 
         # Write the dataset to parquet
         self.to_parquet(defrag=defrag, index=index)
+
+
+    def _connect_s3(self, access_key_id=None, secret_access_key=None, endpoint_url=None):
+        """Establish a connection to S3FileSystem."""
+        if access_key_id is not None: self.access_key_id = access_key_id
+        if secret_access_key is not None: self.secret_access_key = secret_access_key
+        if endpoint_url is not None: self.endpoint_url = endpoint_url
+            
+        self.remote_fs = s3fs.S3FileSystem(
+            key=self.access_key_id,
+            secret=self.secret_access_key,
+            client_kwargs={
+                'endpoint_url': self.endpoint_url,
+            }
+        )
+
+
+    def to_cos(self, upload_type, bucket=None, access_key_id=None, secret_access_key=None, endpoint_url=None):
+        """Push local vectorstore (all partitions) to cloud objectstore.
+        
+        upload_type:            Flag to indicate what to do with existing remote partitions and files.
+            "replace_all"       Replace entire remote parquet store with local version.
+                                Removes remote partitions not present locally (such as after defrag).
+            "replace_partition" Replace remote partition with local version if a local version exists.
+                                Entire remote partition folder will be replaced by local version.
+                                Keeps remote partitions not present locally.
+            "add"               Adds local partition files to remote partition.
+                                Skips parquet files with the exact same hashed filename.
+                                May result in a fragmented remote partition.
+        """
+        REMOTE_VECTORSTORE_DIRECTORY = 'vectorstore'
+        
+        if self.verbose:
+            stopwatch_start = time.time()
+
+        if bucket is not None: self.bucket = bucket
+        if access_key_id is not None: self.access_key_id = access_key_id
+        if secret_access_key is not None: self.secret_access_key = secret_access_key
+        if endpoint_url is not None: self.endpoint_url = endpoint_url
+
+        if not hasattr(self, 'remote_fs'):
+            self._connect_s3()
+
+        remote_prefix = os.path.join(self.bucket, REMOTE_VECTORSTORE_DIRECTORY).replace('\\', '/')
+        spatial_partitions = sorted(self._glob_partitions()['partition'])
+        if upload_type=='replace_all':
+            # Remove existing remote parquet_directory
+            local_folderpath = self.geoparquet_directory
+            remote_folderpath = os.path.join(remote_prefix, local_folderpath.lstrip(self.vectorstore_directory)).replace('\\', '/')
+            remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**.parquet').replace('\\', '/'))
+            if len(remote_filepaths)>0:
+                if self.verbose:
+                    print('removing remote_filepaths', remote_filepaths)
+                self.remote_fs.rm(remote_filepaths)
+
+        elif upload_type=='replace_partition':
+            for spatial_partition in spatial_partitions:
+                temporal_partition = {}
+                # Remove remote partition that exists locally
+                local_folderpath = self._folderpath(temporal_partition, spatial_partition)
+                remote_folderpath = os.path.join(remote_prefix, local_folderpath.lstrip(self.vectorstore_directory)).replace('\\', '/')
+                remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**.parquet').replace('\\', '/'))
+                if len(remote_filepaths)>0:
+                    if self.verbose:
+                        print('removing remote_filepaths', remote_filepaths)
+                    self.remote_fs.rm(remote_filepaths)
+
+        elif upload_type=='add':
+            pass
+            
+        else:
+            raise ValueError('upload_type not understood.')
+
+        for spatial_partition in spatial_partitions:
+            temporal_partition = {}
+            local_folderpath = self._folderpath(temporal_partition, spatial_partition)
+            local_paths = glob(os.path.join(local_folderpath, '*.parquet'))
+            local_paths = [f.replace('\\', '/') for f in local_paths]
+
+            for local_path in local_paths:
+                remote_path = os.path.join(remote_prefix, local_path.lstrip(self.vectorstore_directory)).replace('\\', '/')
+                if upload_type!='add' or (not self.remote_fs.exists(remote_path)):
+                    if self.verbose:
+                        print('uploading to remote_path', remote_path)
+                    self.remote_fs.upload(local_path, remote_path)
+        
+        if self.verbose:
+            print('Time for pushing local vectorstore to COS', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
 
 
     def _initialize_reproject(
@@ -1389,7 +1498,6 @@ class Vectorstore():
             # Upload to new vectorstore
             vs2.partial_upload(
                 gdf2,
-                target_rows=target_rows,
                 defrag=defrag,
                 index=index,
                 validate_geometries=False, #No need to validate since reprojecting from good geometries

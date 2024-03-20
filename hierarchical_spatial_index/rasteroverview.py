@@ -1039,9 +1039,8 @@ class Rasteroverview():
                 filepath,
                 temporal_level+'='+str(temporal_partition[temporal_level])
             ).replace('\\', '/')
-        filepath = os.path.join(filepath, 'spatial_partition'+'='+spatial_partition).replace('\\', '/')
-        if create_path and not os.path.exists(filepath):
-            os.makedirs(filepath)
+        filepath = os.path.join(filepath, 'spatial_partition='+spatial_partition).replace('\\', '/')
+        if create_path and not os.path.exists(filepath): os.makedirs(filepath)
 
         filename = 'hsi.parquet'
         return os.path.join(filepath, filename).replace('\\', '/')
