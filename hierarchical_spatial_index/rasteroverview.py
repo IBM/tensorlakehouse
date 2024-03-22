@@ -1026,8 +1026,7 @@ class Rasteroverview():
             parquet_directory,
             'hsi_level=' + str(self.hsi_level)
         ).replace('\\', '/')
-        if not os.path.exists(parquet_directory):
-            os.makedirs(parquet_directory)
+        os.makedirs(parquet_directory, exist_ok=True)
         return parquet_directory
 
     

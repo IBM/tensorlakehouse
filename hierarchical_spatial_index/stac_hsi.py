@@ -1046,8 +1046,7 @@ def search_hsi(
 #             # Using local (or mounted) drive to upload to
 #             if not os.path.exists(dst_path):
 #                 dst_dir = os.path.dirname(dst_path)
-#                 if not os.path.exists(dst_dir):
-#                     os.makedirs(dst_dir)
+#                 os.makedirs(dst_dir, exist_ok=True)
 #                 shutil.copy(src_path, dst_path)
 #             else:
 #                 if verbose:

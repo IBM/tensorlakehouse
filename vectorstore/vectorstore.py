@@ -16,6 +16,8 @@ import numpy
 import pandas
 from datetime import datetime, timedelta
 import pytz
+import dask_geopandas
+import pyarrow.parquet
 import geopandas
 import shapely
 import hashlib
@@ -155,22 +157,22 @@ class Vectorstore():
         
         # Dataset directory is subfolder in vectorstore_directory
         self.dataset_directory = os.path.join(self.vectorstore_directory, self.dataset).replace('\\', '/')
-        if not os.path.exists(self.dataset_directory): os.makedirs(self.dataset_directory)
+        os.makedirs(self.dataset_directory, exist_ok=True)
 
         # Grid directory (where the index is defined on) is subfolder in dataset_directory
         self.grid_directory = os.path.join(
             self.dataset_directory,
             'grid=' + self.grid.__repr__()
         ).replace('\\', '/')
-        if not os.path.exists(self.grid_directory): os.makedirs(self.grid_directory)
+        os.makedirs(self.grid_directory, exist_ok=True)
 
         # Parquet directory is subfolder in grid_directory
         self.geoparquet_directory = os.path.join(self.grid_directory, 'geoparquet').replace('\\', '/')
-        if not os.path.exists(self.geoparquet_directory): os.makedirs(self.geoparquet_directory)
+        os.makedirs(self.geoparquet_directory, exist_ok=True)
 
         # Index directory is subfolder in grid_directory 
         self.index_directory = os.path.join(self.grid_directory, 'index').replace('\\', '/')
-        if not os.path.exists(self.index_directory): os.makedirs(self.index_directory)
+        os.makedirs(self.index_directory, exist_ok=True)
 
         # Table specific column information
         self.dt_col = self.DT_COL if dt_col is None else dt_col
@@ -1246,7 +1248,7 @@ class Vectorstore():
                 by=[self.dt_col]+list(self.dimension_values)+[self.key_col]
             ).reset_index(drop=True)
 
-            if not os.path.exists(folderpath): os.makedirs(folderpath)
+            os.makedirs(folderpath, exist_ok=True)
             filepath = self._unique_filepath(folderpath)
             gdf_part.to_parquet(
                 path=filepath,
@@ -1280,7 +1282,7 @@ class Vectorstore():
                 by=[self.dt_col]+list(self.dimension_values)+[self.key_col]
             ).reset_index(drop=True)
 
-            if not os.path.exists(folderpath): os.makedirs(folderpath)
+            os.makedirs(folderpath, exist_ok=True)
             filepath = self._unique_filepath(folderpath)
             gdf_part.to_parquet(
                 path=filepath,
@@ -1349,7 +1351,12 @@ class Vectorstore():
         return os.path.join(prefix_new, folderpath[len(prefix_old):]).replace('\\', '/')
 
         
-    def to_cos(self, upload_type, bucket=None, access_key_id=None, secret_access_key=None, endpoint_url=None):
+    def to_cos(
+        self, upload_type, 
+        stac_url, collection_id, stac_json_folder, certificate,
+        bucket=None, access_key_id=None, secret_access_key=None, endpoint_url=None,
+        temporal_partitions=None, spatial_partitions = None,
+    ):
         """Push local vectorstore (all partitions) to cloud objectstore.
         
         upload_type:            Flag to indicate what to do with existing remote partitions and files.
@@ -1361,6 +1368,8 @@ class Vectorstore():
             "add"               Adds local partition files to remote partition.
                                 Skips parquet files with the exact same hashed filename.
                                 May result in a fragmented remote partition.
+            "stac_items_only"   Does not erase or create anything parquet files in COS.
+                                Creates the stac items corresponding to the local files.
         """
         REMOTE_VECTORSTORE_DIRECTORY = 'vectorstore'
         
@@ -1375,9 +1384,13 @@ class Vectorstore():
         if not hasattr(self, 'remote_fs'):
             self._connect_s3()
 
+        if spatial_partitions is None:
+            spatial_partitions = sorted(self._glob_partitions()['partition'])
+        if temporal_partitions is not None:
+            raise NotImplementedError()
+
         local_prefix = self.vectorstore_directory
         remote_prefix = os.path.join(self.bucket, REMOTE_VECTORSTORE_DIRECTORY).replace('\\', '/')
-        spatial_partitions = sorted(self._glob_partitions()['partition'])
         if upload_type=='replace_all':
             # Remove existing remote parquet_directory
             local_folderpath = self.geoparquet_directory
@@ -1388,6 +1401,7 @@ class Vectorstore():
                 if self.verbose:
                     print('removing remote_filepaths', remote_filepaths)
                 self.remote_fs.rm(remote_filepaths)
+                # ToDo: remove existing STAC item.
 
         elif upload_type=='replace_partition':
             for spatial_partition in spatial_partitions:
@@ -1400,8 +1414,9 @@ class Vectorstore():
                     if self.verbose:
                         print('removing remote_filepaths', remote_filepaths)
                     self.remote_fs.rm(remote_filepaths)
+                    # ToDo: remove existing STAC item.
 
-        elif upload_type=='add':
+        elif upload_type in ['add', 'stac_items_only']:
             pass
             
         else:
@@ -1418,237 +1433,331 @@ class Vectorstore():
                 if upload_type!='add' or (not self.remote_fs.exists(remote_path)):
                     if self.verbose:
                         print('uploading to remote_path', remote_path)
-                    self.remote_fs.upload(local_path, remote_path)
+                    if upload_type!='stac_items_only':
+                        self.remote_fs.upload(local_path, remote_path)
+                    self.to_stac_item(
+                        stac_url, collection_id, stac_json_folder, certificate, remote_path,
+                        local_path=local_path,
+                        bucket=bucket,
+                        access_key_id=access_key_id,
+                        secret_access_key=secret_access_key,
+                        endpoint_url=endpoint_url,
+                    )
         
         if self.verbose:
             print('Time for pushing local vectorstore to COS', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
 
-    # def to_stac(self):
-    #     """Register vectorstore partitions as items in STAC."""
-    #     REMOTE_VECTORSTORE_DIRECTORY = 'vectorstore'
+    def to_stac_item(
+        self, stac_url, collection_id, stac_json_folder, certificate, remote_path, local_path=None,
+        bucket=None, access_key_id=None, secret_access_key=None, endpoint_url=None
+    ):
+        """Register vectorstore file as item in STAC."""
+        REMOTE_VECTORSTORE_DIRECTORY = 'vectorstore'
+        ISO_8601                     = '%Y-%m-%dT%H:%M:%SZ'
         
-    #     if self.verbose:
-    #         stopwatch_start = time.time()
+        if self.verbose:
+            stopwatch_start = time.time()
 
-    #     if bucket is not None: self.bucket = bucket
-    #     if access_key_id is not None: self.access_key_id = access_key_id
-    #     if secret_access_key is not None: self.secret_access_key = secret_access_key
-    #     if endpoint_url is not None: self.endpoint_url = endpoint_url
-
-    #     if not hasattr(self, 'remote_fs'):
-    #         self._connect_s3()
-            
-    #     storage_urls = self.remote_fs.glob(os.path.join(self.geoparquet_directory, '**.parquet').replace('\\', '/'))
-    
-    #     if self.verbose:
-    #         print('storage_urls            ', len(self.storage_urls))
-    #         #print(*self.storage_urls, sep='\n')
-    #     self.json_folder_submitted = os.path.join(self.json_folder, 'submitted') 
-    #     os.makedirs(self.json_folder_submitted, exist_ok=True)
-    
-    #     for i, storage_url_part in enumerate(self.storage_urls):
-    #         json_filepath = os.path.join(self.json_folder, f'item{i}.json')
-
-    #         href = 's3://' + storage_url_part
-    #         try:
-    #             # If available and installed properly, dask_geopandas can read the metadata faster
-    #             gdf1 = dask_geopandas.read_parquet(
-    #                 's3://'+storage_url_part,
-    #                 storage_options={
-    #                     'key' : self.hsi_access_key_id,
-    #                     'secret' : self.hsi_secret_access_key,
-    #                     'client_kwargs' : {'endpoint_url': self.hsi_endpoint_url},
-    #                 },
-    #             )
-    #             # Spatial extent in native coordinates based on partition (fast):
-    #             poly_native = gdf1.spatial_partitions.unary_union
-    #             gdf1 = gdf1.set_crs(self.grid.crs).compute()
-    #         except:
-    #             # Read with geopandas
-    #             gdf1 = geopandas.read_parquet(
-    #                 's3://'+storage_url_part,
-    #                 storage_options={
-    #                     'key' : self.hsi_access_key_id,
-    #                     'secret' : self.hsi_secret_access_key,
-    #                     'client_kwargs' : {'endpoint_url': self.hsi_endpoint_url},
-    #                 },
-    #             )
-    #             # Spatial extent in native coordinates based on HSI cells (slow)
-    #             poly_native = gdf1.buffer(self.grid.epsilon).unary_union
-    #             gdf1 = gdf1.set_crs(self.grid.crs)
+        # STAC access
+        self.stac_url = stac_url
+        self.collection_id = collection_id
+        self.stac_json_folder = stac_json_folder
+        self.certificate = certificate
         
-    #         poly_wgs84 = geopandas.GeoDataFrame([
-    #             {'geometry': poly_native}
-    #         ]).set_crs(self.grid.crs).to_crs(4326).loc[0, 'geometry']
-    #         geometry_native = json.loads(shapely.to_geojson(poly_native))
-    #         geometry_wgs84 = json.loads(shapely.to_geojson(poly_wgs84))
-    #         total_bounds_native = list(poly_native.bounds)
-    #         total_bounds_wgs84 = list(poly_wgs84.bounds)
+        # COS access
+        if bucket is not None: self.bucket = bucket
+        if access_key_id is not None: self.access_key_id = access_key_id
+        if secret_access_key is not None: self.secret_access_key = secret_access_key
+        if endpoint_url is not None: self.endpoint_url = endpoint_url
+
+        if not hasattr(self, 'remote_fs'):
+            self._connect_s3()
+
+        os.makedirs(self.stac_json_folder, exist_ok=True)
+        uid = os.path.splitext((os.path.basename(remote_path)))[0]
+        json_filepath = os.path.join(self.stac_json_folder, f'item_{uid}.json').replace('\\', '/')
+
+        self.stac_json_folder_submitted = os.path.join(self.stac_json_folder, 'submitted')
+        os.makedirs(self.stac_json_folder_submitted, exist_ok=True)
     
-    #         table_columns = []
-    #         for col in gdf1.columns:
-    #             if col in self.REQUIRED_STATS_CATEGORICAL | self.REQUIRED_STATS_NUMERIC:
-    #                 description = 'statistic: ' + col
-    #             elif col.startswith(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH):
-    #                 description = 'value_count for category ' + col.lstrip(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH)
-    #             elif col.endswith(self.OPTIONAL_STATS_NUMERIC_ENDSWITH):
-    #                 description = 'quantile: ' + col
-    #             elif col=='q_key':
-    #                 description = 'base4 key of the observation location'
-    #             elif col=='geometry':
-    #                 description = 'location of the observation'
-    #             elif col=='crs':
-    #                 description = 'coordinate reference system'
-    #             elif col=='time':
-    #                 description = 'time of the observation'
-    #             elif col=='dset_id':
-    #                 description = 'PAIRS dataset ID'
-    #             elif col=='layer_id':
-    #                 description = 'PAIRS layer ID'
-    #             elif col=='hsi_level':
-    #                 description = 'spatial level of the HSI'
-    #             elif col=='spatial_partition':
-    #                 description = 'base4 key of the spatial partition'
-    #             elif col in ('year', 'month', 'day'):
-    #                 description = 'temporal partition: ' + col
-    #             elif col=='dimension_band':
-    #                 description = 'band'
-    #             elif col=='dimension_tile':
-    #                 description = 'tile'
-    #             else:
-    #                 print('Gdf columns', gdf1.columns)
-    #                 raise ValueError(f'"{col}" column name not understood.')
-    #                 description = None
+        # local_prefix = self.vectorstore_directory
+        # remote_prefix = os.path.join(self.bucket, REMOTE_VECTORSTORE_DIRECTORY).replace('\\', '/')
+        # remote_geoparquet_directory = self._swap_prefixes(self.geoparquet_directory, local_prefix, remote_prefix)
+        # self.storage_urls = self.remote_fs.glob(os.path.join(remote_geoparquet_directory, '**.parquet').replace('\\', '/'))
+        # for storage_url_part in self.storage_urls:
+
+        # Read metadata efficiently using dask_geopandas and/or pyarrow.parquet
+        ddf = dask_geopandas.read_parquet(local_path)
+        #gdf = ddf.compute() # Try not to read the entire file for speed and egress issues.
+        parquet_file = pyarrow.parquet.ParquetFile(local_path)
+        schema = pyarrow.parquet.read_schema(local_path, memory_map=True)
+
+        if self.verbose:
+            print('schema.names', schema.names)
+            print('schema.types', schema.types)
+            print('schema.metadata', [k for k in schema.metadata])
+
+        # if local_path is None:
+        #     # Read metadata remotely
+        #     try:
+        #         # Spatial extent in native coordinates based on dask_geopandas spatial_partitions (fast)
+        #         gdf1 = dask_geopandas.read_parquet(
+        #             's3://'+remote_path,
+        #             storage_options={
+        #                 'key' : self.access_key_id,
+        #                 'secret' : self.secret_access_key,
+        #                 'client_kwargs' : {'endpoint_url': self.endpoint_url},
+        #             },
+        #         )
+                
+        #         if gdf1.spatial_partitions is None:
+        #             # ToDo: need to ensure that all GeoParquet files written have spatial_partitions metadata
+        #             #       Run dask_geopandas: calculate_spatial_partitions() before to_parquet().
+        #             #       However, currently this seems to be broken in dask_geopandas/pyarrow. 
+        #             #       (The spatial_partitions metadata is not persisted in parquet file)
+        #             gdf1.calculate_spatial_partitions()
+                    
+        #         poly_native = gdf1.spatial_partitions.unary_union
+        #         gdf1 = gdf1.set_crs(self.grid.crs).compute()
+        #     except:
+        #         # Read with geopandas
+        #         gdf1 = geopandas.read_parquet(
+        #             's3://'+remote_path,
+        #             storage_options={
+        #                 'key' : self.access_key_id,
+        #                 'secret' : self.secret_access_key,
+        #                 'client_kwargs' : {'endpoint_url': self.endpoint_url},
+        #             },
+        #         )
+        #         # Spatial extent in native coordinates based on HSI cells (slow)
+        #         poly_native = gdf1.buffer(self.grid.epsilon).unary_union
+        #         gdf1 = gdf1.set_crs(self.grid.crs)
     
-    #             table_columns.append(
-    #                 {
-    #                     "name": col,
-    #                     "description": description,
-    #                     "type": repr(gdf1[col].dtype),
-    #                 }
-    #             )
+        # Bounding geometries
+        if ddf.spatial_partitions is None:
+            # Convex hull of unary union
+            ddf.calculate_spatial_partitions()
+
+        poly_native = ddf.spatial_partitions.loc[0]
+        poly_wgs84 = geopandas.GeoDataFrame([
+            {'geometry': poly_native}
+        ]).set_crs(self.grid.crs).to_crs(4326).loc[0, 'geometry']
+        geometry_native = json.loads(shapely.to_geojson(poly_native))
+        geometry_wgs84 = json.loads(shapely.to_geojson(poly_wgs84))
+        total_bounds_native = list(poly_native.bounds)
+        total_bounds_wgs84 = list(poly_wgs84.bounds)
+
+        # Start and end timestamps
+        dt_pos = schema.names.index(self.dt_col) # Position of the datetime column within the parquet column schema
+        start_datetime = min([
+            parquet_file.metadata.row_group(i).column(dt_pos).statistics.min for i in range(parquet_file.metadata.num_row_groups)
+        ]).strftime(ISO_8601)
+        end_datetime = max([
+            parquet_file.metadata.row_group(i).column(dt_pos).statistics.max for i in range(parquet_file.metadata.num_row_groups)
+        ]).strftime(ISO_8601)
+
+        # Table Extension (https://stac-extensions.github.io/table/v1.2.0/schema.json)
+        table_columns = []
+        for col in ddf.columns:
+            if col==self.dt_col:
+                description = 'Datetime column'
+            elif col==self.geom_col:
+                description = 'Geometry column'
+            elif col==self.id_col:
+                description = 'ID column'
+            elif col==self.key_col:
+                description = 'Spatial key column'
+            elif col==self.idx_col:
+                description = 'Index column'
+            elif col==self.idx_box_col:
+                description = 'Index box column'
+            elif col==self.geom_area_col:
+                description = 'Geometry area column'
+            elif col==self.geom_length_col:
+                description = 'Geometry length column'
+            elif col=='spatial_partition':
+                description = 'Spatial partition column'
+            elif col=='grid':
+                description = 'Nested grid column'
+            else:
+                description = f'Undefined column named {col}'
+        
+            table_columns.append(
+                {
+                    "name": col,
+                    "description": description,
+                    "type": repr(ddf[col].dtype),
+                }
+            )
+
+        # Datacube extension (https://stac-extensions.github.io/datacube/v2.2.0/schema.json)
+        cube_dimensions = {
+            self.geom_col: {
+                "axis": self.geom_col,
+                "extent": None,
+                "description": "Vectorcube geometry",
+                "step": None,
+                "type": "spatial",
+                "reference_system": self.grid.epsg
+            },
+            "time": {
+                "extent": [
+                    start_datetime,
+                    end_datetime,
+                ],
+                "description": None,
+                "step": None,
+                "type": "temporal"
+            }
+        }
+        
+        for col in list(self.dimension_values.keys()):
+            cube_dimensions[col] = {
+                "axis": col,
+                "extent": None,
+                "description": f"Vectorcube dimension {col}",
+                "step": None,
+                "type": "other",
+                "reference_system": None
+                }
     
-    #         datetime_lst = [t.strftime(self.ISO_8601) for t in sorted(gdf1['time'].unique())]
-    #         hsi_level = int([
-    #             d for d in storage_url_part.split('/') if "hsi_level" in d
-    #         ][0].split('=')[1])
+        cube_variables = {}
+        for col in ddf.columns:
+            if not (col in (
+                [self.geom_col, self.dt_col, self.id_col, self.key_col, 'grid', 'spatial_partition'] + list(self.dimension_values.keys())
+            )):
+                cube_variables[col] = {
+                    "dimensions": [
+                          self.geom_col,
+                          "time",
+                    ] + list(self.dimension_values.keys()),
+                    "type": "data",
+                    "description": "",
+                    "unit": "",
+                }
+
+        href = 's3://' + remote_path
+
+        stac_item_dict = {
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "stac_extensions": [
+                "https://stac-extensions.github.io/datacube/v2.2.0/schema.json",
+                "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+                "https://stac-extensions.github.io/table/v1.2.0/schema.json",
+            ],
+            "id": uid,
+            "collection": self.collection_id,
+            "bbox": total_bounds_wgs84,
+            "geometry": geometry_wgs84,
+        
+            "properties": {
+                "datetime": start_datetime,
+                "start_datetime": start_datetime,
+                "end_datetime": end_datetime,
+        
+                # Projection Extension (https://stac-extensions.github.io/projection/v1.1.0/schema.json)
+                "proj:epsg": self.grid.epsg,
+                "proj:bbox": total_bounds_native,
+                "proj:geometry": geometry_native,
+        
+                # Table Extension (https://stac-extensions.github.io/table/v1.2.0/schema.json)
+                "table:columns": table_columns,
+                "table:primary_geometry": "geometry",
+                "table:row_count": len(ddf),
+        
+                # Datacube extension (https://stac-extensions.github.io/datacube/v2.2.0/schema.json)
+                "cube:dimensions": cube_dimensions,
+                "cube:variables": cube_variables,
+            },
+            "links": [
+                {
+                    "href": "./collection.json",
+                    "rel": "collection",
+                },
+            ],
+            "assets": {
+                "data": {
+                    "href": href,
+                    "type": "table/parquet; application=geoparquet; profile=cloud-optimized",
+                    "title": self.collection_id,
+                    "roles": [
+                        "Vectordata"
+                    ],
+                    "description": ""
+                },
+            }
+        }
+
+        with open(json_filepath, 'w') as outfile:
+            json.dump(stac_item_dict, outfile, indent=4, sort_keys=False)
     
-    #         cube_dimensions = {
-    #             "q_key": {
-    #                 "axis": "q_key",
-    #                 "extent": None,
-    #                 "description": 'base4 key of the Morton curve',
-    #                 "step": None,
-    #                 "type": "spatial",
-    #                 "reference_system": None
-    #             },
-    #             "time": {
-    #                 "extent": [
-    #                     datetime_lst[0],
-    #                     datetime_lst[-1],
-    #                 ],
-    #                 "description": None,
-    #                 "step": None,
-    #                 "type": "temporal"
-    #             }
-    #         }
-    
-    #         for col in gdf1.columns:
-    #             if col.startswith('dimension'):
-    #                 cube_dimensions[col] = {
-    #                     "axis": col,
-    #                     "extent": sorted(gdf1[col].unique()),
-    #                     "description": None,
-    #                     "step": None,
-    #                     "type": "other",
-    #                     "reference_system": None
-    #                     }
-    
-    #         cube_variables = {}
-    #         for col in gdf1.columns:
-    #             if (
-    #                 (col in self.REQUIRED_STATS_CATEGORICAL) |
-    #                 (col in self.REQUIRED_STATS_NUMERIC) | 
-    #                 col.startswith(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH) | 
-    #                 col.endswith(self.OPTIONAL_STATS_NUMERIC_ENDSWITH)
-    #             ):
-    #                 cube_variables[col] = {
-    #                     "dimensions": [
-    #                           "q_key",
-    #                           "time",
-    #                     ] + [c for c in gdf1.columns if c.startswith('dimension')],
-    #                     "type": "data",
-    #                     "description": "",
-    #                     "unit": "",
-    #                 }
-    
-    #         stac_item_dict = {
-    #             "type": "Feature",
-    #             "stac_version": "1.0.0",
-    #             "stac_extensions": [
-    #                 "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
-    #                 "https://stac-extensions.github.io/table/v1.2.0/schema.json",
-    #             ],
-    #             #"id": storage_url_part.lstrip('s3://').rsplit('/',1)[0],
-    #             "id": uuid.uuid4().hex,
-    #             "collection": self.hsi_collection_id,
-    #             "bbox": total_bounds_wgs84,
-    #             "geometry": geometry_wgs84,
-    
-    #             "properties": {
-    #                 # debug: may need to indicate that datetime can be a list?
-    #                 "datetime": datetime_lst[0],
-    #                 "start_datetime": datetime_lst[0],
-    #                 "end_datetime": datetime_lst[-1],
-    
-    #                 # Projection Extension (https://github.com/stac-extensions/projection)
-    #                 #debug: need to set the projection in the geoparquet so that we can import here
-    #                 "proj:epsg": self.grid.epsg,
-    #                 "proj:bbox": total_bounds_native,
-    #                 "proj:geometry": geometry_native,
-    
-    #                 "table:columns": table_columns,
-    #                 "table:primary_geometry": "geometry",
-    #                 "table:row_count": len(gdf1),
-    
-    #                 #debug: this is a hack to make the item openEO compatible
-    #                 "cube:dimensions": cube_dimensions,
-    #                 #debug: this is a hack to make the item openEO compatible
-    #                 "cube:variables": cube_variables,
-    #             },
-    #             "links": [
-    #                 {
-    #                     "href": "./collection.json",
-    #                     "rel": "collection",
-    #                 },
-    #             ],
-    #             "assets": {
-    #                 "data": {
-    #                     "href": href,
-    #                     "type": "table/parquet; application=geoparquet; profile=cloud-optimized",
-    #                     "title": self.hsi_collection_id,
-    #                     "roles": [
-    #                         "hierarchical spatial index"
-    #                     ],
-    #                     "description": ""
-    #                 },
-    #             }
-    #         }
-    
-    #         with open(json_filepath, 'w') as outfile:
-    #             json.dump(stac_item_dict, outfile, indent=4, sort_keys=False)
-    
-    #     # Upload files to STAC
-    #     stac_collection_url = os.path.join(
-    #         self.stac_url, 'collections', self.hsi_collection_id.replace(" ", "%20"), 'items'
-    #     ).replace('\\', '/')
-    #     for file in glob(os.path.join(self.json_folder, '*.json')):
-    #         file = file.replace('\\', '/')
-    #         os.system(f'curl -H "Content-Type: application/json" -X POST {stac_collection_url} -kL {self.certificate} -d "@{file}"')
-    #         os.system(f'mv {file} {self.json_folder_submitted}')
-            
+        # # Upload files to STAC
+        # stac_collection_url = os.path.join(
+        #     self.stac_url, 'collections', self.collection_id.replace(" ", "%20"), 'items'
+        # ).replace('\\', '/')
+        # for file in glob(os.path.join(self.stac_json_folder, '*.json')):
+        #     file = file.replace('\\', '/')
+        #     os.system(f'curl -H "Content-Type: application/json" -X POST {stac_collection_url} -kL {self.certificate} -d "@{file}"')
+        #     os.system(f'mv {file} {self.stac_json_folder_submitted}')
+
+
+    def to_stac_collection(
+        self, stac_url, collection_id, stac_json_folder, certificate,
+        bbox, dt_start, dt_end, title, description,
+    ):
+        """Register vectorstore collection in STAC."""
+
+        ISO_8601 = '%Y-%m-%dT%H:%M:%SZ'
+        
+        # STAC access
+        self.stac_url = stac_url
+        self.collection_id = collection_id
+        self.stac_json_folder = stac_json_folder
+        self.certificate = certificate
+
+        # # Debug
+        # stac = pystac_client.Client.open(self.stac_url)
+        # stac_collections = list(stac.get_all_collections())
+        # collection = stac_collections[[c.id for c in stac_collections].index(self.collection_id)]
+
+        stac_collection_dict = {
+            "id": self.collection_id,
+            "type": "Collection",
+            "stac_version": "1.0.0",
+            "title": title,
+            "description": description,
+            "extent": {
+                "spatial": {
+                    "bbox": bbox,
+                },
+                "temporal": {
+                    "interval": [
+                        [dt_start.strftime(ISO_8601), dt_end.strftime(ISO_8601)]
+                    ]
+                }
+            },
+            "license": "Unknown",
+            "links": [
+                {
+                    "href": "",
+                    "rel": "self",
+                },
+                {
+                    "href": "",
+                    "rel": "item",
+                },
+            ],
+        }
+
+        json_filepath = os.path.join(self.stac_json_folder, f'collection_{self.collection_id}.json').replace('\\', '/')
+
+        #json.dumps(stac_collection_dict)
+        with open(json_filepath, "w") as outfile:
+            json.dump(stac_collection_dict, outfile, indent=4, sort_keys=False)
+
 
     def _initialize_reproject(
         self,
@@ -1845,8 +1954,6 @@ class Vectorstore():
                 setattr(self, k, vs_settings[k])
             
 
-
-    
     # def _all_the_same(self, s):
     #     # Quick test if column values (pandas series s) are all the same
     #     a = s.to_numpy()
