@@ -515,7 +515,7 @@ class Vectorstore():
     def _partitions_df(self):
         """Existing partitions and partition levels."""
 
-        partitions = self._glob_partitions
+        partitions = self._glob_partitions()
 
         df_partitions = pandas.DataFrame({
             'partition': partitions,
@@ -1271,12 +1271,63 @@ class Vectorstore():
                 os.remove(file)
 
 
-    def _to_parquet(self, temporal_partition, spatial_partition, gdf_part=None, defrag=False):
+    def _reproject_to_local_equal_area_grid(self, gdf, spatial_partition):
+        """Reproject to local equal area grid.
+
+        Enable length and area measurements.
+        All geometries must belong to the same spatial partition.
+        """
+        
+        assert all(gdf[self.key_col].apply(lambda x: x[:len(spatial_partition)])==spatial_partition)
+        
+        # Get the centroid of the spatial partition
+        lon, lat = self.morton.base4_to_center_coords(spatial_partition)
+
+        # local_azimuthal_projection preserves angle (e.g. circles stay circles)
+        #local_azimuthal_projection = f"+proj=aeqd +R=6371000 +units=m +lat_0={lat} +lon_0={lon}"
+
+        # Lambert Azimuthal Equal Area preserves area 
+        lambert_azimuthal_ea = f"+proj=laea +lat_0={lat} +lon_0={lon} +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+        #gdf['area_local_azimuthal_projection'] = gdf.to_crs(local_azimuthal_projection).area
+        #gdf['area_lambert_azimuthal_ea'] = gdf.to_crs(lambert_azimuthal_ea).area
+        
+        return gdf.to_crs(lambert_azimuthal_ea)
+
+    
+    def _to_parquet(
+        self,
+        temporal_partition,
+        spatial_partition,
+        gdf_part=None,
+        defrag=False,
+        geometry_area=False,
+        geometry_length=False,
+    ):
         """Write GeoDataFrame partition to parquet."""
         
         if gdf_part is None:
             # Creating gdf_part from latest self.gdf_ingest
             gdf_part = self._filter_partition(temporal_partition, spatial_partition)
+
+        # Add area and/or length columns if requested
+        if geometry_area or geometry_length:
+            gdf_unique = gdf_part[
+                [self.id_col, self.geom_col, self.key_col]
+            ].drop_duplicates(subset=self.id_col).reset_index(drop=True)
+
+            if self.grid.epsg==4326:
+                gdf_ea = self._reproject_to_local_equal_area_grid(gdf_unique, spatial_partition)
+            else:
+                gdf_ea = gdf_unique
+                
+            if geometry_area:
+                gdf_unique[self.geom_area_col] = gdf_ea.area / 1e6 # units: [km2]
+            if geometry_length:
+                gdf_unique[self.geom_length_col] = gdf_ea.length / 1e3 # units: [km]
+                
+            del gdf_unique[self.geom_col]
+            gdf_part = pandas.merge(gdf_part, gdf_unique, on=[self.id_col, self.key_col])
 
         folderpath = self._folderpath(temporal_partition, spatial_partition)
 
@@ -1290,6 +1341,12 @@ class Vectorstore():
                 by=[self.dt_col]+list(self.dimension_values)+[self.key_col]
             ).reset_index(drop=True)
 
+            # Save as object column so that nan values don't break things.
+            if geometry_area:
+                gdf_part[self.geom_area_col] = gdf_part[self.geom_area_col].astype(object)
+            if geometry_length:
+                gdf_part[self.geom_length_col] = gdf_part[self.geom_length_col].astype(object)
+
             os.makedirs(folderpath, exist_ok=True)
             filepath = self._unique_filepath(folderpath)
             gdf_part.to_parquet(
@@ -1300,8 +1357,13 @@ class Vectorstore():
                 #partition_cols=self.partition_cols
             )
 
-
-    def to_parquet(self, defrag=False, index=False):
+    def to_parquet(
+        self,
+        defrag=False,
+        index=False,
+        geometry_area=False,
+        geometry_length=False,
+    ):
         """Write entire GeoDataFrame (all partitions) to parquet."""
         if self.verbose:
             stopwatch_start = time.time()
@@ -1315,7 +1377,13 @@ class Vectorstore():
             temporal_partition = {}
 
             # Write the data to parquet partitions
-            self._to_parquet(temporal_partition, spatial_partition, defrag=defrag)
+            self._to_parquet(
+                temporal_partition,
+                spatial_partition,
+                defrag=defrag,
+                geometry_area=geometry_area,
+                geometry_length=geometry_length,
+            )
             
             if index:
                 # Write the index to parquet
@@ -1326,7 +1394,15 @@ class Vectorstore():
             stopwatch_start = time.time()
 
 
-    def partial_upload(self, gdf, defrag=False, index=False, validate_geometries=False):
+    def partial_upload(
+        self, 
+        gdf, 
+        defrag=False,
+        index=False,
+        geometry_area=False,
+        geometry_length=False,
+        validate_geometries=False,
+    ):
         """Register GeoDataFrame, create partition, and save parquet to disk.
 
         :param gdf:         Geopandas GeoDataFrame to be indexed and written to disk.
@@ -1336,7 +1412,7 @@ class Vectorstore():
         self.load_geodataframe(gdf, validate_geometries=validate_geometries)
 
         # Write the dataset to parquet
-        self.to_parquet(defrag=defrag, index=index)
+        self.to_parquet(defrag=defrag, index=index, geometry_area=geometry_area, geometry_length=geometry_length)
 
 
     def _connect_s3(self, access_key_id=None, secret_access_key=None, endpoint_url=None):
@@ -1506,42 +1582,6 @@ class Vectorstore():
             print('schema.names', schema.names)
             print('schema.types', schema.types)
             print('schema.metadata', [k for k in schema.metadata])
-
-        # if local_path is None:
-        #     # Read metadata remotely
-        #     try:
-        #         # Spatial extent in native coordinates based on dask_geopandas spatial_partitions (fast)
-        #         gdf1 = dask_geopandas.read_parquet(
-        #             's3://'+remote_path,
-        #             storage_options={
-        #                 'key' : self.access_key_id,
-        #                 'secret' : self.secret_access_key,
-        #                 'client_kwargs' : {'endpoint_url': self.endpoint_url},
-        #             },
-        #         )
-                
-        #         if gdf1.spatial_partitions is None:
-        #             # ToDo: need to ensure that all GeoParquet files written have spatial_partitions metadata
-        #             #       Run dask_geopandas: calculate_spatial_partitions() before to_parquet().
-        #             #       However, currently this seems to be broken in dask_geopandas/pyarrow. 
-        #             #       (The spatial_partitions metadata is not persisted in parquet file)
-        #             gdf1.calculate_spatial_partitions()
-                    
-        #         poly_native = gdf1.spatial_partitions.unary_union
-        #         gdf1 = gdf1.set_crs(self.grid.crs).compute()
-        #     except:
-        #         # Read with geopandas
-        #         gdf1 = geopandas.read_parquet(
-        #             's3://'+remote_path,
-        #             storage_options={
-        #                 'key' : self.access_key_id,
-        #                 'secret' : self.secret_access_key,
-        #                 'client_kwargs' : {'endpoint_url': self.endpoint_url},
-        #             },
-        #         )
-        #         # Spatial extent in native coordinates based on HSI cells (slow)
-        #         poly_native = gdf1.buffer(self.grid.epsilon).unary_union
-        #         gdf1 = gdf1.set_crs(self.grid.crs)
     
         # Bounding geometries
         if ddf.spatial_partitions is None:
@@ -1855,6 +1895,8 @@ class Vectorstore():
                 gdf2,
                 defrag=defrag,
                 index=index,
+                geometry_area=False,
+                geometry_length=False,
                 validate_geometries=False, #No need to validate since reprojecting from good geometries
             )
 
@@ -1959,34 +2001,7 @@ class Vectorstore():
                 self.morton = mortoncurve.Morton(self.grid)
             else:
                 setattr(self, k, vs_settings[k])
-            
 
-    # def _all_the_same(self, s):
-    #     # Quick test if column values (pandas series s) are all the same
-    #     a = s.to_numpy()
-    #     return (a[0] == a).all()
-    
-    # def _reproject_to_local_equal_area_grid(self, gdf):
-    #     """
-    #     All geometries must belong to the same spatial cell
-    #     """
-    #     assert(self._all_the_same(gdf[self.spatial_key_col]))
-        
-    #     # Get the center lat/lon of the spatial cell
-    #     key = gdf.loc[0, self.spatial_key_col]
-    #     level = gdf.loc[0, self.spatial_level_col]
-    #     lat, lon = self.morton.center_coordinates(key, level)
-
-    #     # local_azimuthal_projection preserves angle (e.g. circles stay circles)
-    #     #local_azimuthal_projection = f"+proj=aeqd +R=6371000 +units=m +lat_0={lat} +lon_0={lon}"
-
-    #     # Lambert Azimuthal Equal Area preserves area 
-    #     lambert_azimuthal_ea = f"+proj=laea +lat_0={lat} +lon_0={lon} +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
-
-    #     #gdf['area_local_azimuthal_projection'] = gdf.to_crs(local_azimuthal_projection).area
-    #     #gdf['area_lambert_azimuthal_ea'] = gdf.to_crs(lambert_azimuthal_ea).area
-        
-    #     return gdf.to_crs(lambert_azimuthal_ea)
         
 
     # def read_selected_parquet(
