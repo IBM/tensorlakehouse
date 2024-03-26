@@ -508,7 +508,15 @@ class Vectorstore():
             if f.is_dir():
                 assert f.name.startswith(prefix)
                 partitions.append(f.name[len(prefix):])
-                
+
+        return sorted(partitions)
+
+
+    def _partitions_df(self):
+        """Existing partitions and partition levels."""
+
+        partitions = self._glob_partitions
+
         df_partitions = pandas.DataFrame({
             'partition': partitions,
             'partition_level': [len(p)-2 for p in partitions],
@@ -700,7 +708,7 @@ class Vectorstore():
         if target_rows is not None: self.target_rows = target_rows
 
         # Potential source partitions for sharding and/or splitting
-        df_partitions = self._glob_partitions()
+        df_partitions = self._partitions_df()
         df_source_partitions = df_partitions[df_partitions['partition_level']<=self.target_level].sort_values(
             by='partition_level').reset_index(drop=True)
 
@@ -711,7 +719,7 @@ class Vectorstore():
         for level in numpy.arange(min(df_source_partitions['partition_level']), self.max_level):
             if level>min(df_source_partitions['partition_level']):
                 # Update source partitions, since partitions may have changed
-                df_partitions = self._glob_partitions()
+                df_partitions = self._partitions_df()
                 df_source_partitions = df_partitions[df_partitions['partition_level']<=self.target_level].sort_values(
                     by='partition_level').reset_index(drop=True)
 
@@ -843,7 +851,7 @@ class Vectorstore():
             os.remove(filepath)
 
         # Reindex each partition
-        spatial_partitions = sorted(self._glob_partitions()['partition'])
+        spatial_partitions = self._glob_partitions()
         for spatial_partition in spatial_partitions:
             
             print('spatial_partition', spatial_partition)
@@ -1198,7 +1206,7 @@ class Vectorstore():
         if self.verbose:
             stopwatch_start = time.time()
 
-        spatial_partitions = sorted(self._glob_partitions()['partition'])
+        spatial_partitions = self._glob_partitions()
         for spatial_partition in spatial_partitions:
             # To do: loop through temporal partitions (and other dimensions that we choose to make into partitions.
             temporal_partition = {}
@@ -1385,7 +1393,7 @@ class Vectorstore():
             self._connect_s3()
 
         if spatial_partitions is None:
-            spatial_partitions = sorted(self._glob_partitions()['partition'])
+            spatial_partitions = self._glob_partitions()
         if temporal_partitions is not None:
             raise NotImplementedError()
 
@@ -1835,8 +1843,7 @@ class Vectorstore():
             target_rows=target_rows,
         )
 
-        df_partitions = self._glob_partitions()
-        source_partitions = list(df_partitions['partition'])
+        source_partitions = self._glob_partitions()
         for source_partition in source_partitions:
             gdf = geopandas.read_parquet(self._folderpath({}, source_partition))
 
