@@ -34,8 +34,9 @@ class HSI():
 
     Attributes:
         bands                       Bands to be indexed
-        pixel_level                 Pixel level of the raw data
-        delta_pixel_hsi             Difference between HSI level and raw data level
+        hsi_level                   Resolution level of the HSI
+        n_ovw_x                     Number of pixels to aggregate in the x-direction.
+        n_ovw_y                     Number of pixels to aggregate in the y-direction.
         spatial_partition_level     Spatial partition level
         hsi_directory               Local HSI directory where parquet files are assembled
         tmp_directory               Temporary directory
@@ -98,8 +99,9 @@ class HSI():
     def __init__(
         self,
         bands,
-        pixel_level,
-        delta_pixel_hsi,
+        hsi_level,
+        n_ovw_x,
+        n_ovw_y,
         spatial_partition_level,
         hsi_directory,
         tmp_directory,
@@ -147,8 +149,9 @@ class HSI():
         
         # Rasteroverview parameters
         self.bands = bands
-        self.pixel_level = pixel_level
-        self.delta_pixel_hsi = delta_pixel_hsi
+        self.hsi_level = hsi_level
+        self.n_ovw_x = n_ovw_x
+        self.n_ovw_y = n_ovw_y
         self.spatial_partition_level = spatial_partition_level
         self.hsi_directory = hsi_directory
         self.tmp_directory = tmp_directory
@@ -439,8 +442,9 @@ class HSI():
             print('tmp_directory           ', self.tmp_directory)
             print('dataservice_type        ', self.dataservice_type)
             print('dimension_values        ', self.dimension_values)
-            print('delta_pixel_hsi         ', self.delta_pixel_hsi)
-            print('hsi level               ', self.pixel_level - self.delta_pixel_hsi)
+            print('hsi_level               ', self.hsi_level)
+            print('n_ovw_x                 ', self.n_ovw_x)
+            print('n_ovw_y                 ', self.n_ovw_y)
             print('statistics_type         ', self.statistics_type)
             print('histogram               ', self.histogram)
             print('timestamps              ', len(self.timestamps))
@@ -448,8 +452,9 @@ class HSI():
     
         # Initialize the Rasteroverview
         self.raster = rasteroverview.Rasteroverview(
-            pixel_level=self.pixel_level,
-            delta_pixel_hsi=self.delta_pixel_hsi,
+            hsi_level=self.hsi_level,
+            n_ovw_x=self.n_ovw_x,
+            n_ovw_y=self.n_ovw_y,
             hsi_directory=self.hsi_directory,
             tmp_directory=self.tmp_directory,
             dset_id=self.dset_id,
@@ -550,6 +555,7 @@ class HSI():
         if self.skip_existing and self.hsi_dataservice_type == 'remote_filesystem':
             # Download existing HSI for this partition to skip existing timestamp/dimension combinations.
             try:
+                print('debug self.hsi_remote_path', self.hsi_remote_path)
                 self.hsi_remote_fs.download(self.hsi_remote_path, hsi_local_path)
             except FileNotFoundError:
                 print('Did not find any existing HSI parquet file in cloud for this partition.')
@@ -557,7 +563,7 @@ class HSI():
         found_something = self.raster.hsi_statistics(
             self.temporal_partition, 
             self.spatial_partition, 
-            probe_local_timestamps=False, 
+            probe_hbase_timestamps=False, 
             chunk_n=self.chunk_n,
             skip_existing=self.skip_existing,
             gdf_local_meta=self.gdf_local_meta,
@@ -1001,66 +1007,3 @@ def search_hsi(
             gdf_concat.append(gdf_hsi)
 
     return pandas.concat(gdf_concat).reset_index(drop=True)
-
-
-# def _epsg_from_file(filepath):
-#     arr = xarray.open_dataarray(
-#         filepath,
-#         masked=True, 
-#     )
-#     epsg = arr.rio.crs.to_epsg()
-    
-#     if epsg is None:
-#         # Parse the wkt string instead
-#         crs = arr.rio.crs
-#         assert crs.data['proj']=='utm'
-#         zone_number = crs.data['zone']
-#         if 'Northern Hemisphere' in pyproj.Proj(crs).crs.name:
-#             north_or_south = 'north'
-#             epsg = int(f'326{zone_number:02}')
-#         elif 'Southern Hemisphere' in pyproj.Proj(crs).crs.name:
-#             north_or_south = 'south'
-#             epsg = int(f'327{zone_number:02}')
-#         else:
-#             raise ValueError('projection not understood')
-        
-#     return epsg
-
-
-
-# def upload_hsi_cos(
-#     src,
-#     dst,
-#     dataservice_type,
-#     verbose = False,
-#     **kwargs,
-# ):
-#     """
-#     Upload all the parquet files in the src directory to dst.
-#     If dataservice_type=='remote_filesystem' please provide a remote_fs with write credentials in the kwargs.
-#     """
-#     for src_path in glob(os.path.join(src, '**/*.parquet'), recursive=True):
-#         dst_path = dst + src_path.split(src)[-1]
-        
-#         if dataservice_type=='local_filesystem':
-#             # Using local (or mounted) drive to upload to
-#             if not os.path.exists(dst_path):
-#                 dst_dir = os.path.dirname(dst_path)
-#                 os.makedirs(dst_dir, exist_ok=True)
-#                 shutil.copy(src_path, dst_path)
-#             else:
-#                 if verbose:
-#                     print('WARNING: file exists', dst_path)
-#         elif dataservice_type=='remote_filesystem':
-#             # Using s3fs to upload data to COS
-#             remote_fs = kwargs.get('remote_fs')
-#             if not remote_fs.exists(dst_path):
-#                 remote_fs.upload(src_path, dst_path)
-#             else:
-#                 if verbose:
-#                     print('WARNING: file exists', dst_path)
-#         elif dataservice_type=='hbase':
-#             raise NotImplementedError('hbase not supported for hsi upload.')
-#         else:
-#             raise ValueError(f'"{dataservice_type}" dataservice_type not understood.')
-#     return

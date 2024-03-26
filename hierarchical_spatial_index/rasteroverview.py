@@ -34,8 +34,16 @@ class Rasteroverview():
 
     Attributes:
 
-        pixel_level             Pixel level
-        delta_pixel_hsi         Difference between pixel level and hsi level.
+        hsi_level               HSI level
+        n_ovw_x                 Number of pixels to aggregate in the x-direction.
+                                - Defaults to 32=2**(pixel_level-hsi_level)
+                                - Note the underlying pixel grid needs to be aligned with the 
+                                HSI grid, but we allow aggregation of arbitrary size, where 
+                                pixel_level may become an irrational number:
+                                e.g. 96=3*32=2**(pixel_level-hsi_level) for sentinel2
+        n_ovw_y                 Number of pixels to aggregate in the y-direction.
+                                Defaults to 32=2**(pixel_level-hsi_level)
+                                Typically equal to n_ovw_x
         hsi_directory           Base directory where dataset hsi are stored.
         dset_id                 Dataset ID
         layer_id                Layer ID
@@ -70,7 +78,8 @@ class Rasteroverview():
     DATASERVICE_TYPE           = 'hbase'
     HSI_DIRECTORY              = 'data/raster/hsi/'
     TMP_DIRECTORY              = 'data/raster/tmp'
-    DELTA_PIXEL_HSI            = 5
+    N_OVW_X                    = 32 # (5 levels difference)
+    N_OVW_Y                    = 32 # (5 levels difference)
     MAX_QUERY_PIXELS           = 5e8
     DT_COL                     = 'time'
     # Geopandas relies on the geometry column being named 'geometry', so enforce this
@@ -85,8 +94,9 @@ class Rasteroverview():
 
     def __init__(
         self,
-        pixel_level,
-        delta_pixel_hsi = None,
+        hsi_level,
+        n_ovw_x = None,
+        n_ovw_y = None,
         hsi_directory = None,
         tmp_directory = None,
         dset_id = None,
@@ -109,24 +119,51 @@ class Rasteroverview():
         # Definition of the morton curve on top of the nested grid
         self.morton = mortoncurve.Morton(self.grid)
 
-        # layer attributes
-        self.dset_id          = dset_id
-        self.layer_id         = layer_id
-        self.pixel_level      = pixel_level
-        self.dimension_values = dimension_values
+        # HSI level
+        self.hsi_level        = hsi_level
 
-        # Overview level calculated relative to pixel level
-        if delta_pixel_hsi is None:
-            self.delta_pixel_hsi = self.DELTA_PIXEL_HSI
+        # Number of pixels to aggregate in x and y directions for one overview cell
+        if n_ovw_x is None:
+            self.n_ovw_x = self.N_OVW_X
         else:
-            self.delta_pixel_hsi = delta_pixel_hsi
-        self.hsi_level   = self.pixel_level - self.delta_pixel_hsi
+            self.n_ovw_x = n_ovw_x
+
+        if n_ovw_y is None:
+            self.n_ovw_y = self.N_OVW_Y
+        else:
+            self.n_ovw_y = n_ovw_y
+
+        # Pixel level in x and y direction can be inferred from the above.
+        # These are not necessarily integer numbers.
+        self.delta_pixel_hsi_x = numpy.log2(self.n_ovw_x)
+        self.delta_pixel_hsi_y = numpy.log2(self.n_ovw_y)
+        self.pixel_level_x = self.hsi_level + self.delta_pixel_hsi_x
+        self.pixel_level_y = self.hsi_level + self.delta_pixel_hsi_y
+
+        # HSI and Pixel-level resolution
+        self.res_x_hsi, self.res_y_hsi = self.morton.resolution(self.hsi_level)
+        self.res_x_px = self.res_x_hsi / self.n_ovw_x
+        self.res_y_px = self.res_y_hsi / self.n_ovw_y
 
         # Type of dataservice (e.g. 'hbase', 'local_filesystem', 'remote_filesystem')
         if dataservice_type is None:
             self.dataservice_type = self.DATASERVICE_TYPE
         else:
             self.dataservice_type = dataservice_type
+
+        # HBASE queries require an integer pixel level
+        if self.dataservice_type=='hbase':
+            assert self.pixel_level_x==self.pixel_level_y
+            assert self.pixel_level_x%1==0
+            self.hbase_pixel_level = int(self.pixel_level_x)
+        else:
+            # In COS we do not require a defined pixel level
+            self.hbase_pixel_level = None
+
+        # layer attributes
+        self.dset_id = dset_id
+        self.layer_id = layer_id
+        self.dimension_values = dimension_values
 
         # hsi_directory base directory
         if hsi_directory is None:
@@ -363,7 +400,7 @@ class Rasteroverview():
     
     def hsi_statistics(
         self, temporal_partition={}, spatial_partition=None, chunk_n=1,
-        probe_local_timestamps=False, skip_existing=True, **kwargs
+        probe_hbase_timestamps=False, skip_existing=True, **kwargs
     ):
         """Calculate HSIs for one partition and append or write to file.
         
@@ -398,9 +435,9 @@ class Rasteroverview():
             # Query spatial partition
             query_key        = spatial_partition
 
-            if probe_local_timestamps:
+            if probe_hbase_timestamps:
                 # probe the query_key area in the four corners as well as the center.
-                query_epochtimes = self._probe_query_timestamps(query_key, query_epochtimes, **kwargs)
+                query_epochtimes = self._probe_hbase_timestamps(query_key, query_epochtimes, **kwargs)
 
 
         # Initializing df_existing with zero rows
@@ -434,11 +471,10 @@ class Rasteroverview():
 
         if self.dataservice_type=='hbase':
             # reduce query box by 1/2 pixel because the dataservice will buffer to the full cell
-            res_x, res_y = self.morton.resolution(self.pixel_level)
-            lonmin = max(lonmin, west + res_x/2)
-            latmin = max(latmin, south + res_y/2)
-            lonmax = min(lonmax, east - res_x/2)
-            latmax = min(latmax, north - res_y/2)
+            lonmin = max(lonmin, west + self.res_x_px/2)
+            latmin = max(latmin, south + self.res_y_px/2)
+            lonmax = min(lonmax, east - self.res_x_px/2)
+            latmax = min(latmax, north - self.res_y_px/2)
                 
         if self.dataservice_type in ['local_filesystem', 'remote_filesystem']:
             # Filter by query area
@@ -554,7 +590,7 @@ class Rasteroverview():
         return found_something
 
     
-    def _probe_query_timestamps(self, query_key, query_epochtimes, **kwargs):
+    def _probe_hbase_timestamps(self, query_key, query_epochtimes, **kwargs):
         """Given a query key (partition), what timestamps are likely available?
 
         :param query_key:        spatial key on the partition level
@@ -582,7 +618,7 @@ class Rasteroverview():
             # Get the data from the dataservice
             arr = dataservice.query.to_xarray(
                 layer_id=self.layer_id,
-                level=self.pixel_level,
+                level=self.hbase_pixel_level,
                 latmin=y_coord,
                 lonmin=x_coord,
                 latmax=y_coord,
@@ -660,7 +696,7 @@ class Rasteroverview():
                 if len(chunk)>0:
                     arr = dataservice.query.to_xarray(
                         layer_id=self.layer_id,
-                        level=self.pixel_level,
+                        level=self.hbase_pixel_level,
                         latmin=latmin,
                         lonmin=lonmin,
                         latmax=latmax,
@@ -679,7 +715,7 @@ class Rasteroverview():
                     if len(chunk)>0:
                         arr = dataservice.query.to_xarray(
                             layer_id=self.layer_id,
-                            level=self.pixel_level,
+                            level=self.hbase_pixel_level,
                             latmin=latmin,
                             lonmin=lonmin,
                             latmax=latmax,
@@ -813,15 +849,13 @@ class Rasteroverview():
                 arr = arr.set_index(midx=['time'] + list(self.dimension_values)).unstack('midx')
 
                 # Align hsi grid with pixel grid
-                delta_pixel_partition = self.pixel_level - self.spatial_partition_level
+                x0 = arr.x.min().item()-self.res_x_px/2
+                x0_idx_px = (x0 - self.grid.origin.x) / self.res_x_px
+                delta_x = int(x0_idx_px % (self.n_ovw_x * 2**(self.hsi_level - self.spatial_partition_level)))
 
-                x0 = arr.x.min().item()-self.morton.resolution(self.pixel_level)[0]/2
-                x0_idx_px = self.morton.x_coord_to_idx(x0, self.pixel_level)
-                delta_x = int(x0_idx_px % (2**delta_pixel_partition))
-
-                y0 = arr.y.min().item()-self.morton.resolution(self.pixel_level)[1]/2
-                y0_idx_px = self.morton.y_coord_to_idx(y0, self.pixel_level)
-                delta_y = int(y0_idx_px % (2**delta_pixel_partition))
+                y0 = arr.y.min().item()-self.res_y_px/2
+                y0_idx_px = (y0 - self.grid.origin.y) / self.res_y_px
+                delta_y = int(y0_idx_px % (self.n_ovw_y * 2**(self.hsi_level - self.spatial_partition_level)))
             else:
                 arr = None
             
@@ -833,16 +867,16 @@ class Rasteroverview():
             
         # Multiindex in order to select all the lat/lon values belonging to hsi cells
         ovw_x = [
-            l//2**self.delta_pixel_hsi for l in range(delta_x, len(arr.x)+delta_x)
+            l//self.n_ovw_x for l in range(delta_x, len(arr.x)+delta_x)
         ]
         mod_x = [
-            l%2**self.delta_pixel_hsi for l in range(delta_x, len(arr.x)+delta_x)
+            l%self.n_ovw_x for l in range(delta_x, len(arr.x)+delta_x)
         ]
         ovw_y = list(reversed([
-            l//2**self.delta_pixel_hsi for l in range(delta_y, len(arr.y)+delta_y)
+            l//self.n_ovw_y for l in range(delta_y, len(arr.y)+delta_y)
         ]))
         mod_y = list(reversed([
-            l%2**self.delta_pixel_hsi for l in range(delta_y, len(arr.y)+delta_y)
+            l%self.n_ovw_y for l in range(delta_y, len(arr.y)+delta_y)
         ]))
         
         midx_x = pandas.MultiIndex.from_arrays(
@@ -964,16 +998,14 @@ class Rasteroverview():
         miny = min([a.y.min().to_numpy() for a in lst])
         maxx = max([a.x.max().to_numpy() for a in lst])
         maxy = max([a.y.max().to_numpy() for a in lst])
-        dx = self.morton.resolution_x(self.pixel_level)
-        dy = self.morton.resolution_y(self.pixel_level)
     
         # Creating an empty dummy dataset with shape (1, len(ys), len(xs))
-        xs = numpy.arange(minx, maxx+dx, dx)
-        ys = numpy.arange(maxy, miny-dy, -dy)
+        xs = numpy.arange(minx, maxx+self.res_x_px, self.res_x_px)
+        ys = numpy.arange(maxy, miny-self.res_y_px, -self.res_y_px)
         midx = pandas.MultiIndex.from_arrays(
             [['dummy'] for v in list(flt.values())], names=list(flt)
         )
-        a = numpy.empty((1, int(1+(maxy-miny)/dy), int(1+(maxx-minx)/dx)))
+        a = numpy.empty((1, int(1+(maxy-miny)/self.res_y_px), int(1+(maxx-minx)/self.res_x_px)))
         a[:] = numpy.nan
         arr_dummy = xarray.DataArray(a, coords=[midx, ys, xs], dims=[dim, 'y', 'x'], attrs={})
         
@@ -1181,10 +1213,10 @@ class Rasteroverview():
         ds.attrs = dict(
             dset_id = self.dset_id,
             layer_id = self.layer_id,
-            pixel_level = self.pixel_level,
-            delta_pixel_hsi = self.delta_pixel_hsi,
             hsi_level = self.hsi_level,
-            max_pixel_count = 4**self.delta_pixel_hsi,
+            n_ovw_x = self.n_ovw_x,
+            n_ovw_y = self.n_ovw_y,
+            max_pixel_count = self.n_ovw_x*self.n_ovw_y,
         )
         # Rechunk uniformly for zarr
         ds = ds.chunk(chunks)
@@ -1250,9 +1282,18 @@ class Rasteroverview():
     def to_json(self):
         """Dump attributes to a json file."""
         json_dict = {}
-        json_dict['pixel_level'] = self.pixel_level
-        json_dict['delta_pixel_hsi'] = self.delta_pixel_hsi
         json_dict['hsi_level'] = self.hsi_level
+        json_dict['n_ovw_x'] = self.n_ovw_x
+        json_dict['n_ovw_y'] = self.n_ovw_y
+        json_dict['delta_pixel_hsi_x'] = self.delta_pixel_hsi_x
+        json_dict['delta_pixel_hsi_y'] = self.delta_pixel_hsi_y
+        json_dict['pixel_level_x'] = self.pixel_level_x
+        json_dict['pixel_level_y'] = self.pixel_level_y
+        json_dict['res_x_hsi'] = self.res_x_hsi
+        json_dict['res_y_hsi'] = self.res_y_hsi
+        json_dict['res_x_px'] = self.res_x_px
+        json_dict['res_y_px'] = self.res_y_px
+        json_dict['hbase_pixel_level'] = self.hbase_pixel_level
         json_dict['hsi_directory'] = self.hsi_directory
         json_dict['dset_id'] = self.dset_id
         json_dict['layer_id'] = self.layer_id
