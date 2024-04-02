@@ -1480,7 +1480,7 @@ class Vectorstore():
             local_folderpath = self.geoparquet_directory
 
             remote_folderpath = self._swap_prefixes(local_folderpath, local_prefix, remote_prefix)
-            remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**.parquet').replace('\\', '/'))
+            remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**/*.parquet').replace('\\', '/'))
             if len(remote_filepaths)>0:
                 if self.verbose:
                     print('removing remote_filepaths', remote_filepaths)
@@ -1493,7 +1493,7 @@ class Vectorstore():
                 # Remove remote partition that exists locally
                 local_folderpath = self._folderpath(temporal_partition, spatial_partition)
                 remote_folderpath = self._swap_prefixes(local_folderpath, local_prefix, remote_prefix)
-                remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**.parquet').replace('\\', '/'))
+                remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**/*.parquet').replace('\\', '/'))
                 if len(remote_filepaths)>0:
                     if self.verbose:
                         print('removing remote_filepaths', remote_filepaths)
@@ -1569,7 +1569,7 @@ class Vectorstore():
         # local_prefix = self.vectorstore_directory
         # remote_prefix = os.path.join(self.bucket, REMOTE_VECTORSTORE_DIRECTORY).replace('\\', '/')
         # remote_geoparquet_directory = self._swap_prefixes(self.geoparquet_directory, local_prefix, remote_prefix)
-        # self.storage_urls = self.remote_fs.glob(os.path.join(remote_geoparquet_directory, '**.parquet').replace('\\', '/'))
+        # self.storage_urls = self.remote_fs.glob(os.path.join(remote_geoparquet_directory, '**/*.parquet').replace('\\', '/'))
         # for storage_url_part in self.storage_urls:
 
         # Read metadata efficiently using dask_geopandas and/or pyarrow.parquet
