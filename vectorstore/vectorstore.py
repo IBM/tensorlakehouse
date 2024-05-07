@@ -1415,11 +1415,25 @@ class Vectorstore():
         self.to_parquet(defrag=defrag, index=index, geometry_area=geometry_area, geometry_length=geometry_length)
 
 
-    def _connect_s3(self, access_key_id=None, secret_access_key=None, endpoint_url=None):
+    def _connect_s3(
+        self,
+        access_key_id=None,
+        secret_access_key=None,
+        endpoint_url=None,
+        bucket=None,
+        remote_vectorstore_directory=None,
+    ):
         """Establish a connection to S3FileSystem."""
+        REMOTE_VECTORSTORE_DIRECTORY = 'vectorstore'
+
         if access_key_id is not None: self.access_key_id = access_key_id
         if secret_access_key is not None: self.secret_access_key = secret_access_key
         if endpoint_url is not None: self.endpoint_url = endpoint_url
+        if bucket is not None: self.bucket = bucket
+        if remote_vectorstore_directory is None:
+            self.remote_vectorstore_directory = REMOTE_VECTORSTORE_DIRECTORY
+        else:
+            self.remote_vectorstore_directory = remote_vectorstore_directory
             
         self.remote_fs = s3fs.S3FileSystem(
             key=self.access_key_id,
@@ -1427,6 +1441,13 @@ class Vectorstore():
             client_kwargs={
                 'endpoint_url': self.endpoint_url,
             }
+        )
+
+        # Prefix for switching from local parquet paths to remote paths.
+        self.local_prefix = self.vectorstore_directory
+        self.remote_prefix = os.path.join(self.bucket, self.remote_vectorstore_directory).replace('\\', '/')
+        self.remote_geoparquet_directory = self._swap_prefixes(
+            self.geoparquet_directory, self.local_prefix, self.remote_prefix
         )
 
 
@@ -1437,9 +1458,9 @@ class Vectorstore():
         
     def to_cos(
         self, upload_type, 
-        stac_url, collection_id, stac_json_folder, certificate,
-        bucket=None, access_key_id=None, secret_access_key=None, endpoint_url=None,
-        temporal_partitions=None, spatial_partitions = None,
+        stac_url, collection_id, collection_title, stac_json_folder, certificate,
+        access_key_id=None, secret_access_key=None, endpoint_url=None, bucket=None, remote_vectorstore_directory=None,
+        temporal_partitions=None, spatial_partitions=None,
     ):
         """Push local vectorstore (all partitions) to cloud objectstore.
         
@@ -1454,33 +1475,28 @@ class Vectorstore():
                                 May result in a fragmented remote partition.
             "stac_items_only"   Does not erase or create anything parquet files in COS.
                                 Creates the stac items corresponding to the local files.
-        """
-        REMOTE_VECTORSTORE_DIRECTORY = 'vectorstore'
-        
+        """       
         if self.verbose:
             stopwatch_start = time.time()
 
-        if bucket is not None: self.bucket = bucket
-        if access_key_id is not None: self.access_key_id = access_key_id
-        if secret_access_key is not None: self.secret_access_key = secret_access_key
-        if endpoint_url is not None: self.endpoint_url = endpoint_url
-
-        if not hasattr(self, 'remote_fs'):
-            self._connect_s3()
+        self._connect_s3(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            endpoint_url=endpoint_url,
+            bucket=bucket,
+            remote_vectorstore_directory=remote_vectorstore_directory,
+        )
 
         if spatial_partitions is None:
             spatial_partitions = self._glob_partitions()
         if temporal_partitions is not None:
             raise NotImplementedError()
 
-        local_prefix = self.vectorstore_directory
-        remote_prefix = os.path.join(self.bucket, REMOTE_VECTORSTORE_DIRECTORY).replace('\\', '/')
         if upload_type=='replace_all':
             # Remove existing remote parquet_directory
-            local_folderpath = self.geoparquet_directory
-
-            remote_folderpath = self._swap_prefixes(local_folderpath, local_prefix, remote_prefix)
-            remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**/*.parquet').replace('\\', '/'))
+            remote_filepaths = self.remote_fs.glob(
+                os.path.join(self.remote_geoparquet_directory, '**/*.parquet').replace('\\', '/')
+            )
             if len(remote_filepaths)>0:
                 if self.verbose:
                     print('removing remote_filepaths', remote_filepaths)
@@ -1492,7 +1508,7 @@ class Vectorstore():
                 temporal_partition = {}
                 # Remove remote partition that exists locally
                 local_folderpath = self._folderpath(temporal_partition, spatial_partition)
-                remote_folderpath = self._swap_prefixes(local_folderpath, local_prefix, remote_prefix)
+                remote_folderpath = self._swap_prefixes(local_folderpath, self.local_prefix, self.remote_prefix)
                 remote_filepaths = self.remote_fs.glob(os.path.join(remote_folderpath, '**/*.parquet').replace('\\', '/'))
                 if len(remote_filepaths)>0:
                     if self.verbose:
@@ -1513,19 +1529,25 @@ class Vectorstore():
             local_paths = [f.replace('\\', '/') for f in local_paths]
 
             for local_path in local_paths:
-                remote_path = self._swap_prefixes(local_path, local_prefix, remote_prefix)
+                remote_path = self._swap_prefixes(local_path, self.local_prefix, self.remote_prefix)
                 if upload_type!='add' or (not self.remote_fs.exists(remote_path)):
                     if self.verbose:
                         print('uploading to remote_path', remote_path)
                     if upload_type!='stac_items_only':
                         self.remote_fs.upload(local_path, remote_path)
                     self.to_stac_item(
-                        stac_url, collection_id, stac_json_folder, certificate, remote_path,
+                        stac_url=stac_url,
+                        collection_id=collection_id,
+                        collection_title=collection_title,
+                        stac_json_folder=stac_json_folder,
+                        certificate=certificate,
+                        remote_path=remote_path,
                         local_path=local_path,
-                        bucket=bucket,
-                        access_key_id=access_key_id,
-                        secret_access_key=secret_access_key,
-                        endpoint_url=endpoint_url,
+                        # access_key_id=access_key_id,
+                        # secret_access_key=secret_access_key,
+                        # endpoint_url=endpoint_url,
+                        # bucket=bucket,
+                        # remote_vectorstore_directory=remote_vectorstore_directory,
                     )
         
         if self.verbose:
@@ -1534,11 +1556,10 @@ class Vectorstore():
 
 
     def to_stac_item(
-        self, stac_url, collection_id, stac_json_folder, certificate, remote_path, local_path=None,
-        bucket=None, access_key_id=None, secret_access_key=None, endpoint_url=None
+        self, stac_url, collection_id, collection_title, stac_json_folder, certificate, remote_path, local_path=None,
+        access_key_id=None, secret_access_key=None, endpoint_url=None, bucket=None, remote_vectorstore_directory=None,
     ):
         """Register vectorstore file as item in STAC."""
-        REMOTE_VECTORSTORE_DIRECTORY = 'vectorstore'
         ISO_8601                     = '%Y-%m-%dT%H:%M:%SZ'
         
         if self.verbose:
@@ -1547,33 +1568,31 @@ class Vectorstore():
         # STAC access
         self.stac_url = stac_url
         self.collection_id = collection_id
+        self.collection_title = collection_title
         self.stac_json_folder = stac_json_folder
         self.certificate = certificate
         
         # COS access
-        if bucket is not None: self.bucket = bucket
-        if access_key_id is not None: self.access_key_id = access_key_id
-        if secret_access_key is not None: self.secret_access_key = secret_access_key
-        if endpoint_url is not None: self.endpoint_url = endpoint_url
-
-        if not hasattr(self, 'remote_fs'):
-            self._connect_s3()
+        self._connect_s3(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            endpoint_url=endpoint_url,
+            bucket=bucket,
+            remote_vectorstore_directory=remote_vectorstore_directory,
+        )
 
         os.makedirs(self.stac_json_folder, exist_ok=True)
+        self.stac_json_folder_submitted = os.path.join(self.stac_json_folder, 'submitted').replace('\\', '/')
+        os.makedirs(self.stac_json_folder_submitted, exist_ok=True)
+
         uid = os.path.splitext((os.path.basename(remote_path)))[0]
         json_filepath = os.path.join(self.stac_json_folder, f'item_{uid}.json').replace('\\', '/')
-
-        self.stac_json_folder_submitted = os.path.join(self.stac_json_folder, 'submitted')
-        os.makedirs(self.stac_json_folder_submitted, exist_ok=True)
     
-        # local_prefix = self.vectorstore_directory
-        # remote_prefix = os.path.join(self.bucket, REMOTE_VECTORSTORE_DIRECTORY).replace('\\', '/')
-        # remote_geoparquet_directory = self._swap_prefixes(self.geoparquet_directory, local_prefix, remote_prefix)
-        # self.storage_urls = self.remote_fs.glob(os.path.join(remote_geoparquet_directory, '**/*.parquet').replace('\\', '/'))
-        # for storage_url_part in self.storage_urls:
-
         # Read metadata efficiently using dask_geopandas and/or pyarrow.parquet
-        ddf = dask_geopandas.read_parquet(local_path)
+        ddf = dask_geopandas.read_parquet(
+            local_path,
+            split_row_groups=False, # One stac item per file not row-group
+        )
         #gdf = ddf.compute() # Try not to read the entire file for speed and egress issues.
         parquet_file = pyarrow.parquet.ParquetFile(local_path)
         schema = pyarrow.parquet.read_schema(local_path, memory_map=True)
@@ -1586,7 +1605,11 @@ class Vectorstore():
         # Bounding geometries
         if ddf.spatial_partitions is None:
             # Convex hull of unary union
-            ddf.calculate_spatial_partitions()
+            #ddf.calculate_spatial_partitions() 
+            # THE ABOVE SEEMS TO BE BROKEN IN DASK_GEOPANDAS. DOING IT MANUALLY
+            ddf.spatial_partitions = geopandas.GeoSeries(
+                shapely.convex_hull(shapely.geometrycollections(numpy.asarray(ddf.geometry)))
+            )
 
         poly_native = ddf.spatial_partitions.loc[0]
         poly_wgs84 = geopandas.GeoDataFrame([
@@ -1606,51 +1629,43 @@ class Vectorstore():
             parquet_file.metadata.row_group(i).column(dt_pos).statistics.max for i in range(parquet_file.metadata.num_row_groups)
         ]).strftime(ISO_8601)
 
-        # Table Extension (https://stac-extensions.github.io/table/v1.2.0/schema.json)
-        table_columns = []
-        for col in ddf.columns:
-            if col==self.dt_col:
-                description = 'Datetime column'
-            elif col==self.geom_col:
-                description = 'Geometry column'
-            elif col==self.id_col:
-                description = 'ID column'
-            elif col==self.key_col:
-                description = 'Spatial key column'
-            elif col==self.idx_col:
-                description = 'Index column'
-            elif col==self.idx_box_col:
-                description = 'Index box column'
-            elif col==self.geom_area_col:
-                description = 'Geometry area column'
-            elif col==self.geom_length_col:
-                description = 'Geometry length column'
-            elif col=='spatial_partition':
-                description = 'Spatial partition column'
-            elif col=='grid':
-                description = 'Nested grid column'
-            else:
-                description = f'Undefined column named {col}'
+        # # Table Extension (https://stac-extensions.github.io/table/v1.2.0/schema.json)
+        # table_columns = []
+        # for col in ddf.columns:
+        #     if col==self.dt_col:
+        #         description = 'Datetime column'
+        #     elif col==self.geom_col:
+        #         description = 'Geometry column'
+        #     elif col==self.id_col:
+        #         description = 'ID column'
+        #     elif col==self.key_col:
+        #         description = 'Spatial key column'
+        #     elif col==self.idx_col:
+        #         description = 'Index column'
+        #     elif col==self.idx_box_col:
+        #         description = 'Index box column'
+        #     elif col==self.geom_area_col:
+        #         description = 'Geometry area column'
+        #     elif col==self.geom_length_col:
+        #         description = 'Geometry length column'
+        #     elif col=='spatial_partition':
+        #         description = 'Spatial partition column'
+        #     elif col=='grid':
+        #         description = 'Nested grid column'
+        #     else:
+        #         description = f'Undefined column named {col}'
         
-            table_columns.append(
-                {
-                    "name": col,
-                    "description": description,
-                    "type": repr(ddf[col].dtype),
-                }
-            )
+        #     table_columns.append(
+        #         {
+        #             "name": col,
+        #             "description": description,
+        #             "type": repr(ddf[col].dtype),
+        #         }
+        #     )
 
         # Datacube extension (https://stac-extensions.github.io/datacube/v2.2.0/schema.json)
         cube_dimensions = {
-            self.geom_col: {
-                "axis": self.geom_col,
-                "extent": None,
-                "description": "Vectorcube geometry",
-                "step": None,
-                "type": "spatial",
-                "reference_system": self.grid.epsg
-            },
-            "time": {
+            self.dt_col: {
                 "extent": [
                     start_datetime,
                     end_datetime,
@@ -1658,14 +1673,22 @@ class Vectorstore():
                 "description": None,
                 "step": None,
                 "type": "temporal"
-            }
+            },
+            # self.geom_col: {
+            #     "axis": self.geom_col,
+            #     "extent": None,
+            #     "description": "Vectorcube geometry",
+            #     "step": None,
+            #     "type": "spatial",
+            #     "reference_system": self.grid.epsg
+            # },
         }
         
         for col in list(self.dimension_values.keys()):
             cube_dimensions[col] = {
                 "axis": col,
                 "extent": None,
-                "description": f"Vectorcube dimension {col}",
+                "description": col,
                 "step": None,
                 "type": "other",
                 "reference_system": None
@@ -1674,15 +1697,17 @@ class Vectorstore():
         cube_variables = {}
         for col in ddf.columns:
             if not (col in (
-                [self.geom_col, self.dt_col, self.id_col, self.key_col, 'grid', 'spatial_partition'] + list(self.dimension_values.keys())
+                [
+                    self.geom_col, self.dt_col, self.key_col, 'grid', 'spatial_partition', #self.id_col
+                ] + list(self.dimension_values.keys())
             )):
                 cube_variables[col] = {
                     "dimensions": [
-                          self.geom_col,
-                          "time",
+                          #self.geom_col,
+                          self.dt_col,
                     ] + list(self.dimension_values.keys()),
                     "type": "data",
-                    "description": "",
+                    "description": col,
                     "unit": "",
                 }
 
@@ -1694,7 +1719,7 @@ class Vectorstore():
             "stac_extensions": [
                 "https://stac-extensions.github.io/datacube/v2.2.0/schema.json",
                 "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
-                "https://stac-extensions.github.io/table/v1.2.0/schema.json",
+                #"https://stac-extensions.github.io/table/v1.2.0/schema.json",
             ],
             "id": uid,
             "collection": self.collection_id,
@@ -1702,19 +1727,18 @@ class Vectorstore():
             "geometry": geometry_wgs84,
         
             "properties": {
-                "datetime": start_datetime,
                 "start_datetime": start_datetime,
                 "end_datetime": end_datetime,
         
                 # Projection Extension (https://stac-extensions.github.io/projection/v1.1.0/schema.json)
                 "proj:epsg": self.grid.epsg,
-                "proj:bbox": total_bounds_native,
-                "proj:geometry": geometry_native,
+                # "proj:bbox": total_bounds_native,
+                # "proj:geometry": geometry_native,
         
-                # Table Extension (https://stac-extensions.github.io/table/v1.2.0/schema.json)
-                "table:columns": table_columns,
-                "table:primary_geometry": "geometry",
-                "table:row_count": len(ddf),
+                # # Table Extension (https://stac-extensions.github.io/table/v1.2.0/schema.json)
+                # "table:columns": table_columns,
+                # "table:primary_geometry": "geometry",
+                # "table:row_count": len(ddf),
         
                 # Datacube extension (https://stac-extensions.github.io/datacube/v2.2.0/schema.json)
                 "cube:dimensions": cube_dimensions,
@@ -1722,19 +1746,30 @@ class Vectorstore():
             },
             "links": [
                 {
-                    "href": "./collection.json",
                     "rel": "collection",
+                    "href": "../collection.json",
+                    "type": "application/json",
+                    "title": self.collection_title,
+                },
+                {
+                    "rel": "root",
+                    "href": "../../catalog.json",
+                    "type": "application/json",
+                },
+                {
+                    "rel": "parent",
+                    "href": "../collection.json",
+                    "type": "application/json",
+                    "title": self.collection_title,
                 },
             ],
             "assets": {
-                "data": {
+                uid: {
                     "href": href,
                     "type": "table/parquet; application=geoparquet; profile=cloud-optimized",
                     "title": self.collection_id,
-                    "roles": [
-                        "Vectordata"
-                    ],
-                    "description": ""
+                    "description": "data",
+                    "roles": ["data"],
                 },
             }
         }
@@ -1742,19 +1777,18 @@ class Vectorstore():
         with open(json_filepath, 'w') as outfile:
             json.dump(stac_item_dict, outfile, indent=4, sort_keys=False)
     
-        # # Upload files to STAC
-        # stac_collection_url = os.path.join(
-        #     self.stac_url, 'collections', self.collection_id.replace(" ", "%20"), 'items'
+        # # Upload json file to STAC
+        # stac_item_url = os.path.join(
+        #     self.stac_url, 'collections', self.collection_id, 'items'
         # ).replace('\\', '/')
-        # for file in glob(os.path.join(self.stac_json_folder, '*.json')):
-        #     file = file.replace('\\', '/')
-        #     os.system(f'curl -H "Content-Type: application/json" -X POST {stac_collection_url} -kL {self.certificate} -d "@{file}"')
-        #     os.system(f'mv {file} {self.stac_json_folder_submitted}')
+        # os.system(f'curl -H "Content-Type: application/json" -X POST {stac_item_url} -kL {self.certificate} -d "{os.path.abspath(json_filepath)}"')
+        # os.system(f'mv {json_filepath} {self.stac_json_folder_submitted}')
 
 
     def to_stac_collection(
-        self, stac_url, collection_id, stac_json_folder, certificate,
-        bbox, dt_start, dt_end, title, description,
+        self, stac_url, collection_id, collection_title, stac_json_folder, certificate,
+        bbox, dt_start, dt_end, description,
+        access_key_id=None, secret_access_key=None, endpoint_url=None, bucket=None, remote_vectorstore_directory=None,
     ):
         """Register vectorstore collection in STAC."""
 
@@ -1763,19 +1797,61 @@ class Vectorstore():
         # STAC access
         self.stac_url = stac_url
         self.collection_id = collection_id
+        self.collection_title = collection_title
         self.stac_json_folder = stac_json_folder
         self.certificate = certificate
+        
+        # COS access
+        self._connect_s3(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            endpoint_url=endpoint_url,
+            bucket=bucket,
+            remote_vectorstore_directory=remote_vectorstore_directory,
+        )
+
+        os.makedirs(self.stac_json_folder, exist_ok=True)
+        self.stac_json_folder_submitted = os.path.join(self.stac_json_folder, 'submitted').replace('\\', '/')
+        os.makedirs(self.stac_json_folder_submitted, exist_ok=True)
 
         # # Debug
         # stac = pystac_client.Client.open(self.stac_url)
         # stac_collections = list(stac.get_all_collections())
         # collection = stac_collections[[c.id for c in stac_collections].index(self.collection_id)]
 
+        # Read metadata efficiently using dask_geopandas and/or pyarrow.parquet
+        try:
+            # Either remote version (important for large stores where columns may be added later)
+            ddf = dask_geopandas.read_parquet(
+                's3://'+self.remote_geoparquet_directory,
+                split_row_groups=False, # One stac item per file not row-group
+                storage_options={
+                    'key' : self.access_key_id,
+                    'secret' : self.secret_access_key,
+                    'client_kwargs' : {'endpoint_url': self.endpoint_url},
+                },
+            )
+        except:
+            # Or local (potentially partial) version
+            ddf = dask_geopandas.read_parquet(
+                self.geoparquet_directory,
+                split_row_groups=False, # One stac item per file not row-group
+            )
+        
+        bands = []
+        for col in ddf.columns:
+            if not (col in (
+                [
+                    self.geom_col, self.dt_col, self.key_col, 'grid', 'spatial_partition', #self.id_col
+                ] + list(self.dimension_values.keys())
+            )):
+                bands.append(col)
+
         stac_collection_dict = {
             "id": self.collection_id,
             "type": "Collection",
             "stac_version": "1.0.0",
-            "title": title,
+            "title": self.collection_title,
             "description": description,
             "extent": {
                 "spatial": {
@@ -1787,15 +1863,33 @@ class Vectorstore():
                     ]
                 }
             },
+            "cube:dimensions": {
+                self.dt_col: {
+                    "type": "temporal",
+                    "extent": [dt_start.strftime(ISO_8601), dt_end.strftime(ISO_8601)],
+                },
+                "bands": {
+                    "type": "bands",
+                    "values": bands,
+                },
+            },
             "license": "Unknown",
             "links": [
                 {
-                    "href": "",
-                    "rel": "self",
+                    "rel": "root",
+                    "href": "../catalog.json",
+                    "type": "application/json",
                 },
                 {
-                    "href": "",
-                    "rel": "item",
+                    "rel": "root",
+                    "href": "./collection.json",
+                    "title": self.collection_title,
+                },
+                {
+                    "rel": "parent",
+                    "href": "../catalog.json",
+                    "type": "application/json",
+                    "title": self.collection_title,
                 },
             ],
         }
@@ -1805,6 +1899,11 @@ class Vectorstore():
         #json.dumps(stac_collection_dict)
         with open(json_filepath, "w") as outfile:
             json.dump(stac_collection_dict, outfile, indent=4, sort_keys=False)
+
+        # # Upload json file to STAC
+        # stac_collection_url = os.path.join(self.stac_url, 'collections', self.collection_id).replace('\\', '/')
+        # os.system(f'curl -H "Content-Type: application/json" -X POST {stac_collection_url} -kL {self.certificate} -d "{os.path.abspath(json_filepath)}"')
+        # os.system(f'mv {json_filepath} {self.stac_json_folder_submitted}')
 
 
     def _initialize_reproject(
