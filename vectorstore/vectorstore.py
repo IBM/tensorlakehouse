@@ -54,7 +54,8 @@ class Vectorstore():
         target_level            Target level for detailed quadtree index.
         max_depth               Maximum depth of detailed quadtree (measured from root).
         max_inflation           Maximum inflation factor (max number rows / number geometries) for quadtree index.
-        target_rows             Approximate number of rows per parquet file.
+        target_rows             Approximate number of rows per arquet file.
+        row_group_size          Size of the row groups in parquet files.
         grid                    Nested grid used to index the Vectorstore.
         valid_range             Valid range of the Vectorstore. 
         verbose                 detailed logging
@@ -69,7 +70,10 @@ class Vectorstore():
         defrag                  Defragment all partitions with multiple files.
         reindex                 (Re-)create a qtree spatial index for the entire dataset.
         reproject               Reproject vectorstore.
+        unify_schemas           Unify schemas of the parquet partitions. Add dataset custom_meta_content.
         to_cos                  Push local vectorstore (all partitions) to cloud objectstore.
+        to_stac_collection      Register vectorstore collection in STAC.
+        to_stac_item            Register vectorstore file as item in STAC.
 
     """
 
@@ -104,6 +108,9 @@ class Vectorstore():
 
     # Partition target rows
     TARGET_ROWS                = 1e6
+
+    # Row group size
+    ROW_GROUP_SIZE             = 1e5
     
     CHILDREN                   = ['child_0', 'child_1', 'child_2', 'child_3']
     
@@ -129,8 +136,10 @@ class Vectorstore():
         max_depth = None,
         max_inflation = None,
         target_rows = None,
+        row_group_size = None,
         grid = None,
         valid_range = None,
+        custom_meta_content = None,
         verbose = False,
     ):
         
@@ -195,7 +204,11 @@ class Vectorstore():
         self.max_depth = self.MAX_DEPTH if max_depth is None else max_depth
         self.max_inflation = self.MAX_INFLATION if max_inflation is None else max_inflation
         self.target_rows = self.TARGET_ROWS if target_rows is None else target_rows
+        self.row_group_size = self.ROW_GROUP_SIZE if row_group_size is None else row_group_size
 
+        # Parquet file custom meta content (e.g. {'About': """This is a super dataset."""})
+        self.custom_meta_content = custom_meta_content
+        
         self.verbose = verbose
 
 
@@ -342,7 +355,7 @@ class Vectorstore():
             print('----------------------------------------------------------------------------')
 
     
-    def load_geodataframe(self, gdf, validate_geometries=True):
+    def load_geodataframe(self, gdf, validate_geometries=True, validate_timestamps=True):
         """Calculate the root index for each unique geometry.
 
         :param gdf:  Geopandas GeoDataFrame to be ingested.
@@ -369,6 +382,10 @@ class Vectorstore():
                 print('Time for preprocessing dimension columns in seconds', round(time.time()-stopwatch_start, 3))
                 stopwatch_start = time.time()
 
+        if validate_timestamps:
+            if not all([timestamp.tzinfo==pytz.utc for timestamp in list(set(self.gdf_ingest[self.dt_col]))]):
+                raise ValueError("All timestamps are required to be in UTC." )
+                
         if validate_geometries:
             # Make sure the geometries are valid
             self.gdf_ingest[self.geom_col] = self.gdf_ingest[self.geom_col].apply(shapely.validation.make_valid)
@@ -1194,7 +1211,7 @@ class Vectorstore():
         # ToDo: maybe we need to allow appending similar to _to_parquet method
         gdf_idx.to_parquet(
             path=filepath_idx,
-            row_group_size=100000,
+            row_group_size=self.row_group_size,
             engine='pyarrow',
             compression='snappy',
             #partition_cols=self.partition_cols
@@ -1218,6 +1235,10 @@ class Vectorstore():
             if index:
                 # Write the index to parquet
                 self._index_to_parquet(temporal_partition, spatial_partition, append=True)
+
+        # Unify schemas of the parquet partitions, so that local null-value columns don't break read_parquet. 
+        # Add custom metadata.
+        self.unify_schemas()
 
         if self.verbose:
             print('Time for defragging', round(time.time()-stopwatch_start, 3))
@@ -1351,7 +1372,7 @@ class Vectorstore():
             filepath = self._unique_filepath(folderpath)
             gdf_part.to_parquet(
                 path=filepath,
-                row_group_size=100000,
+                row_group_size=self.row_group_size,
                 engine='pyarrow',
                 compression='snappy',
                 #partition_cols=self.partition_cols
@@ -1389,9 +1410,64 @@ class Vectorstore():
                 # Write the index to parquet
                 self._index_to_parquet(temporal_partition, spatial_partition, append=True)
 
+        # Unify schemas of the parquet partitions, so that local null-value columns don't break read_parquet. 
+        # Add custom metadata.
+        self.unify_schemas()
+
         if self.verbose:
             print('Time for writing GeoDataFrame to GeoParquet partitions', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
+
+
+    def unify_schemas(self):
+        """Unify schemas of the parquet partitions, so that local null-value columns don't break reading code.
+        Add dataset custom_meta_content."""
+        filepaths = glob(os.path.join(self.geoparquet_directory, '**/*.parquet').replace('\\', '/'))
+        schemas = [pyarrow.parquet.read_schema(infile) for infile in filepaths]
+        schema_unified = pyarrow.unify_schemas(schemas)
+    
+        for infile in filepaths:
+            # Tailor the parquet file schema so that it has global column dtypes but local geo metadata, such as bbox
+            table_changed = False
+            
+            # Read the schema and table
+            schema = pyarrow.parquet.read_schema(infile)
+            assert schema.names == schema_unified.names
+            existing_meta = schema.metadata  # Start with the existing metadata
+            combined_meta = existing_meta.copy()
+            table = pyarrow.parquet.read_table(infile)
+            
+            # Add dataset-related custom meta content
+            if self.custom_meta_content is not None:                
+                custom_meta_key = self.dataset
+                custom_meta_json = json.dumps(self.custom_meta_content)
+                try:
+                    # Remove any existing dataset-related metadata before adding it back.
+                    combined_meta.pop(custom_meta_key.encode())
+                except:
+                    pass
+                combined_meta = {
+                    custom_meta_key.encode() : custom_meta_json.encode(), # encoded as bytes
+                    **combined_meta
+                }
+                
+            if combined_meta!=existing_meta:
+                table_changed = True
+            if schema.types!=schema_unified.types:
+                table_changed = True
+
+            # Cast table schema to the unified column types and add combined metadata
+            table = table.cast(pyarrow.schema(zip(schema_unified.names, schema_unified.types)))
+            table = table.replace_schema_metadata(combined_meta)
+            
+            # Overwrite table
+            if table_changed:
+                pyarrow.parquet.write_table(
+                    table,
+                    infile,
+                    row_group_size=self.row_group_size,
+                    compression='snappy',
+                )
 
 
     def partial_upload(
@@ -1402,6 +1478,7 @@ class Vectorstore():
         geometry_area=False,
         geometry_length=False,
         validate_geometries=False,
+        validate_timestamps=True,
     ):
         """Register GeoDataFrame, create partition, and save parquet to disk.
 
@@ -1409,10 +1486,15 @@ class Vectorstore():
         :param index:       Flag whether to create spatial index.
         """
         # Register data
-        self.load_geodataframe(gdf, validate_geometries=validate_geometries)
+        self.load_geodataframe(gdf, validate_geometries=validate_geometries, validate_timestamps=validate_timestamps)
 
         # Write the dataset to parquet
-        self.to_parquet(defrag=defrag, index=index, geometry_area=geometry_area, geometry_length=geometry_length)
+        self.to_parquet(
+            defrag=defrag,
+            index=index,
+            geometry_area=geometry_area,
+            geometry_length=geometry_length,
+        )
 
 
     def _connect_s3(
