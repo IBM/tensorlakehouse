@@ -1685,13 +1685,18 @@ class Vectorstore():
             print('schema.metadata', [k for k in schema.metadata])
     
         # Bounding geometries
-        if ddf.spatial_partitions is None:
+        if (
+            ddf.spatial_partitions is None
+        ) or (
+            all(ddf.spatial_partitions.apply(lambda x: (shapely.box(*x.bounds)-x).area==0))
+        ):
             # Convex hull of unary union
-            #ddf.calculate_spatial_partitions() 
-            # THE ABOVE SEEMS TO BE BROKEN IN DASK_GEOPANDAS. DOING IT MANUALLY
-            ddf.spatial_partitions = geopandas.GeoSeries(
-                shapely.convex_hull(shapely.geometrycollections(numpy.asarray(ddf.geometry)))
-            )
+            ddf.calculate_spatial_partitions() 
+            if all(ddf.spatial_partitions.apply(lambda x: (shapely.box(*x.bounds)-x).area==0)):
+                # THE ABOVE MAY BE BROKEN IN DASK_GEOPANDAS. DOING IT MANUALLY
+                ddf.spatial_partitions = geopandas.GeoSeries(
+                    shapely.convex_hull(shapely.geometrycollections(numpy.asarray(ddf.geometry)))
+                )
 
         poly_native = ddf.spatial_partitions.loc[0]
         poly_wgs84 = geopandas.GeoDataFrame([
@@ -1846,7 +1851,7 @@ class Vectorstore():
                 },
             ],
             "assets": {
-                uid: {
+                "data": {
                     "href": href,
                     "type": "table/parquet; application=geoparquet; profile=cloud-optimized",
                     "title": self.collection_id,
@@ -1933,6 +1938,11 @@ class Vectorstore():
             "id": self.collection_id,
             "type": "Collection",
             "stac_version": "1.0.0",
+            "stac_extensions": [
+                "https://stac-extensions.github.io/datacube/v2.2.0/schema.json",
+                #"https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+                #"https://stac-extensions.github.io/table/v1.2.0/schema.json",
+            ],
             "title": self.collection_title,
             "description": description,
             "extent": {
