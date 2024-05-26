@@ -21,7 +21,10 @@ import xarray
 import dask
 import itertools
 
-import dataservice.query
+try:
+    import dataservice.query
+except:
+    print('rasteroverview.py: dataservice.query module not imported. HBASE queries will not be possible.')
 
 sys.path.insert(1, os.path.abspath(".."))
 from qtree_index import nestedgrid, mortoncurve, qtree
@@ -329,7 +332,7 @@ class Rasteroverview():
         stats = xarray.merge([stats, ds_wq])
 
         stats = stats.drop(['mod_y', 'mod_x'])
-        dims = ['dimension_' + d for d in self.dimension_values]
+        dims = ['_' + d for d in self.dimension_values]
         if len(stats.dims)>1:
             df = stats.to_dataframe().reset_index()
         else:
@@ -357,7 +360,7 @@ class Rasteroverview():
         df['value'] = df['value'].astype(int).astype(str)
 
         # Sort (needed for first statistic)
-        dims = ['dimension_' + d for d in self.dimension_values]
+        dims = ['_' + d for d in self.dimension_values]
         df = df.sort_values(by = dims + ['time', 'ovw_x', 'ovw_y', 'mod_x', 'mod_y'])
         grp = df[['ovw_x', 'ovw_y'] + dims + ['time', 'value']].groupby(
             ['ovw_x', 'ovw_y'] + dims + ['time']
@@ -409,6 +412,8 @@ class Rasteroverview():
         spatial_partition  calculating query box based on spatial_partition
         chunk_n            limit number of timestamps queried at a time
         :param kwargs:     cluster, dataserviceendpoint, gdf_local_meta, remote_fs
+                           data_access_key_id, data_secret_access_key, data_endpoint_url
+
         """
         if len(temporal_partition)==0:
             if self.dataservice_type=='hbase':
@@ -450,15 +455,15 @@ class Rasteroverview():
             try:
                 df_existing = pandas.read_parquet(
                     filepath,
-                    columns=[self.dt_col] + ['dimension_' + d for d in self.dimension_values.keys()]
+                    columns=[self.dt_col] + ['_' + d for d in self.dimension_values]
                 ).drop_duplicates().reset_index(drop=True)
             except IOError:
                 # Likely nothing there yet
                 pass
             else:
-                # Drop the 'dimension_' prefix
+                # Drop the '_' prefix
                 df_existing.columns = [
-                    c[len('dimension_'):] if c.startswith('dimension_') else c for c in df_existing
+                    c[len('_'):] if c.startswith('_') else c for c in df_existing
                 ]
 
         # query box 
@@ -476,12 +481,12 @@ class Rasteroverview():
             lonmax = min(lonmax, east - self.res_x_px/2)
             latmax = min(latmax, north - self.res_y_px/2)
                 
-        if self.dataservice_type in ['local_filesystem', 'remote_filesystem']:
+        if self.dataservice_type in ['local_filesystem', 'remote_filesystem', 'local_zarr', 'remote_zarr']:
             # Filter by query area
             gdf_local_meta = kwargs.get('gdf_local_meta')
             gdf_local_meta = gdf_local_meta[
                 gdf_local_meta.intersects(self.morton.base4_to_box(query_key))
-            ].reset_index(drop=True)
+            ].reset_index(drop=True)                
             
             # Overwriting altered kwargs to pass to the worker _hsi_statistics
             kwargs_filtered = kwargs.copy()
@@ -555,7 +560,7 @@ class Rasteroverview():
             gdf_unique,
             df_stats.reset_index().rename(
                 # Keeping the dimension prefix due to possible clashes with statistic columns
-                #columns={'time': self.dt_col} | {'dimension_' + d: d for d in self.dimension_values}
+                #columns={'time': self.dt_col} | {'_' + d: d for d in self.dimension_values}
                 columns={'time': self.dt_col}
             ),
             on=['ovw_x', 'ovw_y']
@@ -589,7 +594,422 @@ class Rasteroverview():
         found_something = True
         return found_something
 
+
+    def _hsi_statistics(
+        self, chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
+    ):
+        """
+        chunk            List of query_epochtimes for this chunk
+        """
+        arr = None
+        if self.dataservice_type=='hbase':
+            arr, delta_x, delta_y = self._setup_xarray_hbase(
+                chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
+            )
+        elif self.dataservice_type in ['local_zarr', 'remote_zarr']:
+            arr, delta_x, delta_y = self._setup_xarray_zarr(
+                chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
+            )
+        elif self.dataservice_type in ['local_filesystem', 'remote_filesystem']:
+            arr, delta_x, delta_y = self._setup_xarray_cos(
+                chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
+            )
+        else:
+            raise NotImplementedError(self.dataservice_type)
+
+        if arr is None:
+            return pandas.DataFrame()
+            
+        # Multiindex in order to select all the lat/lon values belonging to hsi cells
+        ovw_x = [
+            l//self.n_ovw_x for l in range(delta_x, len(arr.x)+delta_x)
+        ]
+        mod_x = [
+            l%self.n_ovw_x for l in range(delta_x, len(arr.x)+delta_x)
+        ]
+        ovw_y = list(reversed([
+            l//self.n_ovw_y for l in range(delta_y, len(arr.y)+delta_y)
+        ]))
+        mod_y = list(reversed([
+            l%self.n_ovw_y for l in range(delta_y, len(arr.y)+delta_y)
+        ]))
+        
+        midx_x = pandas.MultiIndex.from_arrays(
+            [mod_x, ovw_x], names=("mod_x", "ovw_x")
+        )
+        midx_y = pandas.MultiIndex.from_arrays(
+            [mod_y, ovw_y], names=("mod_y", "ovw_y")
+        )
+
+        # 1D array of x-coordinates indexed by mod_x
+        arr_xs = xarray.DataArray(
+            numpy.array(arr.x),
+            coords = {'midx_x': midx_x},
+            dims =  ['midx_x'],
+        )
+        
+        # 1D array of y-coordinates indexed by mod_y
+        arr_ys = xarray.DataArray(
+            numpy.array(arr.y),
+            coords = {'midx_y': midx_y},
+            dims =  ['midx_y'],
+        ) 
+        
+        # Area weight dynamically indexed dependent on the grid implementation
+        weights = self.morton.grid.area_weights(arr_xs, arr_ys).unstack().fillna(0)
+        weights.name = "weights"
     
+        # Using __getattr__ instead of getattr because there can be a clash between
+        # an attribute name like "quantile" and a bound xarray method "quantile".
+        coords = {name: arr.__getattr__(name) for name in self.dimension_values}
+        coords = coords | {'time': arr.time, 'y': midx_y, 'x': midx_x}
+        
+        # Getting the first three array dimensions in the right order
+        dims = [d.replace('mod_y', 'y').replace('mod_x', 'x') for d in arr.dims[:3]]
+        dims += list(arr.dims[3:])
+        
+        arr = xarray.DataArray(
+            numpy.array(arr),
+            coords = coords,
+            dims =  dims,
+        )
+    
+        # Renaming the dimension names by prepending '_' since there could be 
+        # clashes with keywords such as "quantile".
+        for name in self.dimension_values:
+            arr = arr.rename({name: '_' + name})
+    
+        # Unstack the xarray raster to create separate axis for ovw_x and ovw_y
+        # Unstacking in a two for-loops because the built-in arr.unstack(dim=['x', 'y']) is slow.
+        arr_x_lst = []
+        for x in sorted(set(arr.ovw_x.values)):
+            arr_x_lst.append(arr.sel(ovw_x=x))
+        arr = xarray.concat(arr_x_lst, dim='ovw_x')
+        
+        arr_y_lst = []
+        for y in sorted(set(arr.ovw_y.values)):
+            arr_y_lst.append(arr.sel(ovw_y=y))
+        
+        arr = xarray.concat(arr_y_lst, dim='ovw_y')
+        # Order of arr dimensions is now: ovw_y, ovw_x, mod_y, mod_x, time, other dimensions...
+
+        # get weights dims in the same order as arr dims for fast positional indexing
+        weights = weights.transpose(*[d for d in arr.dims if d in weights.dims])
+    
+        # Pandas is fastest at a length around 1Mio rows, so target aerial chunks to that size
+        # Making chunks small also allows us to remove all-nan chunks before heavy calculations
+        TARGET = 1e6
+        
+        target_chunks = numpy.ceil(numpy.prod(arr.shape) / TARGET) # ceil assures at least one chunk
+        target_len_x = int(numpy.ceil(arr.ovw_x.shape[0]/numpy.sqrt(target_chunks)))
+        target_len_y = int(numpy.ceil(arr.ovw_y.shape[0]/numpy.sqrt(target_chunks)))
+        
+        if self.verbose:
+            print('ovw_x.min, ovw_x.max, ovw_y.min, ovw_y.max')
+            print(
+                int(arr.ovw_x.min()),
+                int(arr.ovw_x.max()),
+                int(arr.ovw_y.min()),
+                int(arr.ovw_y.max())
+            )
+            print('--------------')
+
+        df_stats = []
+        for ovw_x_range in self._chunks(list(arr.ovw_x.to_numpy()), target_len_x):
+            for ovw_y_range in self._chunks(list(arr.ovw_y.to_numpy()), target_len_y):
+                # Work on each chunk sequentially
+                idx_x = numpy.array(ovw_x_range) - int(arr.ovw_x[0])
+                idx_y = numpy.array(ovw_y_range) - int(arr.ovw_y[0])
+                arr_chunk = arr[idx_y[0]:idx_y[-1]+1, idx_x[0]:idx_x[-1]+1,::]
+                if not arr_chunk.isnull().all():
+                    if self.verbose:
+                        print(
+                            int(arr_chunk.ovw_x.min()),
+                            int(arr_chunk.ovw_x.max()),
+                            int(arr_chunk.ovw_y.min()),
+                            int(arr_chunk.ovw_y.max())
+                        )
+                    if self.statistics_type == 'numeric':
+                        weights_chunk = self._weights_chunk(weights, idx_y, idx_x)
+                        df_stats_chunk = self.xarray_stats_numeric(arr_chunk, weights_chunk)
+                    elif self.statistics_type == 'categorical':
+                        df_stats_chunk = self.xarray_stats_categorical(arr_chunk)
+                        
+                    if len(df_stats_chunk)>0:
+                        df_stats.append(df_stats_chunk)
+
+        return pandas.concat(df_stats)
+
+
+    def _setup_xarray_hbase(
+        self, chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
+    ):
+        """Get the data from the hbase dataservice."""
+        
+        if len(self.dimension_values)==0:
+            # Exclude existing timestamps when instructed by skip_existing
+            chunk = self._exclude_timestamps(chunk, df_existing)
+
+            if len(chunk)>0:
+                arr = dataservice.query.to_xarray(
+                    layer_id=self.layer_id,
+                    level=self.hbase_pixel_level,
+                    latmin=latmin,
+                    lonmin=lonmin,
+                    latmax=latmax,
+                    lonmax=lonmax,
+                    timestamps=chunk,
+                    **kwargs,
+                )
+        else:
+            for elements in itertools.product(*self.dimension_values.values()):
+                dimensions={}
+                for i, dimension_name in enumerate(self.dimension_values):
+                    dimensions[dimension_name] = elements[i]
+
+                chunk = self._exclude_timestamps(chunk, df_existing, flt)
+
+                if len(chunk)>0:
+                    arr = dataservice.query.to_xarray(
+                        layer_id=self.layer_id,
+                        level=self.hbase_pixel_level,
+                        latmin=latmin,
+                        lonmin=lonmin,
+                        latmax=latmax,
+                        lonmax=lonmax,
+                        timestamps=chunk,
+                        dimensions=dimensions,
+                        **kwargs,
+                    )
+                    lst.append(arr)
+                    
+            arr = xarray.merge(lst)[self.layer_id]
+
+        # HSI grid is automatically aligned with pixel grid
+        delta_x = 0
+        delta_y = 0
+        
+        return arr, delta_x, delta_y
+        
+        
+    def _setup_xarray_zarr(
+        self, chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
+    ):
+        """Query zarr directly using xarray."""
+        
+        gdf_local_meta = kwargs.get('gdf_local_meta')
+        data_access_key_id = kwargs.get('data_access_key_id')
+        data_secret_access_key = kwargs.get('data_secret_access_key')
+        data_endpoint_url = kwargs.get('data_endpoint_url')
+
+        # Currently we require exactly one zarr store
+        remote_paths = gdf_local_meta['remote_path'].drop_duplicates()
+        assert len(remote_paths)==1
+
+        # Storage url from STAC item asset href
+        # Debug: We need a better way to get the remote_path: bucket/data.zarr from the href
+        # Debug: Currently the href may or may not contain "https", "s3://", data_endpoint_url, etc.
+        storage_url = 's3://' + remote_paths[0].split(data_endpoint_url)[-1].split('s3.')[-1].lstrip('\/')
+        
+        # Exclude existing timestamps when instructed by skip_existing
+        chunk = self._exclude_timestamps(chunk, df_existing)
+
+        # For zarr we require the variables (bands) to be passed as dimension_values
+        assert "band" in self.dimension_values
+        bands = self.dimension_values["band"]
+
+        # Open a lazy xarray dataset
+        ds = xarray.open_dataset(
+            storage_url,
+            engine="zarr",
+            storage_options={
+                'key' : data_access_key_id,
+                'secret' : data_secret_access_key,
+                'client_kwargs' : {'endpoint_url' : data_endpoint_url}
+            }
+        )[bands]
+
+        # Rename latitude and longitude 
+        dims_dict = {'latitude': 'y', 'longitude': 'x'}
+        try:
+            ds = ds.rename_dims(dims_dict).rename_vars(dims_dict)
+        except:
+            pass
+
+        # Filter timestamps
+        try:
+            chunk_utc = [self._utcfromtimestamp(t) for t in chunk]
+            ds1 = ds.sel(time=chunk_utc)
+        except:
+            # Maybe the zarr file uses timezone naive timestamps
+            chunk_naive = [t.replace(tzinfo=None) for t in chunk_utc]
+            ds1 = ds.sel(time=chunk_naive)
+
+        # Efficient (lazy) clipping in x and y
+        ds1 = ds1.loc[{"x": slice(lonmin, lonmax)}]
+        ds1 = ds1.loc[{"y": slice(latmin, latmax)}]
+
+        # Cast to dataarray, converting the variables into a new dimension "band" (even if it's just one band).
+        arr = ds1.to_dataarray(dim='band')
+
+        # Make sure the y-axis is indexed in descending order 
+        if arr.y.values[1]>arr.y.values[0]:
+            print('Warning: reversing y-axis direction')
+            #arr = arr.reindex(y=arr.y[::-1])
+            arr = arr.isel(y=slice(None, None, -1)) # Keeps a lazy dask array
+            
+        # Align hsi grid with pixel grid
+        x0 = arr.x.min().item()-self.res_x_px/2
+        x0_idx_px = (x0 - self.grid.origin.x) / self.res_x_px
+        # Debug: rounding may be necessary 
+        x0_idx_px = round(x0_idx_px)
+        delta_x = int(x0_idx_px % (self.n_ovw_x * 2**(self.hsi_level - self.spatial_partition_level)))
+
+        y0 = arr.y.min().item()-self.res_y_px/2
+        y0_idx_px = (y0 - self.grid.origin.y) / self.res_y_px
+        # Debug: rounding may be necessary 
+        y0_idx_px = round(y0_idx_px)
+        delta_y = int(y0_idx_px % (self.n_ovw_y * 2**(self.hsi_level - self.spatial_partition_level)))
+
+        return arr, delta_x, delta_y
+
+
+    def _setup_xarray_cos(
+        self, chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
+    ):
+        """Download required geotiffs and open them locally."""
+
+        gdf_local_meta = kwargs.get('gdf_local_meta')
+    
+        lst = []
+        for elements in itertools.product(*({'time':chunk} | self.dimension_values).values()):
+            # Filtering the metadata using specific epochtime and dimension values
+            flt = {
+                'time': self._utcfromtimestamp(elements[0])
+            } | {
+                d:elements[i+1] for i, d in enumerate(self.dimension_values)
+            }
+            df_filtered = gdf_local_meta.loc[
+                (gdf_local_meta[list(flt)] == pandas.Series(flt)).all(axis=1)
+            ]
+            
+            if len(df_filtered)==0:
+                continue
+
+            if self.verbose:
+                print('Timestamp/dimension combination', elements)
+                
+            # Skipping existing time and/or dimension combinations
+            if len(df_existing)>0:
+                # Perform an anti-merge with the existing times/dimensions filter
+                df_filtered = pandas.merge(
+                    df_filtered, df_existing, how='outer', indicator=True
+                ).query('_merge == "left_only"').drop(columns='_merge')
+                
+            if len(df_filtered)==0:
+                if self.verbose:
+                    print('Skipping existing timestamp/dimension combination')
+                continue
+
+            if self.dataservice_type=='local_filesystem':
+                # Data is present locally
+                local_paths = df_filtered['filepath'].values
+            elif self.dataservice_type=='remote_filesystem':
+                # Download the remote data to a temporary directory
+                local_paths = []
+                for remote_path in df_filtered['filepath'].values:
+                    try:
+                        local_path = os.path.join(
+                            self.tmp_directory,
+                            os.path.split(remote_path)[1]
+                        ).replace('\\', '/')
+                        remote_fs = kwargs.get('remote_fs')
+                        remote_fs.download(remote_path, local_path)
+                    except IOError as e:
+                        print(e)
+                        return
+                    else:
+                        local_paths.append(local_path)
+
+            if len(local_paths)>1:
+                print('Warning: combining multiple files with the same dimensions', elements)
+            i=0
+            for local_path in local_paths:
+                if self.verbose:
+                    print('local_path', local_path)
+                if i==0:
+                    arr = xarray.load_dataarray(local_path)
+                else:
+                    if self.verbose:
+                        print('filling nan values with', local_path)
+                    arr.fillna(xarray.load_dataarray(local_path))
+                if (self.dataservice_type=='remote_filesystem') and os.path.isfile(local_path):
+                    # clean up
+                    os.remove(local_path)
+                i+=1
+
+            try:
+                # Clip according to the query bounds
+                arr = arr.where(
+                    (arr.x>lonmin) &
+                    (arr.x<lonmax) &
+                    (arr.y>latmin) &
+                    (arr.y<latmax),
+                    drop=True
+                )
+            except ValueError as e:
+                print('Warning at elements ', elements, ': ', e)
+            else:
+                # Build a multiindex for all the timestamps and dimension values,
+                # so that we can simpliy concat the arrays.
+                midx = pandas.MultiIndex.from_arrays(
+                    [[v] for v in list(flt.values())], names=list(flt)
+                )
+
+                # Recast to 3D using the multiindex
+                arr = xarray.DataArray(
+                    numpy.array(arr),
+                    coords = [midx, arr.y, arr.x],
+                    dims =  ['midx', 'y', 'x'],
+                )
+                
+                # Asserting that the y axis values are always in descending order
+                assert arr.y.values[1]<arr.y.values[0]
+                
+                lst.append(arr)
+
+        if len(lst)>0:
+            if len(lst)==1:
+                arr = lst[0]
+            else:
+                #arr = xarray.concat(lst, dim='midx') # debug: This produces errors in some cases
+                arr = self._concat(lst, flt, dim='midx')
+
+            # Concat apparently does the padding of non-commensurate arrays correctly, 
+            # but it may reverse the y-axis direction, so switch back here if needed.
+            if arr.y.values[1]>arr.y.values[0]:
+                print('Warning: reversed y-axis direction after concat')
+                arr = arr.reindex(y=arr.y[::-1])
+
+            # Unstacking the multiindex
+            arr = arr.set_index(midx=['time'] + list(self.dimension_values)).unstack('midx')
+
+            # Align hsi grid with pixel grid
+            x0 = arr.x.min().item()-self.res_x_px/2
+            x0_idx_px = (x0 - self.grid.origin.x) / self.res_x_px
+            delta_x = int(x0_idx_px % (self.n_ovw_x * 2**(self.hsi_level - self.spatial_partition_level)))
+
+            y0 = arr.y.min().item()-self.res_y_px/2
+            y0_idx_px = (y0 - self.grid.origin.y) / self.res_y_px
+            delta_y = int(y0_idx_px % (self.n_ovw_y * 2**(self.hsi_level - self.spatial_partition_level)))
+        else:
+            arr = None
+            delta_x = None
+            delta_y = None
+
+        return arr, delta_x, delta_y
+
+
     def _probe_hbase_timestamps(self, query_key, query_epochtimes, **kwargs):
         """Given a query key (partition), what timestamps are likely available?
 
@@ -679,312 +1099,6 @@ class Rasteroverview():
 
         return sorted(set(chunk) - exclude_ts)
         
-
-    def _hsi_statistics(
-        self, chunk, lonmin, latmin, lonmax, latmax, df_existing, **kwargs
-    ):
-        """
-        chunk            List of query_epochtimes for this chunk
-        """
-        arr = None
-        if self.dataservice_type=='hbase':
-            # Get the data from the hbase dataservice
-            if len(self.dimension_values)==0:
-                # Exclude existing timestamps when instructed by skip_existing
-                chunk = self._exclude_timestamps(chunk, df_existing)
-
-                if len(chunk)>0:
-                    arr = dataservice.query.to_xarray(
-                        layer_id=self.layer_id,
-                        level=self.hbase_pixel_level,
-                        latmin=latmin,
-                        lonmin=lonmin,
-                        latmax=latmax,
-                        lonmax=lonmax,
-                        timestamps=chunk,
-                        **kwargs,
-                    )
-            else:
-                for elements in itertools.product(*self.dimension_values.values()):
-                    dimensions={}
-                    for i, dimension_name in enumerate(self.dimension_values):
-                        dimensions[dimension_name] = elements[i]
-
-                    chunk = self._exclude_timestamps(chunk, df_existing, flt)
-
-                    if len(chunk)>0:
-                        arr = dataservice.query.to_xarray(
-                            layer_id=self.layer_id,
-                            level=self.hbase_pixel_level,
-                            latmin=latmin,
-                            lonmin=lonmin,
-                            latmax=latmax,
-                            lonmax=lonmax,
-                            timestamps=chunk,
-                            dimensions=dimensions,
-                            **kwargs,
-                        )
-                        lst.append(arr)
-                        
-                arr = xarray.merge(lst)[self.layer_id]
-
-            # HSI grid is automatically aligned with pixel grid
-            delta_x = 0
-            delta_y = 0
-
-        elif self.dataservice_type in ['local_filesystem', 'remote_filesystem']:
-            gdf_local_meta = kwargs.get('gdf_local_meta')
-        
-            lst = []
-            for elements in itertools.product(*({'time':chunk} | self.dimension_values).values()):
-                # Filtering the metadata using specific epochtime and dimension values
-                flt = {
-                    'time': self._utcfromtimestamp(elements[0])
-                } | {
-                    d:elements[i+1] for i, d in enumerate(self.dimension_values)
-                }
-                df_filtered = gdf_local_meta.loc[
-                    (gdf_local_meta[list(flt)] == pandas.Series(flt)).all(axis=1)
-                ]
-                
-                if len(df_filtered)==0:
-                    continue
-
-                if self.verbose:
-                    print('Timestamp/dimension combination', elements)
-                    
-                # Skipping existing time and/or dimension combinations
-                if len(df_existing)>0:
-                    # Perform an anti-merge with the existing times/dimensions filter
-                    df_filtered = pandas.merge(
-                        df_filtered, df_existing, how='outer', indicator=True
-                    ).query('_merge == "left_only"').drop(columns='_merge')
-                    
-                if len(df_filtered)==0:
-                    if self.verbose:
-                        print('Skipping existing timestamp/dimension combination')
-                    continue
-
-                if self.dataservice_type=='local_filesystem':
-                    # Data is present locally
-                    local_paths = df_filtered['filepath'].values
-                elif self.dataservice_type=='remote_filesystem':
-                    # Download the remote data to a temporary directory
-                    local_paths = []
-                    for remote_path in df_filtered['filepath'].values:
-                        try:
-                            local_path = os.path.join(
-                                self.tmp_directory,
-                                os.path.split(remote_path)[1]
-                            ).replace('\\', '/')
-                            remote_fs = kwargs.get('remote_fs')
-                            remote_fs.download(remote_path, local_path)
-                        except IOError as e:
-                            print(e)
-                            return
-                        else:
-                            local_paths.append(local_path)
-
-                if len(local_paths)>1:
-                    print('Warning: combining multiple files with the same dimensions', elements)
-                i=0
-                for local_path in local_paths:
-                    if self.verbose:
-                        print('local_path', local_path)
-                    if i==0:
-                        arr = xarray.load_dataarray(local_path)
-                    else:
-                        if self.verbose:
-                            print('filling nan values with', local_path)
-                        arr.fillna(xarray.load_dataarray(local_path))
-                    if (self.dataservice_type=='remote_filesystem') and os.path.isfile(local_path):
-                        # clean up
-                        os.remove(local_path)
-                    i+=1
-
-                try:
-                    # Clip according to the query bounds
-                    arr = arr.where(
-                        (arr.x>lonmin) &
-                        (arr.x<lonmax) &
-                        (arr.y>latmin) &
-                        (arr.y<latmax),
-                        drop=True
-                    )
-                except ValueError as e:
-                    print('Warning at elements ', elements, ': ', e)
-                else:
-                    # Build a multiindex for all the timestamps and dimension values,
-                    # so that we can simpliy concat the arrays.
-                    midx = pandas.MultiIndex.from_arrays(
-                        [[v] for v in list(flt.values())], names=list(flt)
-                    )
-
-                    # Recast to 3D using the multiindex
-                    arr = xarray.DataArray(
-                        numpy.array(arr),
-                        coords = [midx, arr.y, arr.x],
-                        dims =  ['midx', 'y', 'x'],
-                    )
-                    
-                    # Asserting that the y axis values are always in descending order
-                    assert arr.y.values[1]<arr.y.values[0]
-                    
-                    lst.append(arr)
-
-            if len(lst)>0:
-                if len(lst)==1:
-                    arr = lst[0]
-                else:
-                    #arr = xarray.concat(lst, dim='midx') # debug: This produces errors in some cases
-                    arr = self._concat(lst, flt, dim='midx')
-
-                # Concat apparently does the padding of non-commensurate arrays correctly, 
-                # but it may reverse the y-axis direction, so switch back here if needed.
-                if arr.y.values[1]>arr.y.values[0]:
-                    print('Warning: reversed y-axis direction after concat')
-                    arr = arr.reindex(y=arr.y[::-1])
-
-                # Unstacking the multiindex
-                arr = arr.set_index(midx=['time'] + list(self.dimension_values)).unstack('midx')
-
-                # Align hsi grid with pixel grid
-                x0 = arr.x.min().item()-self.res_x_px/2
-                x0_idx_px = (x0 - self.grid.origin.x) / self.res_x_px
-                delta_x = int(x0_idx_px % (self.n_ovw_x * 2**(self.hsi_level - self.spatial_partition_level)))
-
-                y0 = arr.y.min().item()-self.res_y_px/2
-                y0_idx_px = (y0 - self.grid.origin.y) / self.res_y_px
-                delta_y = int(y0_idx_px % (self.n_ovw_y * 2**(self.hsi_level - self.spatial_partition_level)))
-            else:
-                arr = None
-            
-        else:
-            raise NotImplementedError(self.dataservice_type)
-
-        if arr is None:
-            return pandas.DataFrame()
-            
-        # Multiindex in order to select all the lat/lon values belonging to hsi cells
-        ovw_x = [
-            l//self.n_ovw_x for l in range(delta_x, len(arr.x)+delta_x)
-        ]
-        mod_x = [
-            l%self.n_ovw_x for l in range(delta_x, len(arr.x)+delta_x)
-        ]
-        ovw_y = list(reversed([
-            l//self.n_ovw_y for l in range(delta_y, len(arr.y)+delta_y)
-        ]))
-        mod_y = list(reversed([
-            l%self.n_ovw_y for l in range(delta_y, len(arr.y)+delta_y)
-        ]))
-        
-        midx_x = pandas.MultiIndex.from_arrays(
-            [mod_x, ovw_x], names=("mod_x", "ovw_x")
-        )
-        midx_y = pandas.MultiIndex.from_arrays(
-            [mod_y, ovw_y], names=("mod_y", "ovw_y")
-        )
-
-        # 1D array of x-coordinates indexed by mod_x
-        arr_xs = xarray.DataArray(
-            numpy.array(arr.x),
-            coords = {'midx_x': midx_x},
-            dims =  ['midx_x'],
-        )
-        
-        # 1D array of y-coordinates indexed by mod_y
-        arr_ys = xarray.DataArray(
-            numpy.array(arr.y),
-            coords = {'midx_y': midx_y},
-            dims =  ['midx_y'],
-        ) 
-        
-        # Area weight dynamically indexed dependent on the grid implementation
-        weights = self.morton.grid.area_weights(arr_xs, arr_ys).unstack().fillna(0)
-        weights.name = "weights"
-    
-        # Using __getattr__ instead of getattr because there can be a clash between
-        # an attribute name like "quantile" and a bound xarray method "quantile".
-        coords = {name: arr.__getattr__(name) for name in self.dimension_values}
-        coords = coords | {'time': arr.time, 'y': midx_y, 'x': midx_x}
-        
-        # Getting the first three array dimensions in the right order
-        dims = [d.replace('mod_y', 'y').replace('mod_x', 'x') for d in arr.dims[:3]]
-        dims += list(arr.dims[3:])
-        
-        arr = xarray.DataArray(
-            numpy.array(arr),
-            coords = coords,
-            dims =  dims,
-        )
-    
-        # Renaming the dimension names by prepending 'dimension_' since there could be 
-        # clashes with keywords such as "quantile".
-        for name in self.dimension_values:
-            arr = arr.rename({name: 'dimension_' + name})
-    
-        # Unstack the xarray raster to create separate axis for ovw_x and ovw_y
-        # Unstacking in a two for-loops because the built-in arr.unstack(dim=['x', 'y']) is slow.
-        arr_x_lst = []
-        for x in sorted(set(arr.ovw_x.values)):
-            arr_x_lst.append(arr.sel(ovw_x=x))
-        arr = xarray.concat(arr_x_lst, dim='ovw_x')
-        
-        arr_y_lst = []
-        for y in sorted(set(arr.ovw_y.values)):
-            arr_y_lst.append(arr.sel(ovw_y=y))
-        
-        arr = xarray.concat(arr_y_lst, dim='ovw_y')
-        # Order of arr dimensions is now: ovw_y, ovw_x, mod_y, mod_x, time, other dimensions...
-
-        # get weights dims in the same order as arr dims for fast positional indexing
-        weights = weights.transpose(*[d for d in arr.dims if d in weights.dims])
-    
-        # Pandas is fastest at a length around 1Mio rows, so target aerial chunks to that size
-        # Making chunks small also allows us to remove all-nan chunks before heavy calculations
-        TARGET = 1e6
-        
-        target_chunks = numpy.ceil(numpy.prod(arr.shape) / TARGET) # ceil assures at least one chunk
-        target_len_x = int(numpy.ceil(arr.ovw_x.shape[0]/numpy.sqrt(target_chunks)))
-        target_len_y = int(numpy.ceil(arr.ovw_y.shape[0]/numpy.sqrt(target_chunks)))
-        
-        if self.verbose:
-            print('ovw_x.min, ovw_x.max, ovw_y.min, ovw_y.max')
-            print(
-                int(arr.ovw_x.min()),
-                int(arr.ovw_x.max()),
-                int(arr.ovw_y.min()),
-                int(arr.ovw_y.max())
-            )
-            print('--------------')
-
-        df_stats = []
-        for ovw_x_range in self._chunks(list(arr.ovw_x.to_numpy()), target_len_x):
-            for ovw_y_range in self._chunks(list(arr.ovw_y.to_numpy()), target_len_y):
-                # Work on each chunk sequentially
-                idx_x = numpy.array(ovw_x_range) - int(arr.ovw_x[0])
-                idx_y = numpy.array(ovw_y_range) - int(arr.ovw_y[0])
-                arr_chunk = arr[idx_y[0]:idx_y[-1]+1, idx_x[0]:idx_x[-1]+1,::]
-                if not arr_chunk.isnull().all():
-                    if self.verbose:
-                        print(
-                            int(arr_chunk.ovw_x.min()),
-                            int(arr_chunk.ovw_x.max()),
-                            int(arr_chunk.ovw_y.min()),
-                            int(arr_chunk.ovw_y.max())
-                        )
-                    if self.statistics_type == 'numeric':
-                        weights_chunk = self._weights_chunk(weights, idx_y, idx_x)
-                        df_stats_chunk = self.xarray_stats_numeric(arr_chunk, weights_chunk)
-                    elif self.statistics_type == 'categorical':
-                        df_stats_chunk = self.xarray_stats_categorical(arr_chunk)
-                        
-                    if len(df_stats_chunk)>0:
-                        df_stats.append(df_stats_chunk)
-
-        return pandas.concat(df_stats)
-
 
     def _concat(self, lst, flt, dim):
         """Fast xarray.concat for merging data that may not have the same lat/lon coordiates.
@@ -1128,7 +1242,7 @@ class Rasteroverview():
             else:
                 # Merge by concatenating and dropping duplicates (keeping the newer version)
                 gdf = pandas.concat([gdf_existing, gdf]).drop_duplicates(
-                    subset=[self.dt_col, self.key_col]+['dimension_' + d for d in self.dimension_values],
+                    subset=[self.dt_col, self.key_col]+['_' + d for d in self.dimension_values],
                     keep='last',
                 )
                 
@@ -1141,7 +1255,7 @@ class Rasteroverview():
 
             # Sorting so that these columns are used as indices in parquet file
             gdf = gdf.sort_values(
-                by=[self.dt_col]+['dimension_' + d for d in self.dimension_values]+[self.key_col]
+                by=[self.dt_col]+['_' + d for d in self.dimension_values]+[self.key_col]
             ).reset_index(drop=True)
 
             gdf.to_parquet(

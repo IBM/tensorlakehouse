@@ -16,6 +16,7 @@ import dask_geopandas
 import shapely
 import json
 import itertools
+import warnings
 import uuid
 import pystac_client
 
@@ -38,6 +39,7 @@ class HSI():
         n_ovw_x                     Number of pixels to aggregate in the x-direction.
         n_ovw_y                     Number of pixels to aggregate in the y-direction.
         spatial_partition_level     Spatial partition level
+        dimension_values            Dictionary of dimension values
         hsi_directory               Local HSI directory where parquet files are assembled
         tmp_directory               Temporary directory
         statistics_type             Statistics type (numeric or categorical)
@@ -53,9 +55,9 @@ class HSI():
         dataservice_type            Dataservice type (raw data)
         data_bucket                 COS bucket of the raw data
         remote_fs                   Remote filesystem handle for the raw data
-        # data_access_key_id          Raw data access key ID
-        # data_secret_access_key      Raw data sectre access key ID
-        # data_endpoint_url           Raw data endpoint URL
+        data_access_key_id          Raw data access key ID
+        data_secret_access_key      Raw data sectre access key ID
+        data_endpoint_url           Raw data endpoint URL
 
         hsi_dataservice_type        Dataservice type (HSI)
         hsi_bucket                  COS bucket of the HSI data
@@ -103,6 +105,7 @@ class HSI():
         n_ovw_x,
         n_ovw_y,
         spatial_partition_level,
+        dimension_values,
         hsi_directory,
         tmp_directory,
         statistics_type,
@@ -118,9 +121,9 @@ class HSI():
         dataservice_type,
         data_bucket,
         remote_fs,
-        # data_access_key_id,
-        # data_secret_access_key,
-        # data_endpoint_url,
+        data_access_key_id,
+        data_secret_access_key,
+        data_endpoint_url,
 
         hsi_dataservice_type,
         hsi_bucket,
@@ -153,6 +156,7 @@ class HSI():
         self.n_ovw_x = n_ovw_x
         self.n_ovw_y = n_ovw_y
         self.spatial_partition_level = spatial_partition_level
+        self.dimension_values = dimension_values
         self.hsi_directory = hsi_directory
         self.tmp_directory = tmp_directory
         self.dset_id = None
@@ -175,9 +179,9 @@ class HSI():
         self.dataservice_type = dataservice_type
         self.data_bucket = data_bucket
         self.remote_fs = remote_fs
-        # self.data_access_key_id = data_access_key_id
-        # self.data_secret_access_key = data_secret_access_key
-        # self.data_endpoint_url = data_endpoint_url
+        self.data_access_key_id = data_access_key_id
+        self.data_secret_access_key = data_secret_access_key
+        self.data_endpoint_url = data_endpoint_url
 
         # COS HSI access
         self.hsi_dataservice_type = hsi_dataservice_type
@@ -247,11 +251,9 @@ class HSI():
         # Create the metadata table for the Rasteroverview
         self.search_items_local_metadata()
 
-        # Now since we know the local metadata, define the dimensions
-        self.dimension_values = {
-            'band':self.bands,
-            'tile':sorted(self.gdf_local_meta['tile'].unique()),
-        }
+        # Now since we know the local metadata, narrow down the tile dimension_values
+        if 'tile' in self.dimension_values:
+            self.dimension_values['tile'] = sorted(self.gdf_local_meta['tile'].unique())
 
         # Setup the Rasteroverviw object with appropriate partitions for HSI creation.
         self.setup_rasteroverview()
@@ -260,28 +262,10 @@ class HSI():
     def stac_search_available(
         self,
         search_aoi,
-        fields = None,
         filter_epsg = None,
     ):
         """Search for available raw data in STAC."""
         LIMIT = 10000
-        FIELDS = {
-            "include": [
-                "id",
-                "bbox",
-                "datetime",
-                "properties.tile",
-                "properties.cube:variables",
-                "properties.cube:dimensions",
-                "properties.cloud_coverage",
-            ],
-            "exclude": [
-            ],
-        }
-        
-        # Stac fields to query
-        if fields is None:
-            fields = FIELDS
         
         # Temporal search parameters
         if self.day is None:
@@ -328,7 +312,6 @@ class HSI():
             collections = [self.collection_id],
             intersects = search_aoi,
             datetime = dt_string,
-            fields = fields,
         )
         
         self.search_items = None
@@ -339,9 +322,15 @@ class HSI():
     
             # Filter epsg
             if filter_epsg is not None:
-                next_items = [item for item in next_items if (
-                    item.properties['cube:dimensions']['x']['reference_system']==filter_epsg
-                )]
+                # Debug: We need a function to get the correct x-axis name rather than guessing
+                try:
+                    next_items = [item for item in next_items if (
+                        item.properties['cube:dimensions']['x']['reference_system']==filter_epsg
+                    )]
+                except:
+                    next_items = [item for item in next_items if (
+                        item.properties['cube:dimensions']['longitude']['reference_system']==filter_epsg
+                    )]
                 
             if self.verbose:
                 print('batch', i, '; filtered', len(next_items))
@@ -366,6 +355,9 @@ class HSI():
             self.gdf_local_meta = geopandas.GeoDataFrame([{
                 'id': item.id,
                 'time': item.datetime,
+                'start_time': item.properties['start_datetime'],
+                'end_time': item.properties['end_datetime'],
+                'time_step': item.properties['cube:dimensions']['time']['step'],
                 #'cloud_coverage': item.properties['cloud_coverage'],
                 #'tile': item.properties['tile'],
                 'band': list(item.properties['cube:variables'].keys())[0],
@@ -377,18 +369,38 @@ class HSI():
             self.gdf_local_meta = geopandas.GeoDataFrame([{
                 'id': item.id,
                 'time': item.datetime,
+                'start_time': item.properties['start_datetime'],
+                'end_time': item.properties['end_datetime'],
+                'time_step': item.properties['cube:dimensions']['time']['step'],
                 #'cloud_coverage': item.properties['cloud_coverage'],
                 #'tile': item.properties['tile'],
                 'band': band,
                 'geometry': shapely.box(*item.bbox),
                 'remote_path': item.assets[band].href.split('s3://')[-1],
             } for item in self.search_items for band in item.assets if band in self.bands])
-            
+
+        # Time range to separate timestamps
+        gdf_range = self.gdf_local_meta[self.gdf_local_meta['start_time'].notnull()]
+        gdf_discrete = self.gdf_local_meta[self.gdf_local_meta['start_time'].isnull()]
+        gdf_range['time'] = gdf_range[['start_time', 'end_time', 'time_step']].apply(
+            lambda row: pandas.date_range(
+                datetime.strptime(row['start_time'], self.ISO_8601),
+                datetime.strptime(row['end_time'], self.ISO_8601),
+                freq=pandas.Timedelta(row['time_step'])
+            ),
+            axis=1
+        )
+        gdf_range = gdf_range.explode('time')
+        self.gdf_local_meta = pandas.concat([gdf_range, gdf_discrete]).reset_index(drop=True)
+        del self.gdf_local_meta['start_time']
+        del self.gdf_local_meta['end_time']
+        del self.gdf_local_meta['time_step']
+
         # Local path from remote path
-        if self.dataservice_type=='remote_filesystem':
+        if self.dataservice_type in ['remote_filesystem', 'remote_zarr']:
             # Either (A) download file from remote folder
             self.gdf_local_meta['filepath'] = self.gdf_local_meta['remote_path'].apply(lambda x: 's3://' + x)
-        elif self.dataservice_type=='local_filesystem':
+        elif self.dataservice_type in ['local_filesystem', 'local_zarr']:
             # Or (B) use mounted s3fs
             raise NotImplementedError()
             # self.gdf_local_meta['filepath'] = self.gdf_local_meta['remote_path'].apply(
@@ -486,7 +498,9 @@ class HSI():
         self.gdf_grid_partitions = qt.gridded_to_geodataframe(key_col=None, level_col=None, crop_valid_range=False)
         
         # Sort largest partitions first, so there won't be any long straggler when workers loop through.
-        self.gdf_grid_partitions['area'] = self.gdf_grid_partitions.intersection(self.gdf_total_bounds.loc[0, 'geometry']).area
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.gdf_grid_partitions['area'] = self.gdf_grid_partitions.intersection(self.gdf_total_bounds.loc[0, 'geometry']).area
         # Remove empty partitions that can happen when cells touch but not overlap
         self.gdf_grid_partitions = self.gdf_grid_partitions[self.gdf_grid_partitions['area']>0]
         self.gdf_grid_partitions = self.gdf_grid_partitions.sort_values(by='area', ascending=False).reset_index(drop=True)
@@ -550,7 +564,9 @@ class HSI():
             raise NotImplementedError('hbase not supported for hsi upload.')
         else:
             raise ValueError(f'"{self.hsi_dataservice_type}" hsi_dataservice_type not understood.')
-        self.hsi_remote_path = os.path.join(prefix, hsi_local_path.split(self.raster.hsi_directory)[-1].lstrip('\/')).replace('\\', '/')
+        self.hsi_remote_path = os.path.join(
+            prefix, hsi_local_path.split(self.raster.hsi_directory)[-1].lstrip('\/')
+        ).replace('\\', '/')
     
         if self.skip_existing and self.hsi_dataservice_type == 'remote_filesystem':
             # Download existing HSI for this partition to skip existing timestamp/dimension combinations.
@@ -568,6 +584,9 @@ class HSI():
             skip_existing=self.skip_existing,
             gdf_local_meta=self.gdf_local_meta,
             remote_fs=self.remote_fs,
+            data_access_key_id=self.data_access_key_id,
+            data_secret_access_key=self.data_secret_access_key,
+            data_endpoint_url=self.data_endpoint_url,
             **kwargs,
         )
     
@@ -585,16 +604,18 @@ class HSI():
 
     def register_hsi_items_stac(self):
         """Register HSI items in STAC."""
-        if self.dataservice_type=='local_filesystem':
+        if self.hsi_dataservice_type=='local_filesystem':
             # Accessing in local (or mounted) drive
             self.storage_urls = glob(os.path.join(self.hsi_directory, '**/*.parquet').replace('\\', '/'))
-        elif self.dataservice_type=='remote_filesystem':
+        elif self.hsi_dataservice_type=='remote_filesystem':
             # Using s3fs to access
             directory = os.path.split(self.hsi_remote_path)[0].replace('\\', '/')
             self.storage_urls = self.hsi_remote_fs.glob(os.path.join(directory, '**/*.parquet').replace('\\', '/'))
             if len(self.storage_urls)==0:
                 # Maybe there are zero subdirectories to glob
                 self.storage_urls = self.hsi_remote_fs.glob(os.path.join(directory, '*.parquet').replace('\\', '/'))
+        else:
+            raise NotImplementedError()
     
         if self.verbose:
             print('storage_urls            ', len(self.storage_urls))
@@ -605,7 +626,7 @@ class HSI():
         for i, storage_url_part in enumerate(self.storage_urls):
             json_filepath = os.path.join(self.json_folder, f'item{i}.json')
     
-            if self.dataservice_type=='local_filesystem':
+            if self.hsi_dataservice_type=='local_filesystem':
                 href = os.path.join(
                     's3://' + self.hsi_bucket,
                     'hsi',
@@ -624,7 +645,7 @@ class HSI():
                     poly_native = gdf1.buffer(self.grid.epsilon).unary_union
                     gdf1 = gdf1.set_crs(self.grid.crs)
                     
-            elif self.dataservice_type=='remote_filesystem':
+            elif self.hsi_dataservice_type=='remote_filesystem':
                 href = 's3://' + storage_url_part
                 try:
                     # If available and installed properly, dask_geopandas can read the metadata faster
@@ -687,9 +708,9 @@ class HSI():
                     description = 'base4 key of the spatial partition'
                 elif col in ('year', 'month', 'day'):
                     description = 'temporal partition: ' + col
-                elif col=='dimension_band':
+                elif col=='_band':
                     description = 'band'
-                elif col=='dimension_tile':
+                elif col=='_tile':
                     description = 'tile'
                 else:
                     print('Gdf columns', gdf1.columns)
@@ -887,7 +908,6 @@ def search_hsi(
     search_aoi = None,
     dt_start = None,
     dt_end = None,
-    fields = None,
     required_cols = [],
     filters = [],
     required_crs = None,
@@ -897,28 +917,8 @@ def search_hsi(
 ):
     LIMIT = 200
         
-    #FIELDS = {"include": [], "exclude": []}
-    FIELDS = {
-        "include": [
-            "id",
-            "bbox",
-            "datetime",
-            "properties.table:columns",
-            "properties.proj:epsg",
-            #"properties.tile",
-            #"properties.cube:variables",
-            #"properties.cube:dimensions",
-            #"properties.cloud_coverage",
-        ],
-        "exclude": [
-        ],
-    }
-
     if limit is None:
         limit = LIMIT
-    
-    if fields is None:
-        fields = FIELDS
     
     if verbose:
         print('limit             ', limit)
@@ -946,7 +946,6 @@ def search_hsi(
         collections = [hsi_collection_id],
         intersects = search_aoi,
         datetime = dt_string,
-        fields = fields,
     )
     search_items = next(stac_search_result.pages())
     
