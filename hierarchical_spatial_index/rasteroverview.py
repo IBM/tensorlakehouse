@@ -738,7 +738,10 @@ class Rasteroverview():
                     if len(df_stats_chunk)>0:
                         df_stats.append(df_stats_chunk)
 
-        return pandas.concat(df_stats)
+        if len(df_stats)>0:
+            return pandas.concat(df_stats)
+        else:
+            return pandas.DataFrame()
 
 
     def _setup_xarray_hbase(
