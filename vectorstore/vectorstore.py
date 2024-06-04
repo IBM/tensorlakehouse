@@ -208,6 +208,7 @@ class Vectorstore():
 
         # Parquet file custom meta content (e.g. {'About': """This is a super dataset."""})
         self.custom_meta_content = custom_meta_content
+        self.schema_unified = None
         
         self.verbose = verbose
 
@@ -1217,6 +1218,9 @@ class Vectorstore():
             #partition_cols=self.partition_cols
         )
 
+        # if self.schema_unified is not None:
+        #     self._overwrite_with_unified_schema(filepath_idx)
+
 
     def defrag(self, index=False):
         """Defragment all partitions with multiple files."""
@@ -1235,10 +1239,6 @@ class Vectorstore():
             if index:
                 # Write the index to parquet
                 self._index_to_parquet(temporal_partition, spatial_partition, append=True)
-
-        # Unify schemas of the parquet partitions, so that local null-value columns don't break read_parquet. 
-        # Add custom metadata.
-        self.unify_schemas()
 
         if self.verbose:
             print('Time for defragging', round(time.time()-stopwatch_start, 3))
@@ -1274,7 +1274,8 @@ class Vectorstore():
         if len(gdf_part)>0:
             # Sorting so that these columns are used as indices in parquet file
             gdf_part = gdf_part.sort_values(
-                by=[self.dt_col]+list(self.dimension_values)+[self.key_col]
+                by=[self.key_col, self.dt_col]+list(self.dimension_values)  # Test if local queries are faster this way
+                #by=[self.dt_col]+list(self.dimension_values)+[self.key_col]
             ).reset_index(drop=True)
 
             os.makedirs(folderpath, exist_ok=True)
@@ -1286,6 +1287,9 @@ class Vectorstore():
                 compression='snappy',
                 #partition_cols=self.partition_cols
             )
+
+            if self.schema_unified is not None:
+                self._overwrite_with_unified_schema(filepath)
             
             # Remove the old fragments
             for file in files:
@@ -1378,6 +1382,10 @@ class Vectorstore():
                 #partition_cols=self.partition_cols
             )
 
+            if self.schema_unified is not None:
+                self._overwrite_with_unified_schema(filepath)
+
+
     def to_parquet(
         self,
         defrag=False,
@@ -1410,64 +1418,70 @@ class Vectorstore():
                 # Write the index to parquet
                 self._index_to_parquet(temporal_partition, spatial_partition, append=True)
 
-        # Unify schemas of the parquet partitions, so that local null-value columns don't break read_parquet. 
-        # Add custom metadata.
-        self.unify_schemas()
-
         if self.verbose:
             print('Time for writing GeoDataFrame to GeoParquet partitions', round(time.time()-stopwatch_start, 3))
             stopwatch_start = time.time()
 
 
+    def _overwrite_with_unified_schema(self, infile):
+        """Embed the unified schema and custom metadata in the parquet file.
+
+        Tailors the parquet file schema so that it has global column dtypes but local geo metadata, such as bbox
+        """
+        # Read the schema and table
+        schema = pyarrow.parquet.read_schema(infile)
+        assert schema.names == self.schema_unified.names
+        existing_meta = schema.metadata  # Start with the existing metadata
+        combined_meta = existing_meta.copy()
+        table = pyarrow.parquet.read_table(infile)
+        
+        # Add dataset-related custom meta content
+        if self.custom_meta_content is not None:                
+            custom_meta_key = self.dataset
+            custom_meta_json = json.dumps(self.custom_meta_content)
+            try:
+                # Remove any existing dataset-related metadata before adding it back.
+                combined_meta.pop(custom_meta_key.encode())
+            except:
+                pass
+            combined_meta = {
+                custom_meta_key.encode() : custom_meta_json.encode(), # encoded as bytes
+                **combined_meta
+            }
+            
+        if (combined_meta!=existing_meta) or (schema.types!=self.schema_unified.types):
+            # table_changed
+    
+            # Cast table schema to the unified column types and add combined metadata
+            table = table.cast(pyarrow.schema(zip(self.schema_unified.names, self.schema_unified.types)))
+            table = table.replace_schema_metadata(combined_meta)
+        
+            # Overwrite table
+            pyarrow.parquet.write_table(
+                table,
+                infile,
+                row_group_size=self.row_group_size,
+                compression='snappy',
+            )
+
+
     def unify_schemas(self):
         """Unify schemas of the parquet partitions, so that local null-value columns don't break reading code.
         Add dataset custom_meta_content."""
+        if self.verbose:
+            stopwatch_start = time.time()
+
         filepaths = glob(os.path.join(self.geoparquet_directory, '**/*.parquet').replace('\\', '/'))
         schemas = [pyarrow.parquet.read_schema(infile) for infile in filepaths]
-        schema_unified = pyarrow.unify_schemas(schemas)
+        self.schema_unified = pyarrow.unify_schemas(schemas)
     
         for infile in filepaths:
             # Tailor the parquet file schema so that it has global column dtypes but local geo metadata, such as bbox
-            table_changed = False
-            
-            # Read the schema and table
-            schema = pyarrow.parquet.read_schema(infile)
-            assert schema.names == schema_unified.names
-            existing_meta = schema.metadata  # Start with the existing metadata
-            combined_meta = existing_meta.copy()
-            table = pyarrow.parquet.read_table(infile)
-            
-            # Add dataset-related custom meta content
-            if self.custom_meta_content is not None:                
-                custom_meta_key = self.dataset
-                custom_meta_json = json.dumps(self.custom_meta_content)
-                try:
-                    # Remove any existing dataset-related metadata before adding it back.
-                    combined_meta.pop(custom_meta_key.encode())
-                except:
-                    pass
-                combined_meta = {
-                    custom_meta_key.encode() : custom_meta_json.encode(), # encoded as bytes
-                    **combined_meta
-                }
-                
-            if combined_meta!=existing_meta:
-                table_changed = True
-            if schema.types!=schema_unified.types:
-                table_changed = True
+            self._overwrite_with_unified_schema(infile)
 
-            # Cast table schema to the unified column types and add combined metadata
-            table = table.cast(pyarrow.schema(zip(schema_unified.names, schema_unified.types)))
-            table = table.replace_schema_metadata(combined_meta)
-            
-            # Overwrite table
-            if table_changed:
-                pyarrow.parquet.write_table(
-                    table,
-                    infile,
-                    row_group_size=self.row_group_size,
-                    compression='snappy',
-                )
+        if self.verbose:
+            print('Time for unify_schemas', round(time.time()-stopwatch_start, 3))
+            stopwatch_start = time.time()
 
 
     def partial_upload(
