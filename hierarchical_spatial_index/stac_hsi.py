@@ -240,12 +240,12 @@ class HSI():
         self.search_aoi = json.loads(shapely.to_geojson(shapely.box(*self.grid.valid_bounds_wgs84)))
 
         # Filter epsg using STAC
-        self.filter_epsg = self.grid.epsg
+        self.filter_epsg_stac_items = self.grid.epsg
 
         # Search the available raw data in STAC.
         self.stac_search_available(
             self.search_aoi,
-            filter_epsg=self.filter_epsg
+            filter_epsg_stac_items=self.filter_epsg_stac_items
         )
 
         # Create the metadata table for the Rasteroverview
@@ -262,7 +262,7 @@ class HSI():
     def stac_search_available(
         self,
         search_aoi,
-        filter_epsg = None,
+        filter_epsg_stac_items = None,
     ):
         """Search for available raw data in STAC."""
         LIMIT = 10000
@@ -321,15 +321,15 @@ class HSI():
                 print('batch', i, '; raw     ', len(next_items))
     
             # Filter epsg
-            if filter_epsg is not None:
+            if filter_epsg_stac_items is not None:
                 # Debug: We need a function to get the correct x-axis name rather than guessing
                 try:
                     next_items = [item for item in next_items if (
-                        item.properties['cube:dimensions']['x']['reference_system']==filter_epsg
+                        item.properties['cube:dimensions']['x']['reference_system']==filter_epsg_stac_items
                     )]
                 except:
                     next_items = [item for item in next_items if (
-                        item.properties['cube:dimensions']['longitude']['reference_system']==filter_epsg
+                        item.properties['cube:dimensions']['longitude']['reference_system']==filter_epsg_stac_items
                     )]
                 
             if self.verbose:
