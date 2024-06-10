@@ -185,7 +185,7 @@ class QTree():
             return
 
         if ((self.head is not None) and (self.max_depth is not None) and
-            (node.level > self.head.level + self.max_depth)
+            (node.level >= self.head.level + self.max_depth)
         ):
             node.is_leaf = False
             node.is_early_stopping_leaf = True
