@@ -121,6 +121,7 @@ class Vectorstore():
     def __init__(
         self,
         dataset,
+        collection_id = None,
         vectorstore_directory = None,
         dimension_values = {},
         dt_col = None,
@@ -153,7 +154,10 @@ class Vectorstore():
         self.valid_range = self.morton.valid_range if valid_range is None else valid_range
 
         # Dataset name
-        self.dataset                      = dataset
+        self.dataset = dataset
+
+        # STAC collection id
+        self.collection_id = collection_id
 
         # List of the timestamp hierarchy levels ('year', 'month', ...)
         self.temporal_levels = []
@@ -1775,14 +1779,12 @@ class Vectorstore():
                 "step": None,
                 "type": "temporal"
             },
-            # self.geom_col: {
-            #     "axis": self.geom_col,
-            #     "extent": None,
-            #     "description": "Vectorcube geometry",
-            #     "step": None,
-            #     "type": "spatial",
-            #     "reference_system": self.grid.epsg
-            # },
+            self.geom_col: {
+                "type": "geometry",
+                "description": "Vectordata geometry column",
+                "bbox": total_bounds_native,
+                "reference_system": self.grid.epsg
+            },
         }
         
         for col in list(self.dimension_values.keys()):
@@ -1804,7 +1806,7 @@ class Vectorstore():
             )):
                 cube_variables[col] = {
                     "dimensions": [
-                          #self.geom_col,
+                          self.geom_col,
                           self.dt_col,
                     ] + list(self.dimension_values.keys()),
                     "type": "data",
@@ -1828,6 +1830,7 @@ class Vectorstore():
             "geometry": geometry_wgs84,
         
             "properties": {
+                "datetime": None,  # Needs to be set to null (None) if start_datetime and end_datetime are set.
                 "start_datetime": start_datetime,
                 "end_datetime": end_datetime,
         
@@ -1961,7 +1964,9 @@ class Vectorstore():
             "description": description,
             "extent": {
                 "spatial": {
-                    "bbox": bbox,
+                    "bbox": [
+                        bbox,
+                    ],
                 },
                 "temporal": {
                     "interval": [
@@ -1973,6 +1978,12 @@ class Vectorstore():
                 self.dt_col: {
                     "type": "temporal",
                     "extent": [dt_start.strftime(ISO_8601), dt_end.strftime(ISO_8601)],
+                },
+                self.geom_col: {
+                    "type": "geometry",
+                    "description": "Vectordata geometry column",
+                    "bbox": bbox,
+                    "reference_system": self.grid.epsg
                 },
                 "bands": {
                     "type": "bands",
@@ -2161,6 +2172,7 @@ class Vectorstore():
         """
         vs_settings = {}
         vs_settings['dataset'] = self.dataset
+        vs_settings['collection_id'] = self.collection_id
         vs_settings['vectorstore_directory'] = self.vectorstore_directory
         vs_settings['dataset_directory'] = self.dataset_directory
         vs_settings['grid_directory'] = self.grid_directory
