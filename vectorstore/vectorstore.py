@@ -1656,7 +1656,7 @@ class Vectorstore():
 
 
     def to_stac_item(
-        self, stac_url, collection_id, collection_title, stac_json_folder, certificate, remote_path, local_path=None,
+        self, stac_url, collection_id, collection_title, stac_json_folder, certificate, remote_path, local_path,
         access_key_id=None, secret_access_key=None, endpoint_url=None, bucket=None, remote_vectorstore_directory=None,
     ):
         """Register vectorstore file as item in STAC."""
@@ -1709,7 +1709,7 @@ class Vectorstore():
             all(ddf.spatial_partitions.apply(lambda x: (shapely.box(*x.bounds)-x).area==0))
         ):
             # Convex hull of unary union
-            ddf.calculate_spatial_partitions() 
+            ddf.calculate_spatial_partitions()
             if all(ddf.spatial_partitions.apply(lambda x: (shapely.box(*x.bounds)-x).area==0)):
                 # THE ABOVE MAY BE BROKEN IN DASK_GEOPANDAS. DOING IT MANUALLY
                 ddf.spatial_partitions = geopandas.GeoSeries(
