@@ -575,6 +575,9 @@ class Rasteroverview():
             if self.verbose:
                 print('WARNING: ', self.dt_col, 'of dtype int64 detected. Translating to datetime')
 
+        # Make sure the tzinfo is set to utc
+        gdf_hsi = self._localize_utc_if_not_tz_aware(gdf_hsi)
+
         gdf_hsi = gdf_hsi.set_crs(self.grid.crs)
         
         if skip_existing:
@@ -701,6 +704,9 @@ class Rasteroverview():
         TARGET = 1e6
         
         target_chunks = numpy.ceil(numpy.prod(arr.shape) / TARGET) # ceil assures at least one chunk
+        if target_chunks==0:
+            print('WARNING: target_chunks==0')
+            return pandas.DataFrame()
         target_len_x = int(numpy.ceil(arr.ovw_x.shape[0]/numpy.sqrt(target_chunks)))
         target_len_y = int(numpy.ceil(arr.ovw_y.shape[0]/numpy.sqrt(target_chunks)))
         
@@ -1162,6 +1168,15 @@ class Rasteroverview():
         except OSError as e:
             # Maybe value was too large (nano second timestamp definition)
             return datetime.utcfromtimestamp(x/1e9).replace(tzinfo=pytz.utc)
+
+    
+    def _localize_utc_if_not_tz_aware(self, gdf):
+        try:
+            gdf['time'] = gdf['time'].dt.tz_localize('UTC')
+        except Exception as e:
+            if (len(e.args)!=1) or (not 'Already tz-aware, use tz_convert to convert.' in e.args):
+                raise
+        return gdf
 
     
     def _parquet_directory(self):

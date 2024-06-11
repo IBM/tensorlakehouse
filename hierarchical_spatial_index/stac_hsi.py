@@ -8,6 +8,7 @@ sys.path.insert(1, os.path.abspath(".."))
 from qtree_index import qtree, partition
 from . import rasteroverview
 
+import numpy
 import pandas
 from datetime import datetime, timedelta
 import pytz
@@ -17,7 +18,7 @@ import shapely
 import json
 import itertools
 import warnings
-import uuid
+import hashlib
 import pystac_client
 
 
@@ -83,12 +84,13 @@ class HSI():
         
     Methods
 
-        stac_search_available       Search for available raw data in STAC.
-        search_items_local_metadata Create metadataframe from STAC search_items.
-        setup_rasteroverview        Setup the Rasteroverviw object with appropriate partitions for HSI creation.
-        hsi_worker                  Calculate HSI for one partition 
-                                        (uses one CPU and memory dependent on size of partitions.
-        register_hsi_items_stac     Register HSI items in STAC.
+        stac_search_available         Search for available raw data in STAC.
+        search_items_local_metadata   Create metadataframe from STAC search_items.
+        setup_rasteroverview          Setup the Rasteroverviw object with appropriate partitions for HSI creation.
+        hsi_worker                    Calculate HSI for one partition 
+                                          (uses one CPU and memory dependent on size of partitions.
+        register_hsi_items_stac       Register HSI items in STAC.
+        register_hsi_collection_stac  Register HSI collection in STAC.
         
     """
     # Constants
@@ -127,6 +129,7 @@ class HSI():
 
         hsi_dataservice_type,
         hsi_bucket,
+        hsi_remote_directory,
         hsi_remote_fs,
         hsi_access_key_id,
         hsi_secret_access_key,
@@ -145,6 +148,7 @@ class HSI():
         filter_epsg_using_tile_zone=None,
     ):
         self.verbose = verbose
+        self.HSI_REMOTE_DIRECTORY = 'hsi'
 
         # Debug: currently we require these parameters since STAC items are not set up to provide all information about dimensions
         self.tile_from_filepath=tile_from_filepath
@@ -186,6 +190,7 @@ class HSI():
         # COS HSI access
         self.hsi_dataservice_type = hsi_dataservice_type
         self.hsi_bucket = hsi_bucket
+        self.hsi_remote_directory = hsi_remote_directory
         self.hsi_remote_fs = hsi_remote_fs
         self.hsi_access_key_id = hsi_access_key_id
         self.hsi_secret_access_key = hsi_secret_access_key
@@ -557,9 +562,9 @@ class HSI():
         # Path to HSI
         hsi_local_path = self.raster._filepath(self.spatial_partition, self.temporal_partition)
         if self.hsi_dataservice_type == 'local_filesystem': # (mounted drive)
-            prefix = os.path.join('data', 'hsi', self.collection_id).replace('\\', '/')
+            prefix = os.path.join('data', 'hsi', self.hsi_collection_id).replace('\\', '/')
         elif self.hsi_dataservice_type == 'remote_filesystem':
-            prefix = os.path.join(self.hsi_bucket, 'hsi', self.collection_id).replace('\\', '/')
+            prefix = os.path.join(self.hsi_bucket, self.hsi_remote_directory, self.hsi_collection_id).replace('\\', '/')
         elif self.hsi_dataservice_type == 'hbase':
             raise NotImplementedError('hbase not supported for hsi upload.')
         else:
@@ -598,59 +603,109 @@ class HSI():
                 self.hsi_remote_fs.upload(hsi_local_path, self.hsi_remote_path)
 
             # Registering HSI items in STAC
-            self.register_hsi_items_stac()
+            self.register_hsi_items_stac(self.hsi_remote_path)
             print(f'Registered hsi for partition {elements}')
 
 
-    def register_hsi_items_stac(self):
-        """Register HSI items in STAC."""
+    def _glob_storage_urls(self):
+        """glob local or remote filesystem for storage urls."""
         if self.hsi_dataservice_type=='local_filesystem':
             # Accessing in local (or mounted) drive
             self.storage_urls = glob(os.path.join(self.hsi_directory, '**/*.parquet').replace('\\', '/'))
         elif self.hsi_dataservice_type=='remote_filesystem':
             # Using s3fs to access
-            directory = os.path.split(self.hsi_remote_path)[0].replace('\\', '/')
-            self.storage_urls = self.hsi_remote_fs.glob(os.path.join(directory, '**/*.parquet').replace('\\', '/'))
+            self.storage_urls = self.hsi_remote_fs.glob(os.path.join(
+                self.hsi_bucket,
+                self.hsi_remote_directory,
+                self.hsi_collection_id,
+                '**/*.parquet'
+            ).replace('\\', '/'))
             if len(self.storage_urls)==0:
                 # Maybe there are zero subdirectories to glob
-                self.storage_urls = self.hsi_remote_fs.glob(os.path.join(directory, '*.parquet').replace('\\', '/'))
+                self.storage_urls = self.hsi_remote_fs.glob(os.path.join(
+                    self.hsi_bucket,
+                    self.hsi_remote_directory,
+                    self.hsi_collection_id,
+                    '*.parquet'
+                ).replace('\\', '/'))
         else:
             raise NotImplementedError()
-    
+            
         if self.verbose:
-            print('storage_urls            ', len(self.storage_urls))
-            #print(*self.storage_urls, sep='\n')
+            print('len(storage_urls)', len(self.storage_urls))
+            
+
+    def _hash_filepath(self, hsi_remote_path, how='sha1'):
+        split_prefix = os.path.join(self.hsi_bucket, self.hsi_remote_directory).replace('\\', '/') + '/'
+        filepath = hsi_remote_path.split(split_prefix)[1]
+        if how=='md5':
+            hash_id = hashlib.md5(filepath.encode('utf-8')).hexdigest()
+        elif how=='sha1':
+            hash_id = hashlib.sha1(filepath.encode('utf-8')).hexdigest()
+        elif how=='sha256':
+            hash_id = hashlib.sha256(filepath.encode('utf-8')).hexdigest()
+        else:
+            raise NotImplementedError()
+        return hash_id
+    
+        
+    def register_hsi_items_stac(self, storage_url=None):
+        """Register HSI items in STAC."""
+
         self.json_folder_submitted = os.path.join(self.json_folder, 'submitted') 
         os.makedirs(self.json_folder_submitted, exist_ok=True)
-    
-        for i, storage_url_part in enumerate(self.storage_urls):
-            json_filepath = os.path.join(self.json_folder, f'item{i}.json')
+
+        if storage_url is None:
+            # Register all STAC items
+            self._glob_storage_urls()
+            urls = self.storage_urls
+        else:
+            urls = [storage_url]
+
+        for url in urls:
+            hash_id = self._hash_filepath(url)
+            json_filepath = os.path.join(self.json_folder, f'item_{hash_id}.json')
+            print('Creating STAC item', json_filepath)
     
             if self.hsi_dataservice_type=='local_filesystem':
                 href = os.path.join(
                     's3://' + self.hsi_bucket,
-                    'hsi',
-                    storage_url_part.split('/hsi/')[1]
+                    self.hsi_remote_directory,
+                    url.split(f"/{hsi_remote_directory}/")[1]
                 ).replace('\\', '/')
                 try:
                     # If available and installed properly, dask_geopandas can read the metadata faster
-                    gdf1 = dask_geopandas.read_parquet(storage_url_part)
+                    ddf = dask_geopandas.read_parquet(url)
                     # Spatial extent in native coordinates based on partition (fast):
-                    poly_native = gdf1.spatial_partitions.unary_union
-                    gdf1 = gdf1.set_crs(self.grid.crs).compute()
+                    if (
+                        ddf.spatial_partitions is None
+                    ) or (
+                        all(ddf.spatial_partitions.apply(lambda x: (shapely.box(*x.bounds)-x).area==0))
+                    ):
+                        # Convex hull of unary union
+                        ddf.calculate_spatial_partitions()
+                        if all(ddf.spatial_partitions.apply(lambda x: (shapely.box(*x.bounds)-x).area==0)):
+                            # THE ABOVE MAY BE BROKEN IN DASK_GEOPANDAS. DOING IT MANUALLY
+                            ddf.spatial_partitions = geopandas.GeoSeries(
+                                shapely.convex_hull(shapely.geometrycollections(numpy.asarray(ddf.geometry)))
+                            )
+                    poly_native = ddf.spatial_partitions.unary_union
+                    ddf = ddf.set_crs(self.grid.crs).compute()
+                    
                 except:
                     # Read with geopandas
-                    gdf1 = geopandas.read_parquet(storage_url_part)
+                    print('WARNING: dask_geopandas not installed or parquet file spatial_partitions not calculated.')
+                    ddf = geopandas.read_parquet(url)
                     # Spatial extent in native coordinates based on hsi cells (slow)
-                    poly_native = gdf1.buffer(self.grid.epsilon).unary_union
-                    gdf1 = gdf1.set_crs(self.grid.crs)
+                    poly_native = ddf.buffer(self.grid.epsilon).unary_union
+                    ddf = ddf.set_crs(self.grid.crs)
                     
             elif self.hsi_dataservice_type=='remote_filesystem':
-                href = 's3://' + storage_url_part
+                href = 's3://' + url
                 try:
                     # If available and installed properly, dask_geopandas can read the metadata faster
-                    gdf1 = dask_geopandas.read_parquet(
-                        's3://'+storage_url_part,
+                    ddf = dask_geopandas.read_parquet(
+                        's3://'+url,
                         storage_options={
                             'key' : self.hsi_access_key_id,
                             'secret' : self.hsi_secret_access_key,
@@ -658,12 +713,25 @@ class HSI():
                         },
                     )
                     # Spatial extent in native coordinates based on partition (fast):
-                    poly_native = gdf1.spatial_partitions.unary_union
-                    gdf1 = gdf1.set_crs(self.grid.crs).compute()
+                    if (
+                        ddf.spatial_partitions is None
+                    ) or (
+                        all(ddf.spatial_partitions.apply(lambda x: (shapely.box(*x.bounds)-x).area==0))
+                    ):
+                        # Convex hull of unary union
+                        ddf.calculate_spatial_partitions()
+                        if all(ddf.spatial_partitions.apply(lambda x: (shapely.box(*x.bounds)-x).area==0)):
+                            # THE ABOVE MAY BE BROKEN IN DASK_GEOPANDAS. DOING IT MANUALLY
+                            ddf.spatial_partitions = geopandas.GeoSeries(
+                                shapely.convex_hull(shapely.geometrycollections(numpy.asarray(ddf.geometry)))
+                            )
+                    poly_native = ddf.spatial_partitions.unary_union
+                    ddf = ddf.set_crs(self.grid.crs).compute()
                 except:
                     # Read with geopandas
-                    gdf1 = geopandas.read_parquet(
-                        's3://'+storage_url_part,
+                    print('WARNING: dask_geopandas not installed or parquet file spatial_partitions not calculated.')
+                    ddf = geopandas.read_parquet(
+                        's3://'+url,
                         storage_options={
                             'key' : self.hsi_access_key_id,
                             'secret' : self.hsi_secret_access_key,
@@ -671,8 +739,8 @@ class HSI():
                         },
                     )
                     # Spatial extent in native coordinates based on HSI cells (slow)
-                    poly_native = gdf1.buffer(self.grid.epsilon).unary_union
-                    gdf1 = gdf1.set_crs(self.grid.crs)
+                    poly_native = ddf.buffer(self.grid.epsilon).unary_union
+                    ddf = ddf.set_crs(self.grid.crs)
             
             poly_wgs84 = geopandas.GeoDataFrame([
                 {'geometry': poly_native}
@@ -683,7 +751,7 @@ class HSI():
             total_bounds_wgs84 = list(poly_wgs84.bounds)
     
             table_columns = []
-            for col in gdf1.columns:
+            for col in ddf.columns:
                 if col in self.REQUIRED_STATS_CATEGORICAL | self.REQUIRED_STATS_NUMERIC:
                     description = 'statistic: ' + col
                 elif col.startswith(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH):
@@ -713,7 +781,7 @@ class HSI():
                 elif col=='_tile':
                     description = 'tile'
                 else:
-                    print('Gdf columns', gdf1.columns)
+                    print('Gdf columns', ddf.columns)
                     raise ValueError(f'"{col}" column name not understood.')
                     description = None
     
@@ -721,48 +789,45 @@ class HSI():
                     {
                         "name": col,
                         "description": description,
-                        "type": repr(gdf1[col].dtype),
+                        "type": repr(ddf[col].dtype),
                     }
                 )
     
-            datetime_lst = [t.strftime(self.ISO_8601) for t in sorted(gdf1['time'].unique())]
+            datetime_lst = [t.strftime(self.ISO_8601) for t in sorted(ddf['time'].unique())]
             hsi_level = int([
-                d for d in storage_url_part.split('/') if "hsi_level" in d
+                d for d in url.split('/') if "hsi_level" in d
             ][0].split('=')[1])
     
             cube_dimensions = {
-                "q_key": {
-                    "axis": "q_key",
-                    "extent": None,
-                    "description": 'base4 key of the Morton curve',
-                    "step": None,
-                    "type": "spatial",
-                    "reference_system": None
-                },
                 "time": {
+                    "type": "temporal",
                     "extent": [
                         datetime_lst[0],
                         datetime_lst[-1],
                     ],
-                    "description": None,
                     "step": None,
-                    "type": "temporal"
-                }
+                    "description": None,
+                },
+                'geometry': {
+                    "type": "geometry",
+                    "bbox": total_bounds_native,
+                    "reference_system": self.grid.epsg,
+                    "description": "Vectordata geometry column",
+                },
             }
     
-            for col in gdf1.columns:
-                if col.startswith('dimension'):
+            for col in ddf.columns:
+                if col.startswith('_'):
                     cube_dimensions[col] = {
-                        "axis": col,
-                        "extent": sorted(gdf1[col].unique()),
-                        "description": None,
-                        "step": None,
                         "type": "other",
-                        "reference_system": None
+                        "axis": col,
+                        "extent": sorted(ddf[col].unique()),
+                        "step": None,
+                        "description": None,
                         }
     
             cube_variables = {}
-            for col in gdf1.columns:
+            for col in ddf.columns:
                 if (
                     (col in self.REQUIRED_STATS_CATEGORICAL) |
                     (col in self.REQUIRED_STATS_NUMERIC) | 
@@ -771,11 +836,11 @@ class HSI():
                 ):
                     cube_variables[col] = {
                         "dimensions": [
-                              "q_key",
+                              "geometry",
                               "time",
-                        ] + [c for c in gdf1.columns if c.startswith('dimension')],
+                        ] + [c for c in ddf.columns if c.startswith('_')],
                         "type": "data",
-                        "description": "",
+                        "description": "hsi statistic column",
                         "unit": "",
                     }
     
@@ -783,39 +848,53 @@ class HSI():
                 "type": "Feature",
                 "stac_version": "1.0.0",
                 "stac_extensions": [
+                    "https://stac-extensions.github.io/datacube/v2.2.0/schema.json",
                     "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
                     "https://stac-extensions.github.io/table/v1.2.0/schema.json",
                 ],
-                "id": uuid.uuid4().hex,
+                "id": hash_id,
                 "collection": self.hsi_collection_id,
                 "bbox": total_bounds_wgs84,
                 "geometry": geometry_wgs84,
     
                 "properties": {
                     # debug: may need to indicate that datetime can be a list?
-                    "datetime": datetime_lst[0],
+                    "datetime": None,  # Needs to be set to null (None) if start_datetime and end_datetime are set.
                     "start_datetime": datetime_lst[0],
                     "end_datetime": datetime_lst[-1],
     
                     # Projection Extension (https://github.com/stac-extensions/projection)
-                    #debug: need to set the projection in the geoparquet so that we can import here
+                    # Note that the projection needs to be set in the geoparquet so that we can import here
                     "proj:epsg": self.grid.epsg,
                     "proj:bbox": total_bounds_native,
                     "proj:geometry": geometry_native,
     
+                    # Table Extension (https://stac-extensions.github.io/table/v1.2.0/schema.json)
                     "table:columns": table_columns,
                     "table:primary_geometry": "geometry",
-                    "table:row_count": len(gdf1),
+                    "table:row_count": len(ddf),
     
-                    #debug: this is a hack to make the item openEO compatible
+                    # Datacube extension (https://stac-extensions.github.io/datacube/v2.2.0/schema.json)
                     "cube:dimensions": cube_dimensions,
-                    #debug: this is a hack to make the item openEO compatible
                     "cube:variables": cube_variables,
                 },
                 "links": [
                     {
-                        "href": "./collection.json",
                         "rel": "collection",
+                        "href": "../collection.json",
+                        "type": "application/json",
+                        "title": self.hsi_collection_id,
+                    },
+                    {
+                        "rel": "root",
+                        "href": "../../catalog.json",
+                        "type": "application/json",
+                    },
+                    {
+                        "rel": "parent",
+                        "href": "../collection.json",
+                        "type": "application/json",
+                        "title": self.hsi_collection_id,
                     },
                 ],
                 "assets": {
@@ -823,10 +902,8 @@ class HSI():
                         "href": href,
                         "type": "table/parquet; application=geoparquet; profile=cloud-optimized",
                         "title": self.hsi_collection_id,
-                        "roles": [
-                            "hierarchical spatial index"
-                        ],
-                        "description": ""
+                        "description": "summary statistics: hierarchical spatial index",
+                        "roles": ["data"],
                     },
                 }
             }
@@ -834,14 +911,14 @@ class HSI():
             with open(json_filepath, 'w') as outfile:
                 json.dump(stac_item_dict, outfile, indent=4, sort_keys=False)
     
-        # Upload files to STAC
-        stac_collection_url = os.path.join(
-            self.stac_url, 'collections', self.hsi_collection_id.replace(" ", "%20"), 'items'
-        ).replace('\\', '/')
-        for file in glob(os.path.join(self.json_folder, '*.json')):
-            file = file.replace('\\', '/')
-            os.system(f'curl -H "Content-Type: application/json" -X POST {stac_collection_url} -kL {self.certificate} -d "@{file}"')
-            os.system(f'mv {file} {self.json_folder_submitted}')
+        # # Upload files to STAC
+        # stac_collection_url = os.path.join(
+        #     self.stac_url, 'collections', self.hsi_collection_id.replace(" ", "%20"), 'items'
+        # ).replace('\\', '/')
+        # for file in glob(os.path.join(self.json_folder, '*.json')):
+        #     file = file.replace('\\', '/')
+        #     os.system(f'curl -H "Content-Type: application/json" -X POST {stac_collection_url} -kL {self.certificate} -d "@{file}"')
+        #     os.system(f'mv {file} {self.json_folder_submitted}')
 
 
     def register_hsi_collection_stac(
@@ -849,29 +926,52 @@ class HSI():
         bbox,
         dt_start,
         dt_end,
-        title,
         description,
         outpath,
     ):
-        """
-        Register HSI collection in STAC.
+        """Register HSI collection in STAC."""
 
-        Debug: NEED TO CHECK IF THIS METHOD IS STILL WORKING
-        """
-        # # Debug
-        # stac = pystac_client.Client.open(self.stac_url)
-        # stac_collections = list(stac.get_all_collections())
-        # collection = stac_collections[[c.id for c in stac_collections].index(self.hsi_collection_id)]
-    
+        assert outpath.endswith('.json')
+        
+        self._glob_storage_urls()
+        if self.hsi_dataservice_type=='remote_filesystem':
+            ddf = dask_geopandas.read_parquet(
+                ['s3://'+url for url in self.storage_urls],
+                storage_options={
+                    'key' : self.hsi_access_key_id,
+                    'secret' : self.hsi_secret_access_key,
+                    'client_kwargs' : {'endpoint_url': self.hsi_endpoint_url},
+                },
+            )
+        else:
+            raise NotImplementedError()
+            
+        cube_bands = []
+        for col in ddf.columns:
+            if (
+                (col in self.REQUIRED_STATS_CATEGORICAL) |
+                (col in self.REQUIRED_STATS_NUMERIC) | 
+                col.startswith(self.OPTIONAL_STATS_CATEGORICAL_STARTSWITH) | 
+                col.endswith(self.OPTIONAL_STATS_NUMERIC_ENDSWITH)
+            ):
+                cube_bands.append(col)
+
         stac_collection_dict = {
             "id": self.hsi_collection_id,
             "type": "Collection",
             "stac_version": "1.0.0",
-            "title": title,
+            "stac_extensions": [
+                "https://stac-extensions.github.io/datacube/v2.2.0/schema.json",
+                #"https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+                #"https://stac-extensions.github.io/table/v1.2.0/schema.json",
+            ],
+            "title": self.hsi_collection_id,
             "description": description,
             "extent": {
                 "spatial": {
-                    "bbox": bbox,
+                    "bbox": [
+                        bbox,
+                    ],
                 },
                 "temporal": {
                     "interval": [
@@ -879,15 +979,41 @@ class HSI():
                     ]
                 }
             },
+            "cube:dimensions": {
+                "time": {
+                    "type": "temporal",
+                    "extent": [dt_start.strftime(self.ISO_8601), dt_end.strftime(self.ISO_8601)],
+                    "step": None,
+                    "description": None,
+                },
+                "geometry": {
+                    "type": "geometry",
+                    "bbox": bbox,
+                    "reference_system": self.grid.epsg,
+                    "description": "Vectordata geometry column",
+                },
+                "bands": {
+                    "type": "bands",
+                    "values": cube_bands,
+                },
+            },
             "license": "Unknown",
             "links": [
                 {
-                    "href": "",
-                    "rel": "self",
+                    "rel": "root",
+                    "href": "../catalog.json",
+                    "type": "application/json",
                 },
                 {
-                    "href": "",
-                    "rel": "item",
+                    "rel": "root",
+                    "href": "./collection.json",
+                    "title": self.hsi_collection_id,
+                },
+                {
+                    "rel": "parent",
+                    "href": "../catalog.json",
+                    "type": "application/json",
+                    "title": self.hsi_collection_id,
                 },
             ],
         }
