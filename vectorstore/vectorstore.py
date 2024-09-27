@@ -1786,16 +1786,32 @@ class Vectorstore():
                 "reference_system": self.grid.epsg
             },
         }
-        
+
         for col in list(self.dimension_values.keys()):
+            # Try to get the dimension values from the schema first. 
+            pos = schema.names.index(col) # Position of the datetime column within the parquet column schema
+            min_value = min([
+                parquet_file.metadata.row_group(i).column(pos).statistics.min for i in range(parquet_file.metadata.num_row_groups)
+            ])
+            max_value = max([
+                parquet_file.metadata.row_group(i).column(pos).statistics.max for i in range(parquet_file.metadata.num_row_groups)
+            ])
+            if min_value==max_value:
+                # Files seem to be partitioned by dimension
+                values_list_ordered = [min_value]
+            else:
+                # Read the file if we don't have a choice.
+                values_list_ordered = sorted(ddf[[col]].compute().drop_duplicates()[col])
+
             cube_dimensions[col] = {
                 "axis": col,
                 "extent": None,
                 "description": col,
                 "step": None,
                 "type": "other",
-                "reference_system": None
-                }
+                "reference_system": None,
+                "values": values_list_ordered,
+            }
     
         cube_variables = {}
         for col in ddf.columns:
@@ -2010,6 +2026,15 @@ class Vectorstore():
                 },
             ],
         }
+        for col in list(self.dimension_values.keys()):
+            stac_collection_dict['cube:dimensions'][col] = {
+                "axis": col,
+                "extent": None,
+                "description": col,
+                "step": None,
+                "type": "other",
+                "reference_system": None
+            }
 
         json_filepath = os.path.join(self.stac_json_folder, f'collection_{self.collection_id}.json').replace('\\', '/')
 
