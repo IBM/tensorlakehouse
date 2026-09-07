@@ -120,7 +120,7 @@ flexcache==0.3
 flexparser==0.4
 flox==0.10.4
 folium==0.20.0
-fonttools==4.58.4
+fonttools==4.60.2
 fqdn==1.5.1
 frozenlist==1.7.0
 fsspec==2025.5.1
