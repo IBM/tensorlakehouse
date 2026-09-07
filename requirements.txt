@@ -127,7 +127,7 @@ fsspec==2025.5.1
 GeoAlchemy2==0.17.1
 geojson==3.2.0
 geojson-pydantic==1.2.0
-geopandas==0.14.4
+geopandas==1.1.2
 geoparquet==0.0.3
 gevent==24.11.1
 google-api-core==2.25.1
