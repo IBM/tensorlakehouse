@@ -12,7 +12,7 @@ pydantic>=1.10,<2
 
 # ---- STAC client ----
 pystac-client>=0.7.5,<0.9
-aiohttp>=3.9.0,<3.14
+aiohttp>=3.14.3,<3.15
 
 # ---- Process execution (openeo-fastapi uses the slim variant) ----
 openeo-pg-parser-networkx>=2024.1.1
