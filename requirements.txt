@@ -370,7 +370,7 @@ uritemplate==3.0.1
 urllib3==2.5.0
 uvicorn==0.30.6
 vine==5.1.0
-virtualenv==20.26.6
+virtualenv==20.36.1
 wcwidth==0.2.13
 webcolors==24.11.1
 webencodings==0.5.1
