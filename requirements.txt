@@ -229,7 +229,7 @@ openeo-processes-dask==2025.5.1
 openeo_driver @ git+https://github.com/Open-EO/openeo-python-driver.git@0511bdc4e9ab4c8f812dd7e6ed7ac8bef6ed9713
 openpyxl==3.1.5
 orderly-set==5.4.1
-orjson==3.10.18
+orjson==3.11.6
 overrides==7.7.0
 packaging==24.2
 pandas==2.2.3
