@@ -29,7 +29,7 @@ aws-requests-auth==0.4.3
 babel==2.17.0
 beautifulsoup4==4.13.4
 better-apidoc==0.3.2
-billiard==4.2.1
+billiard==4.2.4
 binaryornot==0.4.4
 black==24.10.0
 bleach==6.2.0
