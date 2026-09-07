@@ -273,7 +273,7 @@ pydantic_core==2.33.2
 pyfdb==0.1.2
 pyflakes==3.3.2
 pygeos==0.14
-Pygments==2.19.2
+Pygments==2.20.0
 PyJWT==2.10.1
 pyodc==1.6.0
 pyparsing==3.2.3
