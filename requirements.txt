@@ -146,7 +146,7 @@ h5netcdf==1.6.2
 h5py==3.14.0
 hda==2.34
 httpcore==1.0.9
-httplib2==0.22.0
+httplib2==0.32.0
 httpx==0.28.1
 ibm-cos-sdk==2.14.2
 ibm-cos-sdk-core==2.14.2
