@@ -1,0 +1,15 @@
+# Allow DCO sign-offs to be applied retroactively via remediation commits.
+#
+# PR #137 vendors GeoDN-Discovery/overviews in as a git subtree, which brings
+# 153 upstream commits that predate this repository's DCO requirement and so
+# carry no Signed-off-by line. Their authors cannot rewrite that history
+# without destroying the subtree merge, and nobody else may sign off on their
+# behalf, so the commits are remediated instead.
+#
+# thirdParty is required in addition to individual: one of the commits was
+# authored by whitesource-ets[bot], which cannot sign off for itself. Note the
+# app nests the third-party check inside the individual check, so thirdParty
+# has no effect unless individual is also true.
+allowRemediationCommits:
+  individual: true
+  thirdParty: true
