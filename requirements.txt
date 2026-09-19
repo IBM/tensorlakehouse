@@ -12,7 +12,7 @@ alembic==1.16.4
 amqp==5.3.1
 annotated-types==0.7.0
 antimeridian==0.4.1
-anyio==4.9.0
+anyio==4.14.2
 appdirs==1.4.4
 appnope==0.1.4
 argon2-cffi==25.1.0
