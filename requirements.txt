@@ -298,7 +298,7 @@ re-assert==1.1.0
 redis==5.0.0
 referencing==0.36.2
 regex==2024.11.6
-requests==2.32.4
+requests==2.33.0
 requests-mock==1.10.0
 requests-oauthlib==2.0.0
 requests-toolbelt==1.0.0
