@@ -109,7 +109,7 @@ et_xmlfile==2.0.0
 executing==2.2.0
 fasteners==0.19
 fastjsonschema==2.21.1
-filelock==3.18.0
+filelock==3.20.3
 filetype==1.2.0
 findlibs==0.1.1
 fiona==1.10.1
