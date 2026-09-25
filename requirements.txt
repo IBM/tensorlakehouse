@@ -102,7 +102,7 @@ eccodes==2.42.0
 eckitlib==1.29.2
 ecmwf-api-client==1.6.5
 ecmwf-datastores-client==0.2.0
-ecmwf-opendata==0.3.20
+ecmwf-opendata==0.3.34
 ecmwflibs==0.6.3
 entrypoints==0.4
 et_xmlfile==2.0.0
