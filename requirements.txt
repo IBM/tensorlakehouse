@@ -263,7 +263,7 @@ ptyprocess==0.7.0
 pure_eval==0.2.3
 py-openapi-schema-to-json-schema==0.0.3
 pyarrow==15.0.2
-pyasn1==0.6.1
+pyasn1==0.6.4
 pyasn1_modules==0.4.2
 pycares==4.9.0
 pycodestyle==2.13.0
