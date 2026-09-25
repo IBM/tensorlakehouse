@@ -274,7 +274,7 @@ pyfdb==0.1.2
 pyflakes==3.3.2
 pygeos==0.14
 Pygments==2.19.2
-PyJWT==2.10.1
+PyJWT==2.13.0
 pyodc==1.6.0
 pyparsing==3.2.3
 pyproj==3.5.0
